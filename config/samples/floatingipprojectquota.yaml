@@ -1,0 +1,17 @@
+apiVersion: rancher.k8s.binbash.org/v1beta1
+kind: FloatingIPProjectQuota
+metadata:
+  name: p-12345
+spec:
+  displayName: "My Awesome 12345 Project"
+  floatingIPQuota:
+    "rke2-bm-aio--public-vlan-1": 3
+---
+apiVersion: rancher.k8s.binbash.org/v1beta1
+kind: FloatingIPProjectQuota
+metadata:
+  name: p-54321
+spec:
+  displayName: "My Cool 54321 Project"
+  floatingIPQuota:
+    "rke2-bm-aio--public-vlan-1": 1

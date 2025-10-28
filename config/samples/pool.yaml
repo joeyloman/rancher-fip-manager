@@ -1,0 +1,17 @@
+apiVersion: rancher.k8s.binbash.org/v1beta1
+kind: FloatingIPPool
+metadata:
+  name: rke2-bm-aio--public-vlan-1
+spec:
+  ipConfig:
+    family: IPv4
+    subnet: "192.168.100.0/24"
+    pool:
+      start: "192.168.100.10"
+      end: "192.168.100.20"
+      exclude:
+        - "192.168.100.15"
+        - "192.168.100.16"
+  targetCluster: rke2-bm-aio
+  targetNetwork: public-vlan-1
+  targetNetworkInterface: eth0

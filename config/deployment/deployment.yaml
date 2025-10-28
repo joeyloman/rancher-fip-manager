@@ -1,0 +1,124 @@
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: rancher-fip-manager
+  labels:
+    app: rancher-fip-manager
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rancher-fip-manager
+  namespace: rancher-fip-manager
+  labels:
+    app: rancher-fip-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rancher-fip-manager
+  labels:
+    app: rancher-fip-manager
+rules:
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingips
+  - floatingippools
+  - floatingipprojectquotas
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingips/status
+  - floatingippools/status
+  - floatingipprojectquotas/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rancher-fip-manager
+  labels:
+    app: rancher-fip-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rancher-fip-manager
+subjects:
+- kind: ServiceAccount
+  name: rancher-fip-manager
+  namespace: rancher-fip-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: rancher-fip-manager
+  name: rancher-fip-manager
+  namespace: rancher-fip-manager
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rancher-fip-manager
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: rancher-fip-manager
+    spec:
+      containers:
+      - name: rancher-fip-manager
+        image: ghcr.io/joeyloman/rancher-fip-manager:latest
+        args:
+        - "--leader-elect=true"
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 100m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccountName: rancher-fip-manager
+      terminationGracePeriodSeconds: 30
