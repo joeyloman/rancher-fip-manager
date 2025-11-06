@@ -10,6 +10,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// UsageData contains usage information for a single subnet.
+type UsageData struct {
+	CIDR      string   `json:"cidr"`
+	Start     string   `json:"start"`
+	End       string   `json:"end"`
+	Broadcast string   `json:"broadcast"`
+	Total     int      `json:"total"`
+	Used      int      `json:"used"`
+	Available int      `json:"available"`
+	UsedIPs   []string `json:"used_ips"`
+}
+
 // IPSubnet represents a single subnet managed by the IPAM. It holds the
 // network configuration and the allocation status of all IPs within its range.
 type IPSubnet struct {
@@ -268,4 +280,41 @@ func (a *IPAllocator) Usage(name string) {
 		len(a.ipam[name].ips),
 		i,
 	)
+}
+
+// GetUsage returns a map of usage data for all subnets.
+func (a *IPAllocator) GetUsage() map[string]UsageData {
+	usage := make(map[string]UsageData)
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	for name, subnet := range a.ipam {
+		usedCount := 0
+		var usedIPs []string
+		for ip, allocated := range subnet.ips {
+			if allocated {
+				usedCount++
+				usedIPs = append(usedIPs, ip)
+			}
+		}
+		sort.Strings(usedIPs)
+
+		broadcast := ""
+		if subnet.broadcast != nil {
+			broadcast = subnet.broadcast.String()
+		}
+
+		usage[name] = UsageData{
+			CIDR:      subnet.cidr.String(),
+			Start:     subnet.start.String(),
+			End:       subnet.end.String(),
+			Broadcast: broadcast,
+			Total:     len(subnet.ips),
+			Used:      usedCount,
+			Available: len(subnet.ips) - usedCount,
+			UsedIPs:   usedIPs,
+		}
+	}
+
+	return usage
 }

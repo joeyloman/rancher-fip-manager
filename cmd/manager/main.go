@@ -24,6 +24,7 @@ import (
 	clientset "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned"
 	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions"
 	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
+	"github.com/joeyloman/rancher-fip-manager/pkg/service"
 	"github.com/joeyloman/rancher-fip-manager/pkg/signals"
 )
 
@@ -33,6 +34,7 @@ var (
 	leaderElect        bool
 	leaseLockName      string
 	leaseLockNamespace string
+	httpServicePort    string
 )
 
 var reinitChan = make(chan struct{}, 1)
@@ -43,6 +45,7 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election for controller.")
 	flag.StringVar(&leaseLockName, "lease-lock-name", "rancher-fip-manager-lock", "The name of the leader election lock.")
 	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "rancher-fip-manager", "The namespace of the leader election lock.")
+	flag.StringVar(&httpServicePort, "http-service-port", "8080", "The port to listen on for HTTP requests.")
 	flag.Parse()
 
 	logrus.SetReportCaller(true)
@@ -149,6 +152,16 @@ func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clients
 	fipPoolController := floatingippool.New(fipClient, kubeClient, fipInformer, fipPoolInformer, floatingIPProjectQuotaInformer, ipamAllocator, reinitChan)
 	floatingIPProjectQuotaController := floatingipprojectquota.New(fipClient, kubeClient, floatingIPProjectQuotaInformer, fipInformer, fipPoolInformer)
 	fipController := floatingip.New(fipClient, kubeClient, fipInformer, fipPoolInformer, floatingIPProjectQuotaInformer, ipamAllocator)
+
+	// Start the HTTP service
+	httpServer := service.New(
+		httpServicePort,
+		ipamAllocator,
+		fipPoolInformer.Lister(),
+		floatingIPProjectQuotaInformer.Lister(),
+		fipInformer.Lister(),
+	)
+	go httpServer.Start(ctx)
 
 	// Start informers
 	go fipInformerFactory.Start(ctx.Done())
