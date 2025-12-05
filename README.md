@@ -151,6 +151,42 @@ If approved, the IP details are returned to the rancher-fip-lb-controller, which
     kubectl get floatingipprojectquota my-project -o yaml
     ```
 
+## Metrics
+
+The following metrics are included in the application which can be used for monitoring:
+
+```YAML
+Name: rancherfipmanager_floatingipprojectquota_created
+Description: Object creation timestamp.
+```
+
+```YAML
+Name: rancherfipmanager_floatingipprojectquota
+Description: Quota information per project.
+```
+
+```YAML
+Name: rancherfipmanager_floatingips
+Description: Information about floating IPs.
+```
+
+```YAML
+Name: rancherfipmanager_ippool_capacity
+Description: Total IPs in the pool.
+```
+
+```YAML
+Name: rancherfipmanager_ippool_available
+Description: Available IPs in the pool.
+```
+
+```YAML
+Name: rancherfipmanager_ippool_used
+Description: Used IPs in the pool.
+```
+
+Metrics are exported on port 8080 by default via the /metrics path. This can be changed by adding the http-service-port flag as an argument in the deployment. The deployment example also contains a servicemonitor object which can be automatically picked up by the Prometheus monitoring solution.
+
 # License
 
 Copyright (c) 2025 Joey Loman <joey@binbash.org>
