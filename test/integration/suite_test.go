@@ -39,7 +39,6 @@ func TestMain(m *testing.M) {
 	logf.SetLogger(zap.New(zap.WriteTo(os.Stdout), zap.UseDevMode(true)))
 
 	ctx, cancel = context.WithCancel(context.TODO())
-	defer cancel()
 
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
@@ -142,7 +141,6 @@ func TestMain(m *testing.M) {
 	// NOTE: The constructor signatures for controllers are assumed based on the resources
 	// they watch and the general controller pattern.
 	ipAllocator := ipam.New()
-	fipPoolUpdateChan := make(chan struct{})
 
 	fipCtrl := fipcontroller.New(
 		rancherfipClientSet,
@@ -159,7 +157,6 @@ func TestMain(m *testing.M) {
 		fipPoolInformer,
 		floatingIPProjectQuotaInformer,
 		ipAllocator,
-		fipPoolUpdateChan,
 	)
 	fipProjectQuotaCtrl := floatingipprojectquotacontroller.New(
 		rancherfipClientSet,
@@ -196,6 +193,8 @@ func TestMain(m *testing.M) {
 	_ = k8sClient.Delete(ctx, startupPool)
 	_ = k8sClient.Delete(ctx, startupProject)
 	_ = k8sClient.Delete(ctx, startupNs)
+
+	cancel()
 
 	err = testEnv.Stop()
 	if err != nil {

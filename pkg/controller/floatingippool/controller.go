@@ -3,7 +3,6 @@ package floatingippool
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -42,7 +41,6 @@ type Controller struct {
 	workqueue                    workqueue.RateLimitingInterface
 	ipam                         *ipam.IPAllocator
 	initSyncDone                 chan struct{}
-	reinitChan                   chan<- struct{}
 }
 
 // New creates a new Controller for managing FloatingIPPool resources.
@@ -52,8 +50,7 @@ func New(
 	fipInformer informers.FloatingIPInformer,
 	fipPoolInformer informers.FloatingIPPoolInformer,
 	floatingIPProjectQuotaInformer informers.FloatingIPProjectQuotaInformer,
-	ipam *ipam.IPAllocator,
-	reinitChan chan<- struct{}) *Controller {
+	ipam *ipam.IPAllocator) *Controller {
 
 	controller := &Controller{
 		clientset:                    clientset,
@@ -67,34 +64,14 @@ func New(
 		workqueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "FloatingIPPools"),
 		ipam:                         ipam,
 		initSyncDone:                 make(chan struct{}),
-		reinitChan:                   reinitChan,
 	}
 
 	logrus.Info("Setting up event handlers for FloatingIPPool controller")
 	fipPoolInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.handleFipPoolCreate,
 		UpdateFunc: func(old, new interface{}) {
-			oldPool, ok := old.(*v1beta1.FloatingIPPool)
-			if !ok {
-				runtime.HandleError(fmt.Errorf("error decoding old object, invalid type"))
-				return
-			}
-			newPool, ok := new.(*v1beta1.FloatingIPPool)
-			if !ok {
-				runtime.HandleError(fmt.Errorf("error decoding new object, invalid type"))
-				return
-			}
-
-			if !reflect.DeepEqual(oldPool.Spec, newPool.Spec) {
-				logrus.Warnf("FloatingIPPool %s spec has changed, re-initializing controller", newPool.Name)
-				select {
-				case controller.reinitChan <- struct{}{}:
-				default:
-				}
-				return
-			}
-			// enable for debugging purposes
-			// controller.ipam.Usage(new.(*v1beta1.FloatingIPPool).Name)
+			// Always enqueue on update. The syncHandler will handle diffs and IPAM updates.
+			controller.enqueueFipPool(new)
 		},
 		DeleteFunc: controller.handleFipPoolDelete,
 	})
@@ -198,8 +175,18 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 	logrus.Infof("Syncing FloatingIPPool %s", name)
 
-	allocated := make(map[string]string)
-	c.addPoolToIpam(pool, allocated)
+	if pool.Spec.IPConfig == nil {
+		return nil
+	}
+
+	// Gather all existing allocations (FIPs) for this pool
+	allocatedIPs := []string{}
+	allocatedMap := make(map[string]string)
+
+	// Add excluded IPs to allocated map for status
+	for _, excludedIP := range pool.Spec.IPConfig.Pool.Exclude {
+		allocatedMap[excludedIP] = "excluded"
+	}
 
 	fips, err := c.fipLister.List(labels.Everything())
 	if err != nil {
@@ -208,14 +195,10 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 	for _, fip := range fips {
 		if fip.Spec.FloatingIPPool == pool.Name {
-			// Make sure all existing allocated FIPs are processed before the floatingip controller starts
-			if fip.Spec.IPAddr != nil && *fip.Spec.IPAddr != "" && fip.Status.IPAddr != "" {
-				// Re-allocate in IPAM to reserve it
-				_, err := c.ipam.GetIP(pool.Name, *fip.Spec.IPAddr)
-				if err != nil {
-					runtime.HandleError(fmt.Errorf("failed to re-allocate ip %s for fip %s/%s in pool %s during pool sync: %w", *fip.Spec.IPAddr, fip.Namespace, fip.Name, pool.Name, err))
-					continue
-				}
+			if fip.Spec.IPAddr != nil && *fip.Spec.IPAddr != "" {
+				allocatedIPs = append(allocatedIPs, *fip.Spec.IPAddr)
+
+				// Determine display name for status
 				var allocatedDisplayName string
 				projectName, ok := fip.Labels["rancher.k8s.binbash.org/project-name"]
 				if ok {
@@ -227,24 +210,34 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 						allocatedDisplayName = fmt.Sprintf("%s [%s]", projectName, allocatedTo.Spec.DisplayName)
 					}
 				} else {
-					runtime.HandleError(fmt.Errorf("fip %s/%s has no project label", fip.Namespace, fip.Name))
 					allocatedDisplayName = "Unassigned"
 				}
-				allocated[*fip.Spec.IPAddr] = allocatedDisplayName
+				allocatedMap[*fip.Spec.IPAddr] = allocatedDisplayName
 			}
 		}
 	}
 
+	// Update IPAM atomically
+	err = c.ipam.RefreshSubnet(
+		pool.Name,
+		pool.Spec.IPConfig.Subnet,
+		pool.Spec.IPConfig.Pool.Start,
+		pool.Spec.IPConfig.Pool.End,
+		pool.Spec.IPConfig.Pool.Exclude,
+		allocatedIPs,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to refresh subnet for pool %s: %w", pool.Name, err)
+	}
+
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Retrieve the latest version of FloatingIPPool before attempting update
-		// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
 		poolToUpdate, err := c.clientset.RancherV1beta1().FloatingIPPools().Get(ctx, pool.Name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get latest version of fip pool %s: %w", pool.Name, err)
 		}
 
 		poolToUpdate.Status = v1beta1.FloatingIPPoolStatus{
-			Allocated: allocated,
+			Allocated: allocatedMap,
 			Used:      c.ipam.Used(pool.Name),
 			Available: c.ipam.Available(pool.Name),
 		}
@@ -255,10 +248,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to update fip pool status for %s: %w", pool.Name, err)
 	}
 
-	// enable for debugging purposes
-	// c.ipam.Usage(pool.Name)
-
-	logrus.Infof("Successfully synced FloatingIPPool %s and rebuilt status", name)
+	logrus.Infof("Successfully synced FloatingIPPool %s", name)
 	return nil
 }
 
@@ -273,53 +263,13 @@ func (c *Controller) enqueueFipPool(obj interface{}) {
 }
 
 func (c *Controller) handleFipPoolCreate(obj interface{}) {
-	pool, ok := obj.(*v1beta1.FloatingIPPool)
+	_, ok := obj.(*v1beta1.FloatingIPPool)
 	if !ok {
 		runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
 		return
 	}
 
-	// On create, we clear the status so it can be rebuilt.
-	if !reflect.DeepEqual(pool.Status, v1beta1.FloatingIPPoolStatus{}) {
-		logrus.Infof("Clearing status for newly created FloatingIPPool %s", pool.Name)
-		// Using context.TODO() as this is an event handler without a context.
-		poolToUpdate, err := c.clientset.RancherV1beta1().FloatingIPPools().Get(context.TODO(), pool.Name, metav1.GetOptions{})
-		if err != nil {
-			runtime.HandleError(fmt.Errorf("failed to get latest fip pool %s to clear status: %w", pool.Name, err))
-			return
-		}
-		poolToUpdate.Status = v1beta1.FloatingIPPoolStatus{}
-		_, err = c.clientset.RancherV1beta1().FloatingIPPools().UpdateStatus(context.TODO(), poolToUpdate, metav1.UpdateOptions{})
-		if err != nil {
-			runtime.HandleError(fmt.Errorf("failed to clear fip pool status for %s: %w", pool.Name, err))
-		}
-	}
-
 	c.enqueueFipPool(obj)
-}
-
-func (c *Controller) addPoolToIpam(pool *v1beta1.FloatingIPPool, allocated map[string]string) {
-	if pool.Spec.IPConfig != nil {
-		err := c.ipam.NewSubnet(pool.Name, pool.Spec.IPConfig.Subnet, pool.Spec.IPConfig.Pool.Start, pool.Spec.IPConfig.Pool.End)
-		if err != nil {
-			runtime.HandleError(fmt.Errorf("failed to add subnet for pool %s to ipam: %w", pool.Name, err))
-			return
-		}
-		// mark the exclude ips as used
-		for _, v := range pool.Spec.IPConfig.Pool.Exclude {
-			ip, err := c.ipam.GetIP(pool.Name, v)
-			if err != nil {
-				runtime.HandleError(fmt.Errorf("failed to allocate exclude-ip %s in pool %s during init: %w", v, pool.Name, err))
-				return
-			}
-			// maybe unnecesarry check, but just to make sure
-			if ip != v {
-				runtime.HandleError(fmt.Errorf("returned ip %s does not match the requested ip %s in pool %s during init: %w", ip, v, pool.Name, err))
-				return
-			}
-			allocated[v] = "excluded"
-		}
-	}
 }
 
 func (c *Controller) handleFipPoolDelete(obj interface{}) {

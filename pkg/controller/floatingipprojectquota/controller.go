@@ -230,26 +230,10 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 }
 
 func (c *Controller) handleFloatingIPProjectQuotaCreate(obj interface{}) {
-	floatingIPProjectQuota, ok := obj.(*v1beta1.FloatingIPProjectQuota)
+	_, ok := obj.(*v1beta1.FloatingIPProjectQuota)
 	if !ok {
 		runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
 		return
-	}
-
-	// On create, we clear the status so it can be rebuilt.
-	if !reflect.DeepEqual(floatingIPProjectQuota.Status, v1beta1.FloatingIPProjectQuotaStatus{}) {
-		logrus.Infof("Clearing status for newly created FloatingIPProjectQuota %s", floatingIPProjectQuota.Name)
-		// Using context.TODO() as this is an event handler without a context.
-		floatingIPProjectQuotaToUpdate, err := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().Get(context.TODO(), floatingIPProjectQuota.Name, metav1.GetOptions{})
-		if err != nil {
-			runtime.HandleError(fmt.Errorf("failed to get latest floatingipprojectquota %s to clear status: %w", floatingIPProjectQuota.Name, err))
-			return
-		}
-		floatingIPProjectQuotaToUpdate.Status = v1beta1.FloatingIPProjectQuotaStatus{}
-		_, err = c.clientset.RancherV1beta1().FloatingIPProjectQuotas().UpdateStatus(context.TODO(), floatingIPProjectQuotaToUpdate, metav1.UpdateOptions{})
-		if err != nil {
-			runtime.HandleError(fmt.Errorf("failed to clear floatingipprojectquota status for %s: %w", floatingIPProjectQuota.Name, err))
-		}
 	}
 
 	c.enqueueFloatingIPProjectQuota(obj)

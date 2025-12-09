@@ -90,8 +90,7 @@ func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 
 	// Create controller
 	ipam := ipam.New()
-	reinitChan := make(chan struct{}, 1)
-	controller := New(clientset, kubeClient, fipInformer, fipPoolInformer, projectInformer, ipam, reinitChan)
+	controller := New(clientset, kubeClient, fipInformer, fipPoolInformer, projectInformer, ipam)
 
 	// Run syncHandler
 	key, err := cache.MetaNamespaceKeyFunc(pool)

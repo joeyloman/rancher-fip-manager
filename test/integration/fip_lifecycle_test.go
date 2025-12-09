@@ -21,7 +21,7 @@ const (
 	fipName            = "my-app-fip"
 	timeout            = time.Second * 10
 	interval           = time.Millisecond * 250
-	finalizerName      = "rancher.k8s.binbash.org/finalizer"
+	finalizerName      = "rancher.k8s.binbash.org/floatingip-cleanup"
 	projectLabel       = "rancher.k8s.binbash.org/project-name"
 	allocatedIP        = "192.168.100.10"
 	fipStatusAllocated = "Allocated"

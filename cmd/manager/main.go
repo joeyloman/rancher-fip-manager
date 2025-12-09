@@ -37,8 +37,6 @@ var (
 	httpServicePort    string
 )
 
-var reinitChan = make(chan struct{}, 1)
-
 func main() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&kubeContext, "context", "", "The name of the kubeconfig context to use.")
@@ -79,7 +77,7 @@ func main() {
 	}
 
 	if !leaderElect {
-		runLoop(ctx, kubeClient, fipClient)
+		run(ctx, kubeClient, fipClient)
 		logrus.Info("Controller finished")
 		return
 	}
@@ -105,7 +103,7 @@ func main() {
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				runLoop(ctx, kubeClient, fipClient)
+				run(ctx, kubeClient, fipClient)
 			},
 			OnStoppedLeading: func() {
 				logrus.Infof("leader lost: %s", id)
@@ -122,24 +120,7 @@ func main() {
 	})
 }
 
-func runLoop(ctx context.Context, kubeClient kubernetes.Interface, fipClient clientset.Interface) {
-	for {
-		runCtx, cancel := context.WithCancel(ctx)
-		run(runCtx, kubeClient, fipClient, reinitChan)
-
-		select {
-		case <-reinitChan:
-			logrus.Info("Re-initializing controller...")
-			cancel()
-		case <-ctx.Done():
-			logrus.Info("Main context cancelled, stopping run loop.")
-			cancel()
-			return
-		}
-	}
-}
-
-func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clientset.Interface, reinitChan chan<- struct{}) {
+func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clientset.Interface) {
 	logrus.Info("Starting rancherfip controller")
 
 	fipInformerFactory := informers.NewSharedInformerFactory(fipClient, 0)
@@ -149,7 +130,7 @@ func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clients
 	floatingIPProjectQuotaInformer := fipInformerFactory.Rancher().V1beta1().FloatingIPProjectQuotas()
 	fipInformer := fipInformerFactory.Rancher().V1beta1().FloatingIPs()
 
-	fipPoolController := floatingippool.New(fipClient, kubeClient, fipInformer, fipPoolInformer, floatingIPProjectQuotaInformer, ipamAllocator, reinitChan)
+	fipPoolController := floatingippool.New(fipClient, kubeClient, fipInformer, fipPoolInformer, floatingIPProjectQuotaInformer, ipamAllocator)
 	floatingIPProjectQuotaController := floatingipprojectquota.New(fipClient, kubeClient, floatingIPProjectQuotaInformer, fipInformer, fipPoolInformer)
 	fipController := floatingip.New(fipClient, kubeClient, fipInformer, fipPoolInformer, floatingIPProjectQuotaInformer, ipamAllocator)
 

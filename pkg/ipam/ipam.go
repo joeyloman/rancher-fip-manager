@@ -51,39 +51,83 @@ func New() *IPAllocator {
 // NewSubnet adds a new subnet to the IPAM. It validates that the start and end
 // IPs are within the subnet and that the end IP is not the broadcast address.
 // It pre-populates a map of all available IPs within the given range.
-func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) (err error) {
+func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) error {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	s, err := a.buildSubnet(subnet, start, end)
+	if err != nil {
+		return err
+	}
+
+	a.ipam[name] = s
+	return nil
+}
+
+// RefreshSubnet recreates a subnet with new configuration and preserves existing allocations.
+func (a *IPAllocator) RefreshSubnet(name, subnet, start, end string, excludes []string, allocations []string) error {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	// 1. Build new subnet configuration
+	s, err := a.buildSubnet(subnet, start, end)
+	if err != nil {
+		return err
+	}
+
+	// 2. Mark excluded IPs as used
+	for _, ipStr := range excludes {
+		// Verify IP is valid for this subnet
+		if err := a.markIPUsed(&s, ipStr); err != nil {
+			return fmt.Errorf("failed to reserve excluded ip %s: %w", ipStr, err)
+		}
+	}
+
+	// 3. Mark existing allocations as used
+	for _, ipStr := range allocations {
+		// Verify IP is valid for this subnet
+		if err := a.markIPUsed(&s, ipStr); err != nil {
+			return fmt.Errorf("failed to restore allocation for ip %s: %w", ipStr, err)
+		}
+	}
+
+	// 4. Atomically swap
+	a.ipam[name] = s
+	return nil
+}
+
+// buildSubnet creates an IPSubnet struct but does not add it to the map.
+func (a *IPAllocator) buildSubnet(subnet, start, end string) (IPSubnet, error) {
 	s := IPSubnet{}
 	s.start = net.ParseIP(start)
 	s.end = net.ParseIP(end)
 
 	ipnet, err := netip.ParsePrefix(subnet)
 	if err != nil {
-		return err
+		return s, err
 	}
 	s.cidr = ipnet
 
 	startIP, err := netip.ParseAddr(start)
 	if err != nil {
-		return err
+		return s, err
 	}
-	startIPCheck := ipnet.Contains(startIP)
-	if !startIPCheck {
-		return fmt.Errorf("start address %s is not within subnet %s range", start, subnet)
+	if !ipnet.Contains(startIP) {
+		return s, fmt.Errorf("start address %s is not within subnet %s range", start, subnet)
 	}
 
 	endIP, err := netip.ParseAddr(end)
 	if err != nil {
-		return err
+		return s, err
 	}
-	endIPCheck := ipnet.Contains(endIP)
-	if !endIPCheck {
-		return fmt.Errorf("end address %s is not within subnet %s range", end, subnet)
+	if !ipnet.Contains(endIP) {
+		return s, fmt.Errorf("end address %s is not within subnet %s range", end, subnet)
 	}
 
 	startAddr, _ := netip.AddrFromSlice(s.start)
 	endAddr, _ := netip.AddrFromSlice(s.end)
 	if startAddr.Compare(endAddr) > 0 {
-		return fmt.Errorf("end address %s is smaller then the start address %s", end, start)
+		return s, fmt.Errorf("end address %s is smaller then the start address %s", end, start)
 	}
 
 	if ipnet.Addr().Is4() {
@@ -96,7 +140,7 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 		s.broadcast = subnetBroadcast
 
 		if s.end.Equal(s.broadcast) {
-			return fmt.Errorf("end address %s equals the broadcast address %s", s.end.String(), s.broadcast.String())
+			return s, fmt.Errorf("end address %s equals the broadcast address %s", s.end.String(), s.broadcast.String())
 		}
 	}
 
@@ -107,13 +151,34 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 	}
 	s.ips = allocatedIPs
 
-	a.ipam[name] = s
+	return s, nil
+}
 
-	return
+// markIPUsed marks an IP as used in the given subnet struct.
+func (a *IPAllocator) markIPUsed(s *IPSubnet, ipStr string) error {
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return err
+	}
+	if !s.cidr.Contains(ip) {
+		return fmt.Errorf("ip %s is not in cidr %s", ipStr, s.cidr)
+	}
+	if s.broadcast != nil && s.broadcast.Equal(ip.Unmap().AsSlice()) {
+		return fmt.Errorf("ip %s equals broadcast address", ipStr)
+	}
+
+	// We check if it exists in the map (within start-end range)
+	if _, ok := s.ips[ipStr]; ok {
+		s.ips[ipStr] = true
+		return nil
+	}
+	return fmt.Errorf("ip %s not found in pool range", ipStr)
 }
 
 // DeleteSubnet removes a subnet from the IPAM.
 func (a *IPAllocator) DeleteSubnet(name string) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
 	delete(a.ipam, name)
 }
 

@@ -625,9 +625,6 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 		logrus.Warnf("failed to release ip %s from ipam pool %s: %v", ipToRelease, poolName, err)
 	}
 
-	// enable for debugging purposes
-	// c.ipam.Usage(poolName)
-
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		currentFipPool, errGet := c.clientset.RancherV1beta1().FloatingIPPools().Get(ctx, poolName, metav1.GetOptions{})
 		if errGet != nil {
@@ -644,7 +641,12 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 		}
 
 		if _, ok := currentFipPoolCopy.Status.Allocated[ipToRelease]; !ok {
-			return nil // Already released
+			// Even if the IP is not in the allocated map, we should still update the Used/Available counts
+			// because ReleaseIP was just called successfully on the IPAM allocator.
+			// This handles cases where the status map might be out of sync but IPAM was tracking it.
+			// However, if IPAM also didn't have it, ReleaseIP would have returned an error (which we logged but ignored).
+			// So it's safer to proceed with updating counts.
+			logrus.Warnf("IP %s is not in the allocated map but ReleaseIP was successful. Updating counts anyway.", ipToRelease)
 		}
 
 		delete(currentFipPoolCopy.Status.Allocated, ipToRelease)
