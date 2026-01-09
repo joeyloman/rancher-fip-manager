@@ -107,17 +107,26 @@ func (c *Collector) collectQuotas(ch chan<- prometheus.Metric) {
 			quota.Name,
 		)
 
-		for poolName, fipInfo := range quota.Status.FloatingIPs {
-			ch <- prometheus.MustNewConstMetric(c.quotaInfo, prometheus.GaugeValue, float64(quota.Spec.FloatingIPQuota[poolName]),
+		for poolName, hardQuota := range quota.Spec.FloatingIPQuota {
+			ch <- prometheus.MustNewConstMetric(c.quotaInfo, prometheus.GaugeValue, float64(hardQuota),
 				quota.Name,
 				poolName,
 				"hard",
 			)
-			ch <- prometheus.MustNewConstMetric(c.quotaInfo, prometheus.GaugeValue, float64(fipInfo.Used),
-				quota.Name,
-				poolName,
-				"used",
-			)
+
+			if quota.Status.FloatingIPs[poolName] != nil {
+				ch <- prometheus.MustNewConstMetric(c.quotaInfo, prometheus.GaugeValue, float64(quota.Status.FloatingIPs[poolName].Used),
+					quota.Name,
+					poolName,
+					"used",
+				)
+			} else {
+				ch <- prometheus.MustNewConstMetric(c.quotaInfo, prometheus.GaugeValue, 0,
+					quota.Name,
+					poolName,
+					"used",
+				)
+			}
 		}
 	}
 }
