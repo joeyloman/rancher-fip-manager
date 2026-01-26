@@ -22,13 +22,13 @@ The controller runs with high availability using a leader election mechanism, en
 
 ## How does the rancher-fip-manager work?
 
-When a user creates a downstream or bare-metal cluster in Rancher, the rancher-fip-cluster-manager detects it and checks for the cluster object label rancher-fip.
-If the label exists and is set to enabled, the manager creates the necessary API configurations and secrets, then installs the rancher-fip-lb-controller and MetalLB Helm charts in the new cluster.
+When a user creates a downstream or bare-metal cluster in Rancher, the rancher-fip-cluster-manager detects it and checks for the cluster object label `rancher-fip` and optionally for the label `rancher-fip-lbtype`.
+If the `rancher-fip` label exists and is set to `enabled`, the manager creates the necessary API configurations and secrets, then installs the rancher-fip-lb-controller and the specified load balancer type (PureLB or MetalLB) Helm charts in the new cluster. If no load balancer type is specified, PureLB is selected as the default.
 
-When the user later creates a Service LoadBalancer object within that cluster, the rancher-fip-lb-controller detects it and requests a new or existing IP address from the rancher-fip-api-server.
-The API server attempts to create a FloatingIP object, which is validated by the rancher-fip-manager-webhook to ensure it is allowed, correctly configured, and within the FloatingIPProjectQuota limits.
+When the user later creates a Service LoadBalancer object within that cluster, the rancher-fip-lb-controller detects it and requests an IP address from the rancher-fip-api-server.
+The API server attempts to create a FloatingIP object, which is validated by the rancher-fip-manager-webhook to ensure the request is allowed, correctly configured, and within the FloatingIPProjectQuota limits.
 
-If approved, the IP details are returned to the rancher-fip-lb-controller, which then creates the L2Advertisement and IPAddressPool objects. These are processed by the MetalLB controller, which assigns the IP address to the Service LoadBalancer.
+If approved, the IP details are returned to the rancher-fip-lb-controller, which then creates the PureLB or MetalLB objects. These are processed by the applicable controllers, which assign the IP address to the Service LoadBalancer.
 
 ![rancher-fip-manager](image/rancher-fip-manager.png)
 
@@ -189,7 +189,7 @@ Metrics are exported on port 8080 by default via the /metrics path. This can be 
 
 # License
 
-Copyright (c) 2025 Joey Loman <joey@binbash.org>
+Copyright (c) 2026 Joey Loman <joey@binbash.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
