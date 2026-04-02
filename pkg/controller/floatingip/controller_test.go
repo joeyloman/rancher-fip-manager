@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	v1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	v1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	"github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned/fake"
 	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions"
 	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
@@ -44,7 +44,7 @@ func newFixture(t *testing.T, fipObjects []runtime.Object, kubeObjects []runtime
 
 	// Initialize IPAM with pools from the test objects
 	for _, obj := range fipObjects {
-		if pool, ok := obj.(*v1beta1.FloatingIPPool); ok {
+		if pool, ok := obj.(*v1beta2.FloatingIPPool); ok {
 			if pool.Spec.IPConfig != nil {
 				err := ipam.NewSubnet(pool.Name, pool.Spec.IPConfig.Subnet, pool.Spec.IPConfig.Pool.Start, pool.Spec.IPConfig.Pool.End)
 				require.NoError(t, err)
@@ -55,21 +55,21 @@ func newFixture(t *testing.T, fipObjects []runtime.Object, kubeObjects []runtime
 	controller := New(
 		clientset,
 		kubeclient,
-		fipInformerFactory.Rancher().V1beta1().FloatingIPs(),
-		fipInformerFactory.Rancher().V1beta1().FloatingIPPools(),
-		fipInformerFactory.Rancher().V1beta1().FloatingIPProjectQuotas(),
+		fipInformerFactory.Rancher().V1beta2().FloatingIPs(),
+		fipInformerFactory.Rancher().V1beta2().FloatingIPPools(),
+		fipInformerFactory.Rancher().V1beta2().FloatingIPProjectQuotas(),
 		ipam,
 	)
 
 	// Populate informers
 	for _, obj := range fipObjects {
 		switch obj := obj.(type) {
-		case *v1beta1.FloatingIP:
-			fipInformerFactory.Rancher().V1beta1().FloatingIPs().Informer().GetIndexer().Add(obj)
-		case *v1beta1.FloatingIPPool:
-			fipInformerFactory.Rancher().V1beta1().FloatingIPPools().Informer().GetIndexer().Add(obj)
-		case *v1beta1.FloatingIPProjectQuota:
-			fipInformerFactory.Rancher().V1beta1().FloatingIPProjectQuotas().Informer().GetIndexer().Add(obj)
+		case *v1beta2.FloatingIP:
+			fipInformerFactory.Rancher().V1beta2().FloatingIPs().Informer().GetIndexer().Add(obj)
+		case *v1beta2.FloatingIPPool:
+			fipInformerFactory.Rancher().V1beta2().FloatingIPPools().Informer().GetIndexer().Add(obj)
+		case *v1beta2.FloatingIPProjectQuota:
+			fipInformerFactory.Rancher().V1beta2().FloatingIPProjectQuotas().Informer().GetIndexer().Add(obj)
 		}
 	}
 	for _, obj := range kubeObjects {
@@ -101,30 +101,30 @@ func newNamespace(name, projectName string) *corev1.Namespace {
 	}
 }
 
-func newProject(name string) *v1beta1.FloatingIPProjectQuota {
-	return &v1beta1.FloatingIPProjectQuota{
-		TypeMeta: metav1.TypeMeta{APIVersion: v1beta1.SchemeGroupVersion.String()},
+func newProject(name string) *v1beta2.FloatingIPProjectQuota {
+	return &v1beta2.FloatingIPProjectQuota{
+		TypeMeta: metav1.TypeMeta{APIVersion: v1beta2.SchemeGroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Spec: v1beta1.FloatingIPProjectQuotaSpec{
+		Spec: v1beta2.FloatingIPProjectQuotaSpec{
 			DisplayName: "Test Project",
 		},
 	}
 }
 
-func newPool(name, start, end string) *v1beta1.FloatingIPPool {
-	return &v1beta1.FloatingIPPool{
-		TypeMeta: metav1.TypeMeta{APIVersion: v1beta1.SchemeGroupVersion.String()},
+func newPool(name, start, end string) *v1beta2.FloatingIPPool {
+	return &v1beta2.FloatingIPPool{
+		TypeMeta: metav1.TypeMeta{APIVersion: v1beta2.SchemeGroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Spec: v1beta1.FloatingIPPoolSpec{
+		Spec: v1beta2.FloatingIPPoolSpec{
 			TargetNetworkInterface: "eth0",
-			IPConfig: &v1beta1.IPConfig{
+			IPConfig: &v1beta2.IPConfig{
 				Family: "IPv4",
 				Subnet: "10.0.0.0/24",
-				Pool: v1beta1.Pool{
+				Pool: v1beta2.Pool{
 					Start: start,
 					End:   end,
 				},
@@ -133,20 +133,20 @@ func newPool(name, start, end string) *v1beta1.FloatingIPPool {
 	}
 }
 
-func newFip(name, namespace, poolName string) *v1beta1.FloatingIP {
-	return &v1beta1.FloatingIP{
-		TypeMeta: metav1.TypeMeta{APIVersion: v1beta1.SchemeGroupVersion.String()},
+func newFip(name, namespace, poolName string) *v1beta2.FloatingIP {
+	return &v1beta2.FloatingIP{
+		TypeMeta: metav1.TypeMeta{APIVersion: v1beta2.SchemeGroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: v1beta1.FloatingIPSpec{
+		Spec: v1beta2.FloatingIPSpec{
 			FloatingIPPool: poolName,
 		},
 	}
 }
 
-func getKey(fip *v1beta1.FloatingIP, t *testing.T) string {
+func getKey(fip *v1beta2.FloatingIP, t *testing.T) string {
 	key, err := cache.MetaNamespaceKeyFunc(fip)
 	require.NoError(t, err, "failed to get key for fip")
 	return key
@@ -160,7 +160,7 @@ func TestSyncHandler_AddsFinalizer(t *testing.T) {
 	err := f.run(key)
 	require.NoError(t, err)
 
-	updatedFip, err := f.clientset.RancherV1beta1().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
+	updatedFip, err := f.clientset.RancherV1beta2().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Contains(t, updatedFip.GetFinalizers(), finalizerName, "finalizer should be added")
 }
@@ -179,7 +179,7 @@ func TestSyncHandler_AllocatesIP(t *testing.T) {
 	err := f.run(key)
 	require.NoError(t, err)
 
-	updatedFip, err := f.clientset.RancherV1beta1().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
+	updatedFip, err := f.clientset.RancherV1beta2().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, updatedFip.Spec.IPAddr, "IPAddr should be set in spec")
 	assert.Equal(t, "10.0.0.10", *updatedFip.Spec.IPAddr, "allocated IP should be the first in the pool")
@@ -203,7 +203,7 @@ func TestSyncHandler_UpdatesStatuses(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check FIP status
-	finalFip, err := f.clientset.RancherV1beta1().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
+	finalFip, err := f.clientset.RancherV1beta2().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, finalFip.Status.Assigned, "FIP status should be assigned")
 	require.NotEmpty(t, finalFip.Status.Conditions, "FIP status should have conditions")
@@ -211,12 +211,12 @@ func TestSyncHandler_UpdatesStatuses(t *testing.T) {
 	assert.Equal(t, metav1.ConditionTrue, finalFip.Status.Conditions[0].Status)
 
 	// Check Pool status
-	finalPool, err := f.clientset.RancherV1beta1().FloatingIPPools().Get(context.Background(), testPoolName, metav1.GetOptions{})
+	finalPool, err := f.clientset.RancherV1beta2().FloatingIPPools().Get(context.Background(), testPoolName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Contains(t, finalPool.Status.Allocated, allocatedIP, "pool status should show allocated IP")
 
 	// Check Project status
-	finalProject, err := f.clientset.RancherV1beta1().FloatingIPProjectQuotas().Get(context.Background(), testProjectName, metav1.GetOptions{})
+	finalProject, err := f.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), testProjectName, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Contains(t, finalProject.Status.FloatingIPs, testPoolName)
 	assert.Equal(t, 1, finalProject.Status.FloatingIPs[testPoolName].Used)
@@ -232,13 +232,13 @@ func TestSyncHandler_Deletion(t *testing.T) {
 	fip.SetFinalizers([]string{finalizerName})
 	now := metav1.Now()
 	fip.SetDeletionTimestamp(&now)
-	fip.Status.Assigned = &v1beta1.AssignedInfo{} // Mark as assigned to trigger release logic
+	fip.Status.Assigned = &v1beta2.AssignedInfo{} // Mark as assigned to trigger release logic
 
 	pool := newPool(testPoolName, "10.0.0.10", "10.0.0.20")
 	pool.Status.Allocated = map[string]string{allocatedIP: "test-project [Test Project]"}
 
 	project := newProject(testProjectName)
-	project.Status.FloatingIPs = map[string]*v1beta1.FipInfo{
+	project.Status.FloatingIPs = map[string]*v1beta2.FipInfo{
 		testPoolName: {
 			Used:      1,
 			Allocated: map[string]string{allocatedIP: "Unassigned"},
@@ -257,17 +257,17 @@ func TestSyncHandler_Deletion(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check finalizer is removed
-	updatedFip, err := f.clientset.RancherV1beta1().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
+	updatedFip, err := f.clientset.RancherV1beta2().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Empty(t, updatedFip.GetFinalizers(), "finalizer should be removed")
 
 	// Check Pool status
-	finalPool, err := f.clientset.RancherV1beta1().FloatingIPPools().Get(context.Background(), testPoolName, metav1.GetOptions{})
+	finalPool, err := f.clientset.RancherV1beta2().FloatingIPPools().Get(context.Background(), testPoolName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.NotContains(t, finalPool.Status.Allocated, allocatedIP, "IP should be released from pool status")
 
 	// Check Project status
-	finalProject, err := f.clientset.RancherV1beta1().FloatingIPProjectQuotas().Get(context.Background(), testProjectName, metav1.GetOptions{})
+	finalProject, err := f.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), testProjectName, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Contains(t, finalProject.Status.FloatingIPs, testPoolName)
 	assert.Equal(t, 0, finalProject.Status.FloatingIPs[testPoolName].Used)

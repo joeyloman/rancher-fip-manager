@@ -5,9 +5,45 @@ metadata:
 spec:
   group: rancher.k8s.binbash.org
   versions:
-    - name: v1beta1
+    - name: v1beta2
       served: true
       storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                displayName:
+                  type: string
+                floatingIPQuota:
+                  type: object
+                  additionalProperties:
+                    type: integer
+            status:
+              type: object
+              properties:
+                fips:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                      family:
+                        type: string
+                      allocated:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      used:
+                        type: integer
+      subresources:
+        status: {}
+    - name: v1beta1
+      served: true
+      storage: false
+      deprecated: true
+      deprecationWarning: "rancher.k8s.binbash.org/v1beta1 FloatingIPProjectQuota is deprecated"
       schema:
         openAPIV3Schema:
           type: object

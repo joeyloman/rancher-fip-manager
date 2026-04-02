@@ -19,9 +19,9 @@ limitations under the License.
 package applyconfiguration
 
 import (
-	v1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	v1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	internal "github.com/joeyloman/rancher-fip-manager/pkg/generated/applyconfiguration/internal"
-	rancherk8sbinbashorgv1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/generated/applyconfiguration/rancher.k8s.binbash.org/v1beta1"
+	rancherk8sbinbashorgv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/generated/applyconfiguration/rancher.k8s.binbash.org/v1beta2"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	managedfields "k8s.io/apimachinery/pkg/util/managedfields"
@@ -31,33 +31,35 @@ import (
 // apply configuration type exists for the given GroupVersionKind.
 func ForKind(kind schema.GroupVersionKind) interface{} {
 	switch kind {
-	// Group=rancher.k8s.binbash.org, Version=v1beta1
-	case v1beta1.SchemeGroupVersion.WithKind("AssignedInfo"):
-		return &rancherk8sbinbashorgv1beta1.AssignedInfoApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FipInfo"):
-		return &rancherk8sbinbashorgv1beta1.FipInfoApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIP"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPPool"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPPoolApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPPoolSpec"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPPoolSpecApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPPoolStatus"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPPoolStatusApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPProjectQuota"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPProjectQuotaApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPProjectQuotaSpec"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPProjectQuotaSpecApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPProjectQuotaStatus"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPProjectQuotaStatusApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPSpec"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPSpecApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("FloatingIPStatus"):
-		return &rancherk8sbinbashorgv1beta1.FloatingIPStatusApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("IPConfig"):
-		return &rancherk8sbinbashorgv1beta1.IPConfigApplyConfiguration{}
-	case v1beta1.SchemeGroupVersion.WithKind("Pool"):
-		return &rancherk8sbinbashorgv1beta1.PoolApplyConfiguration{}
+	// Group=rancher.k8s.binbash.org, Version=v1beta2
+	case v1beta2.SchemeGroupVersion.WithKind("AssignedInfo"):
+		return &rancherk8sbinbashorgv1beta2.AssignedInfoApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("AssignedService"):
+		return &rancherk8sbinbashorgv1beta2.AssignedServiceApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FipInfo"):
+		return &rancherk8sbinbashorgv1beta2.FipInfoApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIP"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPPool"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPPoolApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPPoolSpec"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPPoolSpecApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPPoolStatus"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPPoolStatusApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPProjectQuota"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPProjectQuotaApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPProjectQuotaSpec"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPProjectQuotaSpecApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPProjectQuotaStatus"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPProjectQuotaStatusApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPSpec"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPSpecApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("FloatingIPStatus"):
+		return &rancherk8sbinbashorgv1beta2.FloatingIPStatusApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("IPConfig"):
+		return &rancherk8sbinbashorgv1beta2.IPConfigApplyConfiguration{}
+	case v1beta2.SchemeGroupVersion.WithKind("Pool"):
+		return &rancherk8sbinbashorgv1beta2.PoolApplyConfiguration{}
 
 	}
 	return nil

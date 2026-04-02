@@ -1,4 +1,4 @@
-apiVersion: rancher.k8s.binbash.org/v1beta1
+apiVersion: rancher.k8s.binbash.org/v1beta2
 kind: FloatingIPPool
 metadata:
   name: rke2-bm-aio--public-vlan-1

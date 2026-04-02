@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	rancherfipv1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	rancherfipv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 )
 
 const (
@@ -40,9 +40,9 @@ func TestFloatingIPLifecycle(t *testing.T) {
 	require.NoError(t, k8sClient.Create(ctx, ns), "failed to create test namespace")
 
 	// Create FloatingIPProjectQuota
-	project := &rancherfipv1beta1.FloatingIPProjectQuota{
+	project := &rancherfipv1beta2.FloatingIPProjectQuota{
 		ObjectMeta: metav1.ObjectMeta{Name: projectName},
-		Spec: rancherfipv1beta1.FloatingIPProjectQuotaSpec{
+		Spec: rancherfipv1beta2.FloatingIPProjectQuotaSpec{
 			DisplayName:     "My Test Project",
 			FloatingIPQuota: map[string]int{poolName: 5},
 		},
@@ -50,14 +50,14 @@ func TestFloatingIPLifecycle(t *testing.T) {
 	require.NoError(t, k8sClient.Create(ctx, project), "failed to create FloatingIPProjectQuota")
 
 	// Create FloatingIPPool
-	pool := &rancherfipv1beta1.FloatingIPPool{
+	pool := &rancherfipv1beta2.FloatingIPPool{
 		ObjectMeta: metav1.ObjectMeta{Name: poolName},
-		Spec: rancherfipv1beta1.FloatingIPPoolSpec{
+		Spec: rancherfipv1beta2.FloatingIPPoolSpec{
 			TargetNetworkInterface: "eth0",
-			IPConfig: &rancherfipv1beta1.IPConfig{
+			IPConfig: &rancherfipv1beta2.IPConfig{
 				Family: "IPv4",
 				Subnet: "192.168.100.0/24",
-				Pool: rancherfipv1beta1.Pool{
+				Pool: rancherfipv1beta2.Pool{
 					Start: "192.168.100.10",
 					End:   "192.168.100.20",
 				},
@@ -67,13 +67,13 @@ func TestFloatingIPLifecycle(t *testing.T) {
 	require.NoError(t, k8sClient.Create(ctx, pool), "failed to create FloatingIPPool")
 
 	// Create FloatingIP
-	fip := &rancherfipv1beta1.FloatingIP{
+	fip := &rancherfipv1beta2.FloatingIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fipName,
 			Namespace: namespaceName,
 			Labels:    map[string]string{projectLabel: projectName},
 		},
-		Spec: rancherfipv1beta1.FloatingIPSpec{
+		Spec: rancherfipv1beta2.FloatingIPSpec{
 			FloatingIPPool: poolName,
 		},
 	}
@@ -85,7 +85,7 @@ func TestFloatingIPLifecycle(t *testing.T) {
 	projectKey := types.NamespacedName{Name: projectName, Namespace: ""}
 
 	// 1. Check FloatingIP status
-	var fetchedFIP rancherfipv1beta1.FloatingIP
+	var fetchedFIP rancherfipv1beta2.FloatingIP
 	require.Eventually(t, func() bool {
 		if err := k8sClient.Get(ctx, fipKey, &fetchedFIP); err != nil {
 			return false
@@ -97,7 +97,7 @@ func TestFloatingIPLifecycle(t *testing.T) {
 	require.Equal(t, finalizerName, fetchedFIP.Finalizers[0])
 
 	// 2. Check FloatingIPPool status
-	var fetchedPool rancherfipv1beta1.FloatingIPPool
+	var fetchedPool rancherfipv1beta2.FloatingIPPool
 	expectedPoolAllocationValue := "my-project [My Test Project]"
 	require.Eventually(t, func() bool {
 		if err := k8sClient.Get(ctx, poolKey, &fetchedPool); err != nil {
@@ -108,7 +108,7 @@ func TestFloatingIPLifecycle(t *testing.T) {
 	}, timeout, interval, "FloatingIPPool status should show the IP as allocated")
 
 	// 3. Check FloatingIPProjectQuota status
-	var fetchedProject rancherfipv1beta1.FloatingIPProjectQuota
+	var fetchedProject rancherfipv1beta2.FloatingIPProjectQuota
 	require.Eventually(t, func() bool {
 		if err := k8sClient.Get(ctx, projectKey, &fetchedProject); err != nil {
 			return false
@@ -156,13 +156,13 @@ func TestFloatingIP_PreExistingIP(t *testing.T) {
 	ctx := context.Background()
 
 	// This FIP is created to test that requesting an already allocated IP results in an error state.
-	fip := &rancherfipv1beta1.FloatingIP{
+	fip := &rancherfipv1beta2.FloatingIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      newFipName,
 			Namespace: startupNamespaceName,
 			Labels:    map[string]string{projectLabel: "startup-project"},
 		},
-		Spec: rancherfipv1beta1.FloatingIPSpec{
+		Spec: rancherfipv1beta2.FloatingIPSpec{
 			FloatingIPPool: startupPoolName,
 			IPAddr:         &preAllocatedIP,
 		},
@@ -174,7 +174,7 @@ func TestFloatingIP_PreExistingIP(t *testing.T) {
 	preExistingFipKey := types.NamespacedName{Name: "fip-with-ip", Namespace: startupNamespaceName}
 
 	// 1. Check the new FloatingIP status is Error
-	var fetchedFIP rancherfipv1beta1.FloatingIP
+	var fetchedFIP rancherfipv1beta2.FloatingIP
 	require.Eventually(t, func() bool {
 		if err := k8sClient.Get(ctx, fipKey, &fetchedFIP); err != nil {
 			return false
@@ -183,7 +183,7 @@ func TestFloatingIP_PreExistingIP(t *testing.T) {
 	}, timeout, interval, "new FloatingIP should be in Error state")
 
 	// 2. Check that the pre-existing FloatingIP was also reconciled correctly and not in an error state
-	var preExistingFIP rancherfipv1beta1.FloatingIP
+	var preExistingFIP rancherfipv1beta2.FloatingIP
 	require.Eventually(t, func() bool {
 		if err := k8sClient.Get(ctx, preExistingFipKey, &preExistingFIP); err != nil {
 			return false

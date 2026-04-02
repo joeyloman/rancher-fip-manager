@@ -16,7 +16,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	rancherfipv1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	rancherfipv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	fipcontroller "github.com/joeyloman/rancher-fip-manager/pkg/controller/floatingip"
 	fippoolcontroller "github.com/joeyloman/rancher-fip-manager/pkg/controller/floatingippool"
 	floatingipprojectquotacontroller "github.com/joeyloman/rancher-fip-manager/pkg/controller/floatingipprojectquota"
@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	err = rancherfipv1beta1.AddToScheme(scheme.Scheme)
+	err = rancherfipv1beta2.AddToScheme(scheme.Scheme)
 	if err != nil {
 		logf.Log.Error(err, "failed to add custom scheme")
 		os.Exit(1)
@@ -68,25 +68,25 @@ func TestMain(m *testing.M) {
 
 	// Create resources for startup race condition test
 	startupNs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "startup-ns", Labels: map[string]string{"rancher.k8s.binbash.org/project-name": "startup-project"}}}
-	startupProject := &rancherfipv1beta1.FloatingIPProjectQuota{ObjectMeta: metav1.ObjectMeta{Name: "startup-project"}}
-	startupPool := &rancherfipv1beta1.FloatingIPPool{
+	startupProject := &rancherfipv1beta2.FloatingIPProjectQuota{ObjectMeta: metav1.ObjectMeta{Name: "startup-project"}}
+	startupPool := &rancherfipv1beta2.FloatingIPPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "startup-pool"},
-		Spec: rancherfipv1beta1.FloatingIPPoolSpec{
+		Spec: rancherfipv1beta2.FloatingIPPoolSpec{
 			TargetNetworkInterface: "eth0",
-			IPConfig: &rancherfipv1beta1.IPConfig{
+			IPConfig: &rancherfipv1beta2.IPConfig{
 				Subnet: "10.10.10.0/24",
-				Pool:   rancherfipv1beta1.Pool{Start: "10.10.10.1", End: "10.10.10.10"},
+				Pool:   rancherfipv1beta2.Pool{Start: "10.10.10.1", End: "10.10.10.10"},
 			},
 		},
 	}
 	preAllocatedIP := "10.10.10.1"
-	startupFip := &rancherfipv1beta1.FloatingIP{
+	startupFip := &rancherfipv1beta2.FloatingIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "fip-with-ip",
 			Namespace: "startup-ns",
 			Labels:    map[string]string{"rancher.k8s.binbash.org/project-name": "startup-project"},
 		},
-		Spec: rancherfipv1beta1.FloatingIPSpec{
+		Spec: rancherfipv1beta2.FloatingIPSpec{
 			FloatingIPPool: "startup-pool",
 			IPAddr:         &preAllocatedIP,
 		},
@@ -112,7 +112,7 @@ func TestMain(m *testing.M) {
 	// Pre-populate the status of the startup FIP to simulate a fully allocated IP
 	// This avoids a race condition where the fip-controller tries to allocate an IP
 	// that the fippool-controller has already reserved in IPAM during its startup sync.
-	startupFip.Status = rancherfipv1beta1.FloatingIPStatus{
+	startupFip.Status = rancherfipv1beta2.FloatingIPStatus{
 		IPAddr: preAllocatedIP,
 		State:  fipStatusAllocated,
 	}
@@ -134,9 +134,9 @@ func TestMain(m *testing.M) {
 	}
 
 	informerFactory := informers.NewSharedInformerFactory(rancherfipClientSet, time.Second*30)
-	fipInformer := informerFactory.Rancher().V1beta1().FloatingIPs()
-	fipPoolInformer := informerFactory.Rancher().V1beta1().FloatingIPPools()
-	floatingIPProjectQuotaInformer := informerFactory.Rancher().V1beta1().FloatingIPProjectQuotas()
+	fipInformer := informerFactory.Rancher().V1beta2().FloatingIPs()
+	fipPoolInformer := informerFactory.Rancher().V1beta2().FloatingIPPools()
+	floatingIPProjectQuotaInformer := informerFactory.Rancher().V1beta2().FloatingIPProjectQuotas()
 
 	// NOTE: The constructor signatures for controllers are assumed based on the resources
 	// they watch and the general controller pattern.

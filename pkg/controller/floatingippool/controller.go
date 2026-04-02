@@ -15,10 +15,10 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 
-	v1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	v1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	clientset "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned"
-	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta1"
-	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta1"
+	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta2"
+	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta2"
 	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
 	"k8s.io/client-go/kubernetes"
 )
@@ -193,10 +193,26 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to list floatingips: %w", err)
 	}
 
+	logrus.Debugf("FloatingIPPool %s sync: found %d total FloatingIPs", name, len(fips))
+
 	for _, fip := range fips {
 		if fip.Spec.FloatingIPPool == pool.Name {
-			if fip.Spec.IPAddr != nil && *fip.Spec.IPAddr != "" {
-				allocatedIPs = append(allocatedIPs, *fip.Spec.IPAddr)
+			// Skip FloatingIPs that are being deleted - they should not be included
+			// in the allocation list as their IP is being released
+			if fip.GetDeletionTimestamp() != nil {
+				logrus.Debugf("FloatingIPPool %s sync: skipping FIP %s (being deleted)", name, fip.Name)
+				continue
+			}
+
+			// Use Status.IPAddr instead of Spec.IPAddr to correctly track both
+			// manually assigned and auto-allocated IPs. Spec.IPAddr is only set
+			// for manually assigned IPs, while Status.IPAddr contains the actual
+			// allocated IP (whether auto-allocated or manually assigned).
+			if fip.Status.IPAddr != "" {
+				// DEBUG: Log each IP being added to allocation list
+				logrus.Debugf("FloatingIPPool %s sync: adding IP %s from FIP %s",
+					name, fip.Status.IPAddr, fip.Name)
+				allocatedIPs = append(allocatedIPs, fip.Status.IPAddr)
 
 				// Determine display name for status
 				var allocatedDisplayName string
@@ -212,12 +228,18 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 				} else {
 					allocatedDisplayName = "Unassigned"
 				}
-				allocatedMap[*fip.Spec.IPAddr] = allocatedDisplayName
+				allocatedMap[fip.Status.IPAddr] = allocatedDisplayName
 			}
+		}
+
+		// Log summary of allocations being used for IPAM refresh
+		if len(allocatedIPs) > 0 {
+			logrus.Debugf("FloatingIPPool %s: total IPs to allocate in IPAM: %d", name, len(allocatedIPs))
 		}
 	}
 
 	// Update IPAM atomically
+	logrus.Debugf("FloatingIPPool %s: refreshing subnet with %d allocated IPs: %v", pool.Name, len(allocatedIPs), allocatedIPs)
 	err = c.ipam.RefreshSubnet(
 		pool.Name,
 		pool.Spec.IPConfig.Subnet,
@@ -229,19 +251,21 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("failed to refresh subnet for pool %s: %w", pool.Name, err)
 	}
+	logrus.Debugf("FloatingIPPool %s: IPAM refreshed, Used=%d, Available=%d", pool.Name, c.ipam.Used(pool.Name), c.ipam.Available(pool.Name))
 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		poolToUpdate, err := c.clientset.RancherV1beta1().FloatingIPPools().Get(ctx, pool.Name, metav1.GetOptions{})
+		poolToUpdate, err := c.clientset.RancherV1beta2().FloatingIPPools().Get(ctx, pool.Name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get latest version of fip pool %s: %w", pool.Name, err)
 		}
 
-		poolToUpdate.Status = v1beta1.FloatingIPPoolStatus{
+		poolToUpdate.Status = v1beta2.FloatingIPPoolStatus{
 			Allocated: allocatedMap,
 			Used:      c.ipam.Used(pool.Name),
 			Available: c.ipam.Available(pool.Name),
 		}
-		_, err = c.clientset.RancherV1beta1().FloatingIPPools().UpdateStatus(ctx, poolToUpdate, metav1.UpdateOptions{})
+		logrus.Debugf("FloatingIPPool %s: updating status with %d allocated IPs: %v", pool.Name, len(allocatedMap), allocatedMap)
+		_, err = c.clientset.RancherV1beta2().FloatingIPPools().UpdateStatus(ctx, poolToUpdate, metav1.UpdateOptions{})
 		return err
 	})
 	if err != nil {
@@ -263,7 +287,7 @@ func (c *Controller) enqueueFipPool(obj interface{}) {
 }
 
 func (c *Controller) handleFipPoolCreate(obj interface{}) {
-	_, ok := obj.(*v1beta1.FloatingIPPool)
+	_, ok := obj.(*v1beta2.FloatingIPPool)
 	if !ok {
 		runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
 		return
@@ -273,14 +297,14 @@ func (c *Controller) handleFipPoolCreate(obj interface{}) {
 }
 
 func (c *Controller) handleFipPoolDelete(obj interface{}) {
-	pool, ok := obj.(*v1beta1.FloatingIPPool)
+	pool, ok := obj.(*v1beta2.FloatingIPPool)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
 			return
 		}
-		pool, ok = tombstone.Obj.(*v1beta1.FloatingIPPool)
+		pool, ok = tombstone.Obj.(*v1beta2.FloatingIPPool)
 		if !ok {
 			runtime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
 			return

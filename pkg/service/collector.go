@@ -5,7 +5,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/labels"
 
-	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta1"
+	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta2"
 )
 
 type Collector struct {
@@ -48,7 +48,7 @@ func NewCollector(poolLister listers.FloatingIPPoolLister, quotaLister listers.F
 		),
 		floatingIPs: prometheus.NewDesc("rancherfipmanager_floatingips",
 			"Information about floating IPs",
-			[]string{"fippool", "ip", "status", "project_id", "managed_cluster_id", "service_name", "service_namespace"}, nil,
+			[]string{"fippool", "ip", "status", "project_id", "managed_cluster_id", "floatingip_group", "service_name", "service_namespace"}, nil,
 		),
 	}
 }
@@ -145,14 +145,33 @@ func (c *Collector) collectFloatingIPs(ch chan<- prometheus.Metric) {
 		} else {
 			status = "unassigned"
 		}
-		ch <- prometheus.MustNewConstMetric(c.floatingIPs, prometheus.GaugeValue, 1,
-			fip.Spec.FloatingIPPool,
-			fip.Status.IPAddr,
-			status,
-			fip.ObjectMeta.Labels["rancher.k8s.binbash.org/project-name"],
-			fip.ObjectMeta.Labels["rancher.k8s.binbash.org/cluster-name"],
-			fip.ObjectMeta.Labels["rancher.k8s.binbash.org/service-name"],
-			fip.ObjectMeta.Labels["rancher.k8s.binbash.org/service-namespace"],
-		)
+
+		// Emit metrics for each service associated with the floating IP
+		if fip.Status.Assigned != nil && len(fip.Status.Assigned.Services) > 0 {
+			for _, svc := range fip.Status.Assigned.Services {
+				ch <- prometheus.MustNewConstMetric(c.floatingIPs, prometheus.GaugeValue, 1,
+					fip.Spec.FloatingIPPool,
+					fip.Status.IPAddr,
+					status,
+					fip.ObjectMeta.Labels["rancher.k8s.binbash.org/project-name"],
+					fip.ObjectMeta.Labels["rancher.k8s.binbash.org/cluster-name"],
+					fip.Status.Assigned.FloatingIPGroup,
+					svc.ServiceName,
+					svc.ServiceNamespace,
+				)
+			}
+		} else {
+			// Emit metric with empty service info for unassigned or legacy FIPs
+			ch <- prometheus.MustNewConstMetric(c.floatingIPs, prometheus.GaugeValue, 1,
+				fip.Spec.FloatingIPPool,
+				fip.Status.IPAddr,
+				status,
+				fip.ObjectMeta.Labels["rancher.k8s.binbash.org/project-name"],
+				fip.ObjectMeta.Labels["rancher.k8s.binbash.org/cluster-name"],
+				"",
+				"",
+				"",
+			)
+		}
 	}
 }

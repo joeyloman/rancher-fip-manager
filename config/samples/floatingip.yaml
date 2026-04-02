@@ -1,4 +1,4 @@
-apiVersion: rancher.k8s.binbash.org/v1beta1
+apiVersion: rancher.k8s.binbash.org/v1beta2
 kind: FloatingIP
 metadata:
   name: fip-12345
@@ -9,7 +9,7 @@ spec:
   floatingIPPool: rke2-bm-aio--public-vlan-1
   ipAddr: 192.168.100.10
 ---
-apiVersion: rancher.k8s.binbash.org/v1beta1
+apiVersion: rancher.k8s.binbash.org/v1beta2
 kind: FloatingIP
 metadata:
   name: fip-54321

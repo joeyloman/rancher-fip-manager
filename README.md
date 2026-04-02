@@ -86,7 +86,7 @@ If approved, the IP details are returned to the rancher-fip-lb-controller, which
     First, create a `FloatingIPProjectQuota` to define quotas for a project.
     ```yaml
     # config/samples/floatingipprojectquota.yaml
-    apiVersion: rancher.k8s.binbash.org/v1beta1
+    apiVersion: rancher.k8s.binbash.org/v1beta2
     kind: FloatingIPProjectQuota
     metadata:
       name: my-project
@@ -103,7 +103,7 @@ If approved, the IP details are returned to the rancher-fip-lb-controller, which
     Define a pool of IPs.
     ```yaml
     # config/samples/pool.yaml
-    apiVersion: rancher.k8s.binbash.org/v1beta1
+    apiVersion: rancher.k8s.binbash.org/v1beta2
     kind: FloatingIPPool
     metadata:
       name: prod-v4-pool
@@ -129,7 +129,7 @@ If approved, the IP details are returned to the rancher-fip-lb-controller, which
     Create a `FloatingIP` resource in the project's namespace. Make sure to add the `rancher.k8s.binbash.org/project-name` label to the `FloatingIP` resource itself.
     ```yaml
     # config/samples/fip.yaml
-    apiVersion: rancher.k8s.binbash.org/v1beta1
+    apiVersion: rancher.k8s.binbash.org/v1beta2
     kind: FloatingIP
     metadata:
       name: my-app-fip

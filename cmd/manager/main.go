@@ -126,9 +126,9 @@ func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clients
 	fipInformerFactory := informers.NewSharedInformerFactory(fipClient, 0)
 	ipamAllocator := ipam.New()
 
-	fipPoolInformer := fipInformerFactory.Rancher().V1beta1().FloatingIPPools()
-	floatingIPProjectQuotaInformer := fipInformerFactory.Rancher().V1beta1().FloatingIPProjectQuotas()
-	fipInformer := fipInformerFactory.Rancher().V1beta1().FloatingIPs()
+	fipPoolInformer := fipInformerFactory.Rancher().V1beta2().FloatingIPPools()
+	floatingIPProjectQuotaInformer := fipInformerFactory.Rancher().V1beta2().FloatingIPProjectQuotas()
+	fipInformer := fipInformerFactory.Rancher().V1beta2().FloatingIPs()
 
 	fipPoolController := floatingippool.New(fipClient, kubeClient, fipInformer, fipPoolInformer, floatingIPProjectQuotaInformer, ipamAllocator)
 	floatingIPProjectQuotaController := floatingipprojectquota.New(fipClient, kubeClient, floatingIPProjectQuotaInformer, fipInformer, fipPoolInformer)

@@ -12,7 +12,7 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
-	v1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	v1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	"github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned/fake"
 	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions"
 	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
@@ -20,16 +20,16 @@ import (
 
 func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 	// Test setup
-	pool := &v1beta1.FloatingIPPool{
+	pool := &v1beta2.FloatingIPPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-pool",
 		},
-		Spec: v1beta1.FloatingIPPoolSpec{
+		Spec: v1beta2.FloatingIPPoolSpec{
 			TargetNetworkInterface: "eth0",
-			IPConfig: &v1beta1.IPConfig{
+			IPConfig: &v1beta2.IPConfig{
 				Family: "IPv4",
 				Subnet: "192.168.1.0/24",
-				Pool: v1beta1.Pool{
+				Pool: v1beta2.Pool{
 					Start:   "192.168.1.10",
 					End:     "192.168.1.20",
 					Exclude: []string{"192.168.1.15"},
@@ -38,11 +38,11 @@ func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 		},
 	}
 
-	project := &v1beta1.FloatingIPProjectQuota{
+	project := &v1beta2.FloatingIPProjectQuota{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-project",
 		},
-		Spec: v1beta1.FloatingIPProjectQuotaSpec{
+		Spec: v1beta2.FloatingIPProjectQuotaSpec{
 			DisplayName: "Test Project",
 		},
 	}
@@ -56,7 +56,7 @@ func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 		},
 	}
 
-	fip := &v1beta1.FloatingIP{
+	fip := &v1beta2.FloatingIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-fip",
 			Namespace: "test-ns",
@@ -64,11 +64,11 @@ func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 				"rancher.k8s.binbash.org/project-name": "test-project",
 			},
 		},
-		Spec: v1beta1.FloatingIPSpec{
+		Spec: v1beta2.FloatingIPSpec{
 			FloatingIPPool: "test-pool",
 			IPAddr:         stringPtr("192.168.1.10"),
 		},
-		Status: v1beta1.FloatingIPStatus{
+		Status: v1beta2.FloatingIPStatus{
 			IPAddr: "192.168.1.10",
 		},
 	}
@@ -79,9 +79,9 @@ func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 	kubeClient := k8sfake.NewSimpleClientset(ns)
 	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
 
-	fipInformer := informerFactory.Rancher().V1beta1().FloatingIPs()
-	fipPoolInformer := informerFactory.Rancher().V1beta1().FloatingIPPools()
-	projectInformer := informerFactory.Rancher().V1beta1().FloatingIPProjectQuotas()
+	fipInformer := informerFactory.Rancher().V1beta2().FloatingIPs()
+	fipPoolInformer := informerFactory.Rancher().V1beta2().FloatingIPPools()
+	projectInformer := informerFactory.Rancher().V1beta2().FloatingIPProjectQuotas()
 
 	// Populate informers
 	fipInformer.Informer().GetIndexer().Add(fip)
@@ -99,7 +99,7 @@ func TestFloatingIPPoolController_syncHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	// Assertions
-	updatedPool, err := clientset.RancherV1beta1().FloatingIPPools().Get(context.Background(), "test-pool", metav1.GetOptions{})
+	updatedPool, err := clientset.RancherV1beta2().FloatingIPPools().Get(context.Background(), "test-pool", metav1.GetOptions{})
 	require.NoError(t, err)
 
 	// Expected status

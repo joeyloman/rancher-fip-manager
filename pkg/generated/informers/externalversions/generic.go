@@ -21,7 +21,7 @@ package externalversions
 import (
 	fmt "fmt"
 
-	v1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	v1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	cache "k8s.io/client-go/tools/cache"
 )
@@ -52,13 +52,13 @@ func (f *genericInformer) Lister() cache.GenericLister {
 // TODO extend this to unknown resources with a client pool
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
-	// Group=rancher.k8s.binbash.org, Version=v1beta1
-	case v1beta1.SchemeGroupVersion.WithResource("floatingips"):
-		return &genericInformer{resource: resource.GroupResource(), informer: f.Rancher().V1beta1().FloatingIPs().Informer()}, nil
-	case v1beta1.SchemeGroupVersion.WithResource("floatingippools"):
-		return &genericInformer{resource: resource.GroupResource(), informer: f.Rancher().V1beta1().FloatingIPPools().Informer()}, nil
-	case v1beta1.SchemeGroupVersion.WithResource("floatingipprojectquotas"):
-		return &genericInformer{resource: resource.GroupResource(), informer: f.Rancher().V1beta1().FloatingIPProjectQuotas().Informer()}, nil
+	// Group=rancher.k8s.binbash.org, Version=v1beta2
+	case v1beta2.SchemeGroupVersion.WithResource("floatingips"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Rancher().V1beta2().FloatingIPs().Informer()}, nil
+	case v1beta2.SchemeGroupVersion.WithResource("floatingippools"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Rancher().V1beta2().FloatingIPPools().Informer()}, nil
+	case v1beta2.SchemeGroupVersion.WithResource("floatingipprojectquotas"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Rancher().V1beta2().FloatingIPProjectQuotas().Informer()}, nil
 
 	}
 

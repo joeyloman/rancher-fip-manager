@@ -15,10 +15,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
+	"github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	clientset "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned"
-	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta1"
-	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta1"
+	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta2"
+	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta2"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -170,7 +170,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to list floatingips: %w", err)
 	}
 
-	newFipsStatus := make(map[string]*v1beta1.FipInfo)
+	newFipsStatus := make(map[string]*v1beta2.FipInfo)
 
 	for _, fip := range fips {
 		projectName, ok := fip.Labels["rancher.k8s.binbash.org/project-name"]
@@ -184,7 +184,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		}
 
 		if _, ok := newFipsStatus[poolName]; !ok {
-			newFipsStatus[poolName] = &v1beta1.FipInfo{
+			newFipsStatus[poolName] = &v1beta2.FipInfo{
 				Allocated: make(map[string]string),
 			}
 			pool, err := c.fipPoolLister.Get(poolName)
@@ -209,7 +209,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		}
 	}
 
-	newStatus := v1beta1.FloatingIPProjectQuotaStatus{
+	newStatus := v1beta2.FloatingIPProjectQuotaStatus{
 		FloatingIPs: newFipsStatus,
 	}
 
@@ -221,7 +221,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	floatingIPProjectQuotaToUpdate := floatingIPProjectQuota.DeepCopy()
 	floatingIPProjectQuotaToUpdate.Status = newStatus
 
-	_, err = c.clientset.RancherV1beta1().FloatingIPProjectQuotas().UpdateStatus(ctx, floatingIPProjectQuotaToUpdate, metav1.UpdateOptions{})
+	_, err = c.clientset.RancherV1beta2().FloatingIPProjectQuotas().UpdateStatus(ctx, floatingIPProjectQuotaToUpdate, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("could not update status for FloatingIPProjectQuota %s: %w", name, err)
 	}
@@ -230,7 +230,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 }
 
 func (c *Controller) handleFloatingIPProjectQuotaCreate(obj interface{}) {
-	_, ok := obj.(*v1beta1.FloatingIPProjectQuota)
+	_, ok := obj.(*v1beta2.FloatingIPProjectQuota)
 	if !ok {
 		runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
 		return

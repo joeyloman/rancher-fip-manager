@@ -21,8 +21,8 @@ package fake
 import (
 	applyconfiguration "github.com/joeyloman/rancher-fip-manager/pkg/generated/applyconfiguration"
 	clientset "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned"
-	rancherv1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned/typed/rancher.k8s.binbash.org/v1beta1"
-	fakerancherv1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned/typed/rancher.k8s.binbash.org/v1beta1/fake"
+	rancherv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned/typed/rancher.k8s.binbash.org/v1beta2"
+	fakerancherv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned/typed/rancher.k8s.binbash.org/v1beta2/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -125,7 +125,7 @@ var (
 	_ testing.FakeClient  = &Clientset{}
 )
 
-// RancherV1beta1 retrieves the RancherV1beta1Client
-func (c *Clientset) RancherV1beta1() rancherv1beta1.RancherV1beta1Interface {
-	return &fakerancherv1beta1.FakeRancherV1beta1{Fake: &c.Fake}
+// RancherV1beta2 retrieves the RancherV1beta2Client
+func (c *Clientset) RancherV1beta2() rancherv1beta2.RancherV1beta2Interface {
+	return &fakerancherv1beta2.FakeRancherV1beta2{Fake: &c.Fake}
 }

@@ -15,17 +15,19 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 
-	v1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta1"
-	applyv1beta1 "github.com/joeyloman/rancher-fip-manager/pkg/generated/applyconfiguration/rancher.k8s.binbash.org/v1beta1"
+	v1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
+	applyv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/generated/applyconfiguration/rancher.k8s.binbash.org/v1beta2"
 	clientset "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned"
-	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta1"
-	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta1"
+	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta2"
+	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta2"
 	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
+	"github.com/joeyloman/rancher-fip-manager/pkg/util"
 )
 
 const controllerAgentName = "floatingip-controller"
 const finalizerName = "rancher.k8s.binbash.org/floatingip-cleanup"
 const projectNameLabel = "rancher.k8s.binbash.org/project-name"
+const floatingipGroupLabel = "rancher.k8s.binbash.org/floatingip-group"
 const maxConditions = 30
 
 // Controller is the controller implementation for FloatingIP resources. It is responsible
@@ -227,10 +229,10 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	// Add finalizer if it doesn't exist
 	if !containsString(fip.GetFinalizers(), finalizerName) {
 		logrus.Infof("Adding finalizer to FloatingIP %s/%s", fip.Namespace, fip.Name)
-		fipApplyConfig := applyv1beta1.FloatingIP(fip.Name, fip.Namespace).
+		fipApplyConfig := applyv1beta2.FloatingIP(fip.Name, fip.Namespace).
 			WithFinalizers(append(fip.GetFinalizers(), finalizerName)...)
 
-		_, err := c.clientset.RancherV1beta1().FloatingIPs(namespace).Apply(ctx, fipApplyConfig, metav1.ApplyOptions{FieldManager: controllerAgentName})
+		_, err := c.clientset.RancherV1beta2().FloatingIPs(namespace).Apply(ctx, fipApplyConfig, metav1.ApplyOptions{FieldManager: controllerAgentName})
 		if err != nil {
 			return fmt.Errorf("failed to add finalizer to floatingip %s/%s: %w", fip.Namespace, fip.Name, err)
 		}
@@ -271,7 +273,7 @@ func (c *Controller) setCondition(conditions []metav1.Condition, newCondition me
 	return append(conditions, newCondition)
 }
 
-func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) error {
+func (c *Controller) reconcile(ctx context.Context, fip *v1beta2.FloatingIP) error {
 	logrus.Infof("Reconciling FloatingIP %s/%s", fip.Namespace, fip.Name)
 
 	// Check if the FloatingIP is in an Error state
@@ -315,7 +317,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 		if currentClusterNameInProject != newClusterName {
 			logrus.Infof("Updating floatingipprojectquota for FIP %s/%s. Cluster changed from '%s' to '%s'", fip.Namespace, fip.Name, currentClusterNameInProject, newClusterName)
 			err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-				currentProjectConfig, errGet := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().Get(ctx, projectName, metav1.GetOptions{})
+				currentProjectConfig, errGet := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, projectName, metav1.GetOptions{})
 				if errGet != nil {
 					return errGet
 				}
@@ -323,7 +325,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 				if projectConfigCopy.Status.FloatingIPs != nil && projectConfigCopy.Status.FloatingIPs[poolName] != nil && projectConfigCopy.Status.FloatingIPs[poolName].Allocated != nil {
 					projectConfigCopy.Status.FloatingIPs[poolName].Allocated[ipAddr] = newClusterName
 
-					_, errUpdate := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().UpdateStatus(ctx, projectConfigCopy, metav1.UpdateOptions{})
+					_, errUpdate := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().UpdateStatus(ctx, projectConfigCopy, metav1.UpdateOptions{})
 					return errUpdate
 				} else {
 					runtime.HandleError(fmt.Errorf("floatingipprojectquota status for pool %s is not fully initialized for FIP %s/%s", poolName, fip.Namespace, fip.Name))
@@ -340,7 +342,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 			logrus.Infof("Clearing assigned status for FIP %s/%s because cluster label is not present", fip.Namespace, fip.Name)
 
 			err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-				currentFip, errGet := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
+				currentFip, errGet := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
 				if errGet != nil {
 					return errGet
 				}
@@ -355,42 +357,81 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 				}
 				fipCopy.Status.Conditions = c.setCondition(fipCopy.Status.Conditions, condition)
 
-				_, updateErr := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
+				_, updateErr := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
 				return updateErr
 			})
 			if err != nil {
 				return fmt.Errorf("failed to update fip status for fip %s/%s: %w", fip.Namespace, fip.Name, err)
 			}
 		} else {
-			// else if the assigned status is nil, set it
+			// Cluster label is present, check if we need to set or update the assigned status
 			if fip.Status.Assigned == nil {
 				logrus.Infof("Setting assigned status for FIP %s/%s because cluster label is present", fip.Namespace, fip.Name)
 
+				// store the floatingip-group label
+				floatingIPGroup := fip.Labels[floatingipGroupLabel]
+
+				// if the floatingip-group label is set we need to generate a shared key
+				var sharedKey string
+				if floatingIPGroup != "" {
+					sharedKey = fmt.Sprintf("%s-%s", fip.Labels["rancher.k8s.binbash.org/cluster-name"], util.GenerateRandomString(12))
+				}
+
 				err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-					currentFip, errGet := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
+					currentFip, errGet := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
 					if errGet != nil {
 						return errGet
 					}
 					fipCopy := currentFip.DeepCopy()
-					fipCopy.Status.Assigned = &v1beta1.AssignedInfo{
-						ClusterName:      currentFip.Labels["rancher.k8s.binbash.org/cluster-name"],
-						ProjectName:      currentFip.Labels["rancher.k8s.binbash.org/project-name"],
-						ServiceNamespace: currentFip.Labels["rancher.k8s.binbash.org/service-namespace"],
-						ServiceName:      currentFip.Labels["rancher.k8s.binbash.org/service-name"],
+					services := parseServicesFromLabels(currentFip.Labels)
+					fipCopy.Status.Assigned = &v1beta2.AssignedInfo{
+						ClusterName:     currentFip.Labels["rancher.k8s.binbash.org/cluster-name"],
+						ProjectName:     currentFip.Labels["rancher.k8s.binbash.org/project-name"],
+						FloatingIPGroup: floatingIPGroup,
+						SharedKey:       sharedKey,
+						Services:        services,
 					}
+					serviceDesc := describeServices(services)
 					condition := metav1.Condition{
 						Type:    "Ready",
 						Status:  metav1.ConditionTrue,
 						Reason:  "IPAssigned",
-						Message: fmt.Sprintf("IP is assigned to service %s/%s in cluster %s.", currentFip.Labels["rancher.k8s.binbash.org/service-namespace"], currentFip.Labels["rancher.k8s.binbash.org/service-name"], currentFip.Labels["rancher.k8s.binbash.org/cluster-name"]),
+						Message: fmt.Sprintf("IP is assigned to %s in cluster %s.", serviceDesc, currentFip.Labels["rancher.k8s.binbash.org/cluster-name"]),
 					}
 					fipCopy.Status.Conditions = c.setCondition(fipCopy.Status.Conditions, condition)
 
-					_, updateErr := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
+					_, updateErr := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
 					return updateErr
 				})
 				if err != nil {
 					return fmt.Errorf("failed to update fip status for fip %s/%s: %w", fip.Namespace, fip.Name, err)
+				}
+			} else {
+				// Assigned status already exists, but we need to update services if they've changed
+				logrus.Infof("Updating services for FIP %s/%s because service labels may have changed", fip.Namespace, fip.Name)
+
+				err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+					currentFip, errGet := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
+					if errGet != nil {
+						return errGet
+					}
+					fipCopy := currentFip.DeepCopy()
+					services := parseServicesFromLabels(currentFip.Labels)
+					fipCopy.Status.Assigned.Services = services
+					serviceDesc := describeServices(services)
+					condition := metav1.Condition{
+						Type:    "Ready",
+						Status:  metav1.ConditionTrue,
+						Reason:  "IPAssigned",
+						Message: fmt.Sprintf("IP is assigned to %s in cluster %s.", serviceDesc, currentFip.Labels["rancher.k8s.binbash.org/cluster-name"]),
+					}
+					fipCopy.Status.Conditions = c.setCondition(fipCopy.Status.Conditions, condition)
+
+					_, updateErr := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
+					return updateErr
+				})
+				if err != nil {
+					return fmt.Errorf("failed to update fip services for fip %s/%s: %w", fip.Namespace, fip.Name, err)
 				}
 			}
 		}
@@ -431,7 +472,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 
 	// Allocate IP
 	var allocatedIP string
-	var fipForSpecUpdate *v1beta1.FloatingIP = fip
+	var fipForSpecUpdate *v1beta2.FloatingIP = fip
 	if fip.Spec.IPAddr != nil && *fip.Spec.IPAddr != "" {
 		allocatedIP, err = c.ipam.GetIP(poolName, *fip.Spec.IPAddr)
 		if err != nil {
@@ -463,15 +504,24 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 	fipCopy.Spec.FloatingIPPool = fip.Spec.FloatingIPPool
 	fipCopy.Spec.IPAddr = &allocatedIP
 
-	updatedFip, err := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).Update(ctx, fipCopy, metav1.UpdateOptions{})
+	updatedFip, err := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Update(ctx, fipCopy, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to update fip spec: %w", err)
 	}
 	fipForSpecUpdate = updatedFip
 
+	// store the floatingip-group label
+	floatingIPGroup := fip.Labels[floatingipGroupLabel]
+
+	// if the floatingip-group label is set we need to generate a shared key
+	var sharedKey string
+	if floatingIPGroup != "" {
+		sharedKey = fmt.Sprintf("%s-%s", fip.Labels["rancher.k8s.binbash.org/cluster-name"], util.GenerateRandomString(12))
+	}
+
 	// Update FloatingIP status
 	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		currentFip, errGet := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
+		currentFip, errGet := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Get(ctx, fip.Name, metav1.GetOptions{})
 		if errGet != nil {
 			return errGet
 		}
@@ -479,23 +529,27 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 
 		fipCopyForStatus.Status.IPAddr = allocatedIP
 		fipCopyForStatus.Status.State = "Allocated"
+		var services []v1beta2.AssignedService
 		if currentFip.Labels != nil {
-			fipCopyForStatus.Status.Assigned = &v1beta1.AssignedInfo{
-				ClusterName:      currentFip.Labels["rancher.k8s.binbash.org/cluster-name"],
-				ProjectName:      currentFip.Labels["rancher.k8s.binbash.org/project-name"],
-				ServiceNamespace: currentFip.Labels["rancher.k8s.binbash.org/service-namespace"],
-				ServiceName:      currentFip.Labels["rancher.k8s.binbash.org/service-name"],
+			services = parseServicesFromLabels(currentFip.Labels)
+			fipCopyForStatus.Status.Assigned = &v1beta2.AssignedInfo{
+				ClusterName:     currentFip.Labels["rancher.k8s.binbash.org/cluster-name"],
+				ProjectName:     currentFip.Labels["rancher.k8s.binbash.org/project-name"],
+				Services:        services,
+				FloatingIPGroup: floatingIPGroup,
+				SharedKey:       sharedKey,
 			}
 		}
+		serviceDesc := describeServices(services)
 		condition := metav1.Condition{
 			Type:    "Ready",
 			Status:  metav1.ConditionTrue,
 			Reason:  "IPAssigned",
-			Message: fmt.Sprintf("IP is assigned to service %s/%s in cluster %s.", currentFip.Labels["rancher.k8s.binbash.org/service-namespace"], currentFip.Labels["rancher.k8s.binbash.org/service-name"], currentFip.Labels["rancher.k8s.binbash.org/cluster-name"]),
+			Message: fmt.Sprintf("IP is assigned to %s in cluster %s.", serviceDesc, currentFip.Labels["rancher.k8s.binbash.org/cluster-name"]),
 		}
 		fipCopyForStatus.Status.Conditions = c.setCondition(fipCopyForStatus.Status.Conditions, condition)
 
-		_, updateErr := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopyForStatus, metav1.UpdateOptions{})
+		_, updateErr := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopyForStatus, metav1.UpdateOptions{})
 		return updateErr
 	})
 	if err != nil {
@@ -504,7 +558,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 
 	// Update FloatingIPPool status
 	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		currentFipPool, errGet := c.clientset.RancherV1beta1().FloatingIPPools().Get(ctx, fipPool.Name, metav1.GetOptions{})
+		currentFipPool, errGet := c.clientset.RancherV1beta2().FloatingIPPools().Get(ctx, fipPool.Name, metav1.GetOptions{})
 		if errGet != nil {
 			if errors.IsNotFound(errGet) {
 				logrus.Warnf("FloatingIPPool %s not found during status update on FIP create. Assuming it's already gone.", fipPool.Name)
@@ -523,7 +577,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 		currentFipPoolCopy.Status.Used = c.ipam.Used(poolName)
 		currentFipPoolCopy.Status.Available = c.ipam.Available(poolName)
 
-		_, errUpdate := c.clientset.RancherV1beta1().FloatingIPPools().UpdateStatus(ctx, currentFipPoolCopy, metav1.UpdateOptions{})
+		_, errUpdate := c.clientset.RancherV1beta2().FloatingIPPools().UpdateStatus(ctx, currentFipPoolCopy, metav1.UpdateOptions{})
 		return errUpdate
 	})
 	if err != nil {
@@ -532,17 +586,17 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 
 	// Update FloatingIPProjectQuota status
 	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		currentProjectConfig, errGet := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().Get(ctx, projectName, metav1.GetOptions{})
+		currentProjectConfig, errGet := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, projectName, metav1.GetOptions{})
 		if errGet != nil {
 			return errGet
 		}
 
 		projectConfigCopy := currentProjectConfig.DeepCopy()
 		if projectConfigCopy.Status.FloatingIPs == nil {
-			projectConfigCopy.Status.FloatingIPs = make(map[string]*v1beta1.FipInfo)
+			projectConfigCopy.Status.FloatingIPs = make(map[string]*v1beta2.FipInfo)
 		}
 		if projectConfigCopy.Status.FloatingIPs[poolName] == nil {
-			projectConfigCopy.Status.FloatingIPs[poolName] = &v1beta1.FipInfo{
+			projectConfigCopy.Status.FloatingIPs[poolName] = &v1beta2.FipInfo{
 				Allocated: make(map[string]string),
 			}
 		}
@@ -566,7 +620,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 		}
 		projectConfigCopy.Status.FloatingIPs[poolName].Allocated[allocatedIP] = clusterName
 
-		_, errUpdate := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().UpdateStatus(ctx, projectConfigCopy, metav1.UpdateOptions{})
+		_, errUpdate := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().UpdateStatus(ctx, projectConfigCopy, metav1.UpdateOptions{})
 		return errUpdate
 	})
 	if err != nil {
@@ -577,7 +631,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta1.FloatingIP) err
 	return nil
 }
 
-func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingIP) error {
+func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta2.FloatingIP) error {
 	logrus.Infof("Reconciling deletion of FloatingIP %s/%s", fip.Namespace, fip.Name)
 
 	// The source of truth for an allocated IP is the status field.
@@ -592,7 +646,7 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 	// Update FloatingIPProjectQuota status
 	if projectName, ok := fip.Labels[projectNameLabel]; ok {
 		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			projectConfig, errGet := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().Get(ctx, projectName, metav1.GetOptions{})
+			projectConfig, errGet := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, projectName, metav1.GetOptions{})
 			if errors.IsNotFound(errGet) {
 				logrus.Warnf("FloatingIPProjectQuota %s not found during FIP deletion. Assuming it's already gone.", projectName)
 				return nil
@@ -608,7 +662,7 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 						pcStatus.Used--
 					}
 					delete(pcStatus.Allocated, ipToRelease)
-					_, errUpdate := c.clientset.RancherV1beta1().FloatingIPProjectQuotas().UpdateStatus(ctx, projectConfigCopy, metav1.UpdateOptions{})
+					_, errUpdate := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().UpdateStatus(ctx, projectConfigCopy, metav1.UpdateOptions{})
 					return errUpdate
 				}
 			}
@@ -620,13 +674,16 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 	}
 
 	// Release from IPAM and FloatingIPPool
+	logrus.Infof("FloatingIP %s/%s: releasing IP %s from pool %s", fip.Namespace, fip.Name, ipToRelease, poolName)
 	if err := c.ipam.ReleaseIP(poolName, ipToRelease); err != nil {
 		// Log the error but continue, as we still want to remove the finalizer
 		logrus.Warnf("failed to release ip %s from ipam pool %s: %v", ipToRelease, poolName, err)
+	} else {
+		logrus.Infof("FloatingIP %s/%s: successfully released IP %s from IPAM", fip.Namespace, fip.Name, ipToRelease)
 	}
 
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		currentFipPool, errGet := c.clientset.RancherV1beta1().FloatingIPPools().Get(ctx, poolName, metav1.GetOptions{})
+		currentFipPool, errGet := c.clientset.RancherV1beta2().FloatingIPPools().Get(ctx, poolName, metav1.GetOptions{})
 		if errGet != nil {
 			if errors.IsNotFound(errGet) {
 				logrus.Warnf("FloatingIPPool %s not found during status update on FIP delete. Assuming it's already gone.", poolName)
@@ -653,7 +710,9 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 		currentFipPoolCopy.Status.Used = c.ipam.Used(poolName)
 		currentFipPoolCopy.Status.Available = c.ipam.Available(poolName)
 
-		_, errUpdate := c.clientset.RancherV1beta1().FloatingIPPools().UpdateStatus(ctx, currentFipPoolCopy, metav1.UpdateOptions{})
+		logrus.Infof("FloatingIP %s/%s: updating pool %s status after release, removing IP %s, new Used=%d, Available=%d",
+			fip.Namespace, fip.Name, poolName, ipToRelease, currentFipPoolCopy.Status.Used, currentFipPoolCopy.Status.Available)
+		_, errUpdate := c.clientset.RancherV1beta2().FloatingIPPools().UpdateStatus(ctx, currentFipPoolCopy, metav1.UpdateOptions{})
 		return errUpdate
 	})
 	if err != nil {
@@ -663,7 +722,7 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta1.FloatingI
 	return c.removeFinalizer(ctx, fip)
 }
 
-func (c *Controller) updateFipStatusWithError(ctx context.Context, fip *v1beta1.FloatingIP, reason, message string) error {
+func (c *Controller) updateFipStatusWithError(ctx context.Context, fip *v1beta2.FloatingIP, reason, message string) error {
 	fipCopy := fip.DeepCopy()
 	fipCopy.Status.State = "Error"
 	condition := metav1.Condition{
@@ -674,7 +733,7 @@ func (c *Controller) updateFipStatusWithError(ctx context.Context, fip *v1beta1.
 	}
 	fipCopy.Status.Conditions = c.setCondition(fipCopy.Status.Conditions, condition)
 
-	_, err := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
+	_, err := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to update fip status with error: %w", err)
 	}
@@ -702,11 +761,11 @@ func removeString(slice []string, s string) (result []string) {
 	return
 }
 
-func (c *Controller) removeFinalizer(ctx context.Context, fip *v1beta1.FloatingIP) error {
+func (c *Controller) removeFinalizer(ctx context.Context, fip *v1beta2.FloatingIP) error {
 	fipCopy := fip.DeepCopy()
 	fipCopy.SetFinalizers(removeString(fipCopy.GetFinalizers(), finalizerName))
 
-	_, err := c.clientset.RancherV1beta1().FloatingIPs(fip.Namespace).Update(ctx, fipCopy, metav1.UpdateOptions{})
+	_, err := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Update(ctx, fipCopy, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to remove finalizer from floatingip %s/%s: %w", fip.Namespace, fip.Name, err)
 	}
