@@ -196,3 +196,164 @@ func TestFloatingIP_PreExistingIP(t *testing.T) {
 	// Cleanup
 	require.NoError(t, k8sClient.Delete(ctx, &fetchedFIP), "failed to delete new FloatingIP")
 }
+
+func TestFloatingIP_SameFloatingIPGroupDifferentClusters(t *testing.T) {
+	const (
+		cluster1Name        = "cluster-1"
+		cluster2Name        = "cluster-2"
+		floatingIPGroupName = "my-shared-lb"
+		sharedPoolName      = "shared-pool"
+		sharedProjectName   = "shared-project"
+		cluster1Namespace   = "cluster-1-ns"
+		cluster2Namespace   = "cluster-2-ns"
+		cluster1FipName     = "fip-cluster-1"
+		cluster2FipName     = "fip-cluster-2"
+	)
+
+	ctx := context.Background()
+
+	// Create the FloatingIPPool for the test
+	sharedPool := &rancherfipv1beta2.FloatingIPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: sharedPoolName},
+		Spec: rancherfipv1beta2.FloatingIPPoolSpec{
+			TargetNetworkInterface: "eth0",
+			IPConfig: &rancherfipv1beta2.IPConfig{
+				Family: "IPv4",
+				Subnet: "192.168.200.0/24",
+				Pool: rancherfipv1beta2.Pool{
+					Start: "192.168.200.10",
+					End:   "192.168.200.30",
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, sharedPool), "failed to create shared FloatingIPPool")
+
+	// Create FloatingIPProjectQuota
+	sharedProject := &rancherfipv1beta2.FloatingIPProjectQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: sharedProjectName},
+		Spec: rancherfipv1beta2.FloatingIPProjectQuotaSpec{
+			DisplayName:     "Shared Project",
+			FloatingIPQuota: map[string]int{sharedPoolName: 10},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, sharedProject), "failed to create FloatingIPProjectQuota")
+
+	// Create namespaces for both clusters with cluster-name and project labels
+	cluster1Ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: cluster1Namespace,
+			Labels: map[string]string{
+				projectLabel:                           sharedProjectName,
+				"rancher.k8s.binbash.org/cluster-name": cluster1Name,
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, cluster1Ns), "failed to create cluster-1 namespace")
+
+	cluster2Ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: cluster2Namespace,
+			Labels: map[string]string{
+				projectLabel:                           sharedProjectName,
+				"rancher.k8s.binbash.org/cluster-name": cluster2Name,
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, cluster2Ns), "failed to create cluster-2 namespace")
+
+	// Create FloatingIPs for both clusters with the same floatingip-group label
+	cluster1Fip := &rancherfipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cluster1FipName,
+			Namespace: cluster1Namespace,
+			Labels: map[string]string{
+				projectLabel:                               sharedProjectName,
+				"rancher.k8s.binbash.org/cluster-name":     cluster1Name,
+				"rancher.k8s.binbash.org/floatingip-group": floatingIPGroupName,
+			},
+		},
+		Spec: rancherfipv1beta2.FloatingIPSpec{
+			FloatingIPPool: sharedPoolName,
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, cluster1Fip), "failed to create cluster-1 FloatingIP")
+
+	cluster2Fip := &rancherfipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cluster2FipName,
+			Namespace: cluster2Namespace,
+			Labels: map[string]string{
+				projectLabel:                               sharedProjectName,
+				"rancher.k8s.binbash.org/cluster-name":     cluster2Name,
+				"rancher.k8s.binbash.org/floatingip-group": floatingIPGroupName,
+			},
+		},
+		Spec: rancherfipv1beta2.FloatingIPSpec{
+			FloatingIPPool: sharedPoolName,
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, cluster2Fip), "failed to create cluster-2 FloatingIP")
+
+	// === Verify Allocation ===
+	cluster1FipKey := types.NamespacedName{Name: cluster1FipName, Namespace: cluster1Namespace}
+	cluster2FipKey := types.NamespacedName{Name: cluster2FipName, Namespace: cluster2Namespace}
+	sharedPoolKey := types.NamespacedName{Name: sharedPoolName, Namespace: ""}
+
+	// Verify both FloatingIPs are allocated with different IP addresses
+	var fetchedCluster1FIP rancherfipv1beta2.FloatingIP
+	var fetchedCluster2FIP rancherfipv1beta2.FloatingIP
+
+	require.Eventually(t, func() bool {
+		if err := k8sClient.Get(ctx, cluster1FipKey, &fetchedCluster1FIP); err != nil {
+			return false
+		}
+		return len(fetchedCluster1FIP.Finalizers) > 0 &&
+			fetchedCluster1FIP.Status.IPAddr != "" &&
+			fetchedCluster1FIP.Status.State == fipStatusAllocated
+	}, timeout, interval, "Cluster-1 FloatingIP should be allocated")
+
+	require.Eventually(t, func() bool {
+		if err := k8sClient.Get(ctx, cluster2FipKey, &fetchedCluster2FIP); err != nil {
+			return false
+		}
+		return len(fetchedCluster2FIP.Finalizers) > 0 &&
+			fetchedCluster2FIP.Status.IPAddr != "" &&
+			fetchedCluster2FIP.Status.State == fipStatusAllocated
+	}, timeout, interval, "Cluster-2 FloatingIP should be allocated")
+
+	// Verify they have different IP addresses
+	require.NotEqual(t, fetchedCluster1FIP.Status.IPAddr, fetchedCluster2FIP.Status.IPAddr,
+		"Each cluster should get a different floating IP address")
+
+	// Verify both IPs are in the pool's allocated list
+	var fetchedPool rancherfipv1beta2.FloatingIPPool
+	require.Eventually(t, func() bool {
+		if err := k8sClient.Get(ctx, sharedPoolKey, &fetchedPool); err != nil {
+			return false
+		}
+		_, cluster1IPExists := fetchedPool.Status.Allocated[fetchedCluster1FIP.Status.IPAddr]
+		_, cluster2IPExists := fetchedPool.Status.Allocated[fetchedCluster2FIP.Status.IPAddr]
+		return cluster1IPExists && cluster2IPExists
+	}, timeout, interval, "Both IPs should be marked as allocated in the pool")
+
+	// Verify both FloatingIPs have the same FloatingIPGroup in their status
+	require.Equal(t, floatingIPGroupName, fetchedCluster1FIP.Status.Assigned.FloatingIPGroup,
+		"Cluster-1 FIP should have the correct floatingip-group")
+	require.Equal(t, floatingIPGroupName, fetchedCluster2FIP.Status.Assigned.FloatingIPGroup,
+		"Cluster-2 FIP should have the correct floatingip-group")
+
+	// Verify both FloatingIPs have different ClusterNames
+	require.Equal(t, cluster1Name, fetchedCluster1FIP.Status.Assigned.ClusterName,
+		"Cluster-1 FIP should have the correct cluster name")
+	require.Equal(t, cluster2Name, fetchedCluster2FIP.Status.Assigned.ClusterName,
+		"Cluster-2 FIP should have the correct cluster name")
+
+	// === Cleanup ===
+	require.NoError(t, k8sClient.Delete(ctx, &fetchedCluster1FIP), "failed to delete cluster-1 FloatingIP")
+	require.NoError(t, k8sClient.Delete(ctx, &fetchedCluster2FIP), "failed to delete cluster-2 FloatingIP")
+	require.NoError(t, k8sClient.Delete(ctx, cluster1Ns), "failed to delete cluster-1 namespace")
+	require.NoError(t, k8sClient.Delete(ctx, cluster2Ns), "failed to delete cluster-2 namespace")
+	require.NoError(t, k8sClient.Delete(ctx, sharedPool), "failed to delete shared pool")
+	require.NoError(t, k8sClient.Delete(ctx, sharedProject), "failed to delete shared project")
+}
