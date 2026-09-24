@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rancher-fip-api-server.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "rancher-fip-api-server.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.apiserver.autoscaling.enabled }}
+  replicas: {{ .Values.apiserver.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rancher-fip-api-server.selectorLabels" . | nindent 6 }}
+  progressDeadlineSeconds: 600
+  revisionHistoryLimit: 10
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      {{- with .Values.apiserver.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "rancher-fip-api-server.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.apiserver.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.apiserver.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.apiserver.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      dnsPolicy: ClusterFirst
+      {{- with .Values.apiserver.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "rancher-fip-api-server.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.apiserver.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.apiserver.securityContext | nindent 12 }}
+          image: "{{ .Values.apiserver.image.repository }}:{{ .Values.apiserver.image.tag | default .Chart.AppVersion }}"
+          args:
+            - --jwt-generate-key=true
+            - --jwt-secret-name=jwt-private-key
+            - --jwt-secret-namespace={{ .Release.Namespace | default "kube-system" }}
+            - --leader-elect=true
+            - --lease-lock-name={{ include "rancher-fip-api-server.fullname" . }}-lock
+            - --lease-lock-namespace={{ .Release.Namespace | default "kube-system" }}
+            - --listen-address=:{{ .Values.apiserver.service.apiPort | default 8080 }}
+{{- if .Values.apiserver.service.tls.enabled }}
+            - --tls-enabled=true
+            - --tls-cert-file=/etc/tls/tls.crt
+            - --tls-key-file=/etc/tls/tls.key
+{{- end }}
+          {{- with .Values.apiserver.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+          - name: api
+            containerPort: {{ .Values.apiserver.service.apiPort | default 8080 }}
+            protocol: TCP
+          imagePullPolicy: {{ .Values.apiserver.image.pullPolicy }}
+          resources:
+            {{- toYaml .Values.apiserver.resources | nindent 12 }}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+{{- if .Values.apiserver.service.tls.enabled }}
+          volumeMounts:
+            - name: tls-secret-volume
+              mountPath: /etc/tls
+              readOnly: true
+      volumes:
+        - name: tls-secret-volume
+          secret:
+            secretName: {{ include "rancher-fip-api-server.fullname" . }}-tls
+{{- end }}

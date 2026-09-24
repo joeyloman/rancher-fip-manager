@@ -1,0 +1,65 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "rancher-fip-cluster-manager.fullname" . }}
+  labels:
+    {{- include "rancher-fip-cluster-manager.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingipprojectquotas
+  - floatingippools
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingipprojectquotas/status
+  verbs:
+  - get
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingips
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - provisioning.cattle.io
+  resources:
+  - clusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - management.cattle.io
+  resources:
+  - clusters
+  - projects
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rke-machine-config.cattle.io
+  resources:
+  - harvesterconfigs
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch

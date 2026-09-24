@@ -1,0 +1,247 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rancher-fip-cluster-manager
+  namespace: rancher-fip-manager
+  labels:
+    app: rancher-fip-cluster-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rancher-fip-cluster-manager
+  labels:
+    app: rancher-fip-cluster-manager
+rules:
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingipprojectquotas
+  - floatingippools
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingipprojectquotas/status
+  verbs:
+  - get
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingips
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - provisioning.cattle.io
+  resources:
+  - clusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - management.cattle.io
+  resources:
+  - clusters
+  - projects
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rke-machine-config.cattle.io
+  resources:
+  - harvesterconfigs
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rancher-fip-cluster-manager
+  labels:
+    app: rancher-fip-cluster-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rancher-fip-cluster-manager
+subjects:
+- kind: ServiceAccount
+  name: rancher-fip-cluster-manager
+  namespace: rancher-fip-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rancher-fip-cluster-manager
+  namespace: rancher-fip-manager
+  labels:
+    app: rancher-fip-cluster-manager
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups: ["coordination.k8s.io"]
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rancher-fip-cluster-manager
+  namespace: rancher-fip-manager
+  labels:
+    app: rancher-fip-cluster-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rancher-fip-cluster-manager
+subjects:
+- kind: ServiceAccount
+  name: rancher-fip-cluster-manager
+  namespace: rancher-fip-manager
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rancher-fip-config
+  namespace: rancher-fip-manager
+data:
+  RancherFipApiServerURL: https://rancher-fip-api.example.com/v1
+  RancherFipLBControllerChartName: rancher-fip-lb-controller
+  RancherFipLBControllerChartRef: oci://registry.example.com/projectname/rancher-fip-lb-controller
+  RancherFipLBControllerChartVersion: 0.2.0
+  RancherFipLBControllerNamespace: rancher-fip-manager
+  RancherFipLBControllerValues: |
+    image:
+      repository: ghcr.io/joeyloman/rancher-fip-lb-controller
+      tag: v0.2.0
+  PureLBControllerChartName: purelb
+  PureLBControllerChartRef: https://gitlab.com/api/v4/projects/20400619/packages/helm/stable
+  PureLBControllerChartVersion: 0.13.0
+  PureLBControllerNamespace: rancher-fip-manager
+  PureLBControllerValues: |
+    image:
+      repository: registry.gitlab.com/purelb/purelb
+      tag: v0.13.0
+    lbnodeagent:
+      sendgarp: true
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: 'true'
+      tolerations: [ { "effect": "NoSchedule", "key":
+      "node-role.kubernetes.io/master", "operator": "Exists" }, { "effect":
+      "NoSchedule", "key": "node-role.kubernetes.io/control-plane", "operator":
+      "Exists" }, { "effect": "NoExecute", "key": "node-role.kubernetes.io/etcd",
+      "operator": "Exists" } ]
+    allocator:
+      tolerations: [ { "effect": "NoSchedule", "key":
+      "node-role.kubernetes.io/master", "operator": "Exists" }, { "effect":
+      "NoSchedule", "key": "node-role.kubernetes.io/control-plane", "operator":
+      "Exists" }, { "effect": "NoExecute", "key": "node-role.kubernetes.io/etcd",
+      "operator": "Exists" } ]
+  MetalLBControllerChartName: metallb
+  MetalLBControllerChartRef: https://metallb.github.io/metallb
+  MetalLBControllerChartVersion: 0.15.2
+  MetalLBControllerNamespace: rancher-fip-manager
+  MetalLBControllerValues: |
+    controller:
+      image:
+        repository: quay.io/metallb/controller
+        tag: v0.15.2
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: 'true'
+      tolerations: [ { "effect": "NoSchedule", "key":
+      "node-role.kubernetes.io/master", "operator": "Exists" }, { "effect":
+      "NoSchedule", "key": "node-role.kubernetes.io/control-plane", "operator":
+      "Exists" }, { "effect": "NoExecute", "key": "node-role.kubernetes.io/etcd",
+      "operator": "Exists" } ]
+    speaker:
+      image:
+        repository: quay.io/metallb/speaker
+        tag: v0.15.2
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: 'true'
+      tolerations: [ { "effect": "NoSchedule", "key":
+      "node-role.kubernetes.io/master", "operator": "Exists" }, { "effect":
+      "NoSchedule", "key": "node-role.kubernetes.io/control-plane", "operator":
+      "Exists" }, { "effect": "NoExecute", "key": "node-role.kubernetes.io/etcd",
+      "operator": "Exists" } ]
+      frr:
+        image:
+          repository: quay.io/frrouting/frr
+          tag: 9.1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: rancher-fip-cluster-manager
+  name: rancher-fip-cluster-manager
+  namespace: rancher-fip-manager
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rancher-fip-cluster-manager
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: rancher-fip-cluster-manager
+    spec:
+      containers:
+      - name: rancher-fip-cluster-manager
+        image: ghcr.io/joeyloman/rancher-fip-cluster-manager:latest
+        args:
+        - --leader-elect=true
+        - --lease-lock-name=rancher-fip-cluster-manager-lock
+        - --lease-lock-namespace=rancher-fip-manager
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 100m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccountName: rancher-fip-cluster-manager
+      terminationGracePeriodSeconds: 30

@@ -9,6 +9,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  WEBHOOK_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-manager-webhook
+  APISERVER_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-api-server
+  CLUSTERMANAGER_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-cluster-manager
 
 jobs:
   build-latest:
@@ -28,7 +31,74 @@ jobs:
       - name: Build the container with the commit shasum, tag it as latest and push them
         id: build-image
         run: |
-          docker build -t $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
+          docker build -f build/Dockerfile.manager -t $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
           docker push $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
           docker tag $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$IMAGE_NAME:latest
           docker push $REGISTRY/$IMAGE_NAME:latest
+
+  build-webhook-latest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the webhook container with the commit shasum, tag it as latest and push them
+        id: build-webhook-image
+        run: |
+          docker build -f build/Dockerfile.webhook -t $REGISTRY/$WEBHOOK_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
+          docker push $REGISTRY/$WEBHOOK_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
+          docker tag $REGISTRY/$WEBHOOK_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$WEBHOOK_IMAGE_NAME:latest
+          docker push $REGISTRY/$WEBHOOK_IMAGE_NAME:latest
+
+
+  build-apiserver-latest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the api-server container with the commit shasum, tag it as latest and push them
+        id: build-apiserver-image
+        run: |
+          docker build -f build/Dockerfile.apiserver -t $REGISTRY/$APISERVER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
+          docker push $REGISTRY/$APISERVER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
+          docker tag $REGISTRY/$APISERVER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$APISERVER_IMAGE_NAME:latest
+          docker push $REGISTRY/$APISERVER_IMAGE_NAME:latest
+
+  build-clustermanager-latest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the cluster-manager container with the commit shasum, tag it as latest and push them
+        id: build-clustermanager-image
+        run: |
+          docker build -f build/Dockerfile.clustermanager -t $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
+          docker push $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
+          docker tag $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:latest
+          docker push $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:latest

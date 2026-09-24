@@ -1,0 +1,29 @@
+{{- if .Values.apiserver.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "rancher-fip-api-server.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "rancher-fip-api-server.labels" . | nindent 4 }}
+  {{- with .Values.apiserver.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  rules:
+  - host: {{ .Values.apiserver.ingress.host }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ include "rancher-fip-api-server.fullname" . }}
+            port:
+              number: {{ .Values.apiserver.service.apiPort | default 8080 }}
+  tls:
+  - hosts:
+    - {{ .Values.apiserver.ingress.host }}
+    secretName:	rancher-fip-api-server-tls
+{{- end }}

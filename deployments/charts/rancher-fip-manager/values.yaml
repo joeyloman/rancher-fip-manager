@@ -1,0 +1,371 @@
+# Default values for rancher-fip-manager.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+#
+# rancher-fip-manager options
+#
+manager:
+  replicaCount: 1
+  
+  image:
+    repository: ghcr.io/joeyloman/rancher-fip-manager
+    pullPolicy: IfNotPresent
+    tag: "v0.5.1"
+  
+  imagePullSecrets: []
+  nameOverride: "rancher-fip-manager"
+  fullnameOverride: "rancher-fip-manager"
+  
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+  
+  podAnnotations: {}
+  
+  podSecurityContext: {}
+    # fsGroup: 2000
+  
+  securityContext: {}
+  
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 32Mi
+  
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 80
+    # targetMemoryUtilizationPercentage: 80
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity: {}
+  
+  env: {}
+  
+  service:
+    httpServicePort: 8080
+    httpListenPort: 8080
+
+  serviceMonitor:
+    # Requires the prometheus-operator ServiceMonitor CRD
+    # (monitoring.coreos.com/v1) to be installed on the target cluster
+    enabled: false
+
+#
+# rancher-fip-manager-webhook options
+#
+webhook:
+  replicaCount: 1
+  
+  image:
+    repository: ghcr.io/joeyloman/rancher-fip-manager-webhook
+    pullPolicy: IfNotPresent
+    tag: "v0.3.1"
+  
+  imagePullSecrets: []
+  nameOverride: "rancher-fip-manager-webhook"
+  fullnameOverride: "rancher-fip-manager-webhook"
+  
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+  
+  podAnnotations: {}
+  
+  podSecurityContext: {}
+    # fsGroup: 2000
+  
+  securityContext: {}
+ 
+  resources:
+    limits:
+      cpu: 500m
+      memory: 32Mi
+    requests:
+      cpu: 100m
+      memory: 8Mi
+  
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 80
+    # targetMemoryUtilizationPercentage: 80
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity: {}
+  
+  env: []
+
+  service:
+    webhookServicePort: 8443
+    webhookListenPort: 8443
+
+#
+# rancher-fip-cluster-manager options
+#
+clustermanager:
+  replicaCount: 1
+  
+  image:
+    repository: ghcr.io/joeyloman/rancher-fip-cluster-manager
+    pullPolicy: IfNotPresent
+    tag: "v0.4.1"
+  
+  imagePullSecrets: []
+  nameOverride: "rancher-fip-cluster-manager"
+  fullnameOverride: "rancher-fip-cluster-manager"
+  
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+  
+  podAnnotations: {}
+  
+  podSecurityContext: {}
+    # fsGroup: 2000
+  
+  securityContext: {}
+ 
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 128Mi
+  
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 80
+    # targetMemoryUtilizationPercentage: 80
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity: {}
+  
+  env: []
+
+  service: {}
+
+  # URL of the rancher-fip-api-server exposed through ingress or a nodeport
+  RancherFipApiServerURL: https://rancher-fip-api.example.com/v1
+
+  # rancher-fip-lb-controller install options
+  RancherFipLBControllerChartName: rancher-fip-lb-controller
+  RancherFipLBControllerChartRef: https://joeyloman.github.io/rancher-fip-manager-helm-chart
+  RancherFipLBControllerChartVersion: 0.4.1
+  RancherFipLBControllerNamespace: rancher-fip-manager
+  RancherFipLBControllerValues:
+    image:
+      repository: ghcr.io/joeyloman/rancher-fip-lb-controller
+      pullPolicy: IfNotPresent
+      tag: "v0.4.1"
+
+  # purelb install options
+  PureLBControllerChartName: purelb
+  PureLBControllerChartRef: https://purelb.github.io/purelb/charts
+  PureLBControllerChartVersion: 0.14.1
+  PureLBControllerNamespace: rancher-fip-manager
+  PureLBControllerValues:
+    image:
+      repository: ghcr.io/purelb/purelb
+      tag: v0.14.1
+    lbnodeagent:
+      sendgarp: true
+      nodeSelector:
+        "node-role.kubernetes.io/control-plane: 'true'"
+      tolerations: '[
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/master",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/control-plane",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoExecute",
+          "key": "node-role.kubernetes.io/etcd",
+          "operator": "Exists"
+        }
+      ]'
+    allocator:
+      tolerations: '[
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/master",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/control-plane",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoExecute",
+          "key": "node-role.kubernetes.io/etcd",
+          "operator": "Exists"
+        }
+      ]'
+
+  # metallb install options
+  MetalLBControllerChartName: metallb
+  MetalLBControllerChartRef: https://metallb.github.io/metallb
+  MetalLBControllerChartVersion: 0.15.3
+  MetalLBControllerNamespace: rancher-fip-manager
+  MetalLBControllerValues:
+    controller:
+      image:
+        repository: quay.io/metallb/controller
+        tag: v0.15.3
+      nodeSelector:
+        "node-role.kubernetes.io/control-plane: 'true'"
+      tolerations: '[
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/master",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/control-plane",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoExecute",
+          "key": "node-role.kubernetes.io/etcd",
+          "operator": "Exists"
+        }
+      ]'
+    speaker:
+      image:
+        repository: quay.io/metallb/speaker
+        tag: v0.15.3
+      nodeSelector:
+        "node-role.kubernetes.io/control-plane: 'true'"
+      tolerations: '[
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/master",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/control-plane",
+          "operator": "Exists"
+        },
+        {
+          "effect": "NoExecute",
+          "key": "node-role.kubernetes.io/etcd",
+          "operator": "Exists"
+        }
+      ]'
+      frr:
+        image:
+          repository: quay.io/frrouting/frr
+          tag: 10.4.1
+
+#
+# rancher-fip-api-server options
+#
+apiserver:
+  replicaCount: 1
+  
+  image:
+    repository: ghcr.io/joeyloman/rancher-fip-api-server
+    pullPolicy: IfNotPresent
+    tag: "v0.4.2"
+  
+  imagePullSecrets: []
+  nameOverride: "rancher-fip-api-server"
+  fullnameOverride: "rancher-fip-api-server"
+  
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+  
+  podAnnotations: {}
+  
+  podSecurityContext: {}
+    # fsGroup: 2000
+  
+  securityContext: {}
+ 
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 128Mi
+  
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 80
+    # targetMemoryUtilizationPercentage: 80
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity: {}
+  
+  env: []
+
+  service:
+    apiPort: 8443
+    tls:
+      enabled: true
+
+  nodeport:
+    enabled: true
+    port: 30001
+
+  ingress:
+    enabled: true
+    annotations:
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    host: rancher-fip-api.example.com
+    tls:
+      enabled: true

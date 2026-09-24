@@ -1,0 +1,18 @@
+{{- if .Values.manager.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rancher-fip-manager.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "rancher-fip-manager.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - port: manager
+      path: /metrics
+      scheme: http
+  jobLabel: jobLabel
+  selector:
+    matchLabels:
+      {{- include "rancher-fip-manager.selectorLabels" . | nindent 8 }}
+{{- end }}

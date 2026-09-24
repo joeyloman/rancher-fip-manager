@@ -1,0 +1,48 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "rancher-fip-manager.fullname" . }}
+  labels:
+    {{- include "rancher-fip-manager.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingips
+  - floatingippools
+  - floatingipprojectquotas
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rancher.k8s.binbash.org
+  resources:
+  - floatingips/status
+  - floatingippools/status
+  - floatingipprojectquotas/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
+  - patch

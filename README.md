@@ -32,6 +32,19 @@ If approved, the IP details are returned to the rancher-fip-lb-controller, which
 
 ![rancher-fip-manager](image/rancher-fip-manager.png)
 
+## The rancher-fip-manager-webhook
+
+The validating admission webhook is part of this repository (`cmd/webhook`, `pkg/webhook/`). It validates `FloatingIP` and `FloatingIPPool` objects before they are admitted: it checks that requests are correctly configured and that they stay within the `FloatingIPProjectQuota` limits of the project the request is made for.
+
+The webhook manages its own serving certificate: on startup it generates a TLS key pair via a Kubernetes CertificateSigningRequest, stores it in a Secret and (re)registers its `ValidatingWebhookConfiguration`. A scheduler renews the certificate before it expires (controlled with the `CERTRENEWALPERIOD` environment variable, in minutes).
+
+It is built and published as a separate container image:
+
+```sh
+make webhook
+make docker-build-webhook WEBHOOK_IMG=your-registry/rancher-fip-manager-webhook:latest
+```
+
 ## Getting Started
 
 ### Prerequisites
