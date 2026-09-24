@@ -4,6 +4,19 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'clustermanager/**/*.go'
+      - 'clustermanager/go.mod'
+      - 'clustermanager/go.sum'
+      - 'apiserver/**/*.go'
+      - 'apiserver/go.mod'
+      - 'apiserver/go.sum'
+      - 'build/**'
+      - '.dockerignore'
+      - 'go.mod'
+      - 'go.sum'
   workflow_dispatch:
 
 env:
