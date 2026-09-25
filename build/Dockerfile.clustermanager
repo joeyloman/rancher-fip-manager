@@ -11,6 +11,11 @@ WORKDIR /src/clustermanager
 RUN go build -a -o rancher-fip-cluster-manager cmd/cluster-manager/main.go
 FROM docker.io/alpine:3.24
 RUN adduser -S -D -H -h /app rancher-fip-cluster-manager
+# Helm's default cache/config/data dirs live under $HOME (/app), which is not
+# writable by the runtime user; point them at /tmp instead.
+ENV HELM_CACHE_HOME=/tmp/helm/cache \
+    HELM_CONFIG_HOME=/tmp/helm/config \
+    HELM_DATA_HOME=/tmp/helm/data
 USER rancher-fip-cluster-manager
 COPY --from=builder /src/clustermanager/rancher-fip-cluster-manager /app/
 WORKDIR /app
