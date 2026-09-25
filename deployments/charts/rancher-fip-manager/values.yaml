@@ -11,7 +11,7 @@ manager:
   image:
     repository: ghcr.io/joeyloman/rancher-fip-manager
     pullPolicy: IfNotPresent
-    tag: "v0.5.1"
+    tag: "v0.5.2"
   
   imagePullSecrets: []
   nameOverride: "rancher-fip-manager"
@@ -74,7 +74,7 @@ webhook:
   image:
     repository: ghcr.io/joeyloman/rancher-fip-manager-webhook
     pullPolicy: IfNotPresent
-    tag: "v0.3.1"
+    tag: "v0.5.2"
   
   imagePullSecrets: []
   nameOverride: "rancher-fip-manager-webhook"
@@ -132,7 +132,7 @@ clustermanager:
   image:
     repository: ghcr.io/joeyloman/rancher-fip-cluster-manager
     pullPolicy: IfNotPresent
-    tag: "v0.4.1"
+    tag: "v0.5.2"
   
   imagePullSecrets: []
   nameOverride: "rancher-fip-cluster-manager"
@@ -184,14 +184,14 @@ clustermanager:
 
   # rancher-fip-lb-controller install options
   RancherFipLBControllerChartName: rancher-fip-lb-controller
-  RancherFipLBControllerChartRef: https://joeyloman.github.io/rancher-fip-manager-helm-chart
-  RancherFipLBControllerChartVersion: 0.4.1
+  RancherFipLBControllerChartRef: oci://ghcr.io/joeyloman/charts/rancher-fip-lb-controller
+  RancherFipLBControllerChartVersion: 0.4.2
   RancherFipLBControllerNamespace: rancher-fip-manager
   RancherFipLBControllerValues:
     image:
       repository: ghcr.io/joeyloman/rancher-fip-lb-controller
       pullPolicy: IfNotPresent
-      tag: "v0.4.1"
+      tag: "v0.4.2"
 
   # purelb install options
   PureLBControllerChartName: purelb
@@ -308,7 +308,7 @@ apiserver:
   image:
     repository: ghcr.io/joeyloman/rancher-fip-api-server
     pullPolicy: IfNotPresent
-    tag: "v0.4.2"
+    tag: "v0.5.2"
   
   imagePullSecrets: []
   nameOverride: "rancher-fip-api-server"
