@@ -22,6 +22,3 @@ version: 0.5.2
 # follow Semantic Versioning. They should reflect the version the application is using.
 # It is recommended to use it with quotes.
 appVersion: "v0.5.2"
-
-# NOTE: comment edit to trigger the chart publish workflow (0.5.2 was never
-# published; the workflow gates on "helm pull" existence, not on version diff).
