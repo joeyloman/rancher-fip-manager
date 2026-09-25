@@ -54,6 +54,32 @@ make docker-build-webhook WEBHOOK_IMG=your-registry/rancher-fip-manager-webhook:
 -   `kubectl`
 -   A running Kubernetes cluster (e.g., kind, minikube, or a cloud provider)
 
+### Helm Installation
+
+The chart is published as an OCI artifact to `ghcr.io/joeyloman/charts` by CI whenever the chart version in `deployments/charts/rancher-fip-manager/Chart.yaml` changes.
+
+Install the latest chart version:
+
+```sh
+helm upgrade --install rancher-fip-manager \
+  oci://ghcr.io/joeyloman/charts/rancher-fip-manager \
+  --version 0.5.2 \
+  -n rancher-fip-manager --create-namespace
+```
+
+With common overrides (disable the apiserver ingress placeholder and use NodePort exposure instead, and point the cluster manager at the real apiserver URL):
+
+```sh
+helm upgrade --install rancher-fip-manager \
+  oci://ghcr.io/joeyloman/charts/rancher-fip-manager \
+  --version 0.5.2 \
+  -n rancher-fip-manager --create-namespace \
+  --set apiserver.ingress.enabled=false \
+  --set clustermanager.RancherFipApiServerURL=https://<apiserver-host>:<port>/v1
+```
+
+Available values are documented in `deployments/charts/rancher-fip-manager/values.yaml`.
+
 ### Installation
 
 1.  **Install CRDs**:
