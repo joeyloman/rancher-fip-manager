@@ -65,6 +65,7 @@ require (
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/gosuri/uitable v0.0.4 // indirect
 	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -86,11 +87,13 @@ require (
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
+	github.com/moby/spdystream v0.5.1 // indirect
 	github.com/moby/term v0.5.2 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/monochromegane/go-gitignore v0.0.0-20200626010858-205db1a8cc00 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
@@ -166,6 +169,63 @@ require (
 replace (
 	github.com/joeyloman/rancher-fip-manager => ..
 	k8s.io/api => k8s.io/api v0.34.1
+	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.34.1
 	k8s.io/apimachinery => k8s.io/apimachinery v0.34.1
 	k8s.io/client-go => k8s.io/client-go v0.34.1
 )
+
+replace k8s.io/apiserver => k8s.io/apiserver v0.34.1
+
+replace k8s.io/cli-runtime => k8s.io/cli-runtime v0.34.1
+
+replace k8s.io/cloud-provider => k8s.io/cloud-provider v0.34.1
+
+replace k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.34.1
+
+replace k8s.io/code-generator => k8s.io/code-generator v0.34.1
+
+replace k8s.io/component-base => k8s.io/component-base v0.34.1
+
+replace k8s.io/component-helpers => k8s.io/component-helpers v0.34.1
+
+replace k8s.io/controller-manager => k8s.io/controller-manager v0.34.1
+
+replace k8s.io/cri-api => k8s.io/cri-api v0.34.1
+
+replace k8s.io/cri-client => k8s.io/cri-client v0.34.1
+
+replace k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.34.1
+
+replace k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.34.1
+
+replace k8s.io/kms => k8s.io/kms v0.34.1
+
+replace k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.34.1
+
+replace k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.34.1
+
+replace k8s.io/kube-proxy => k8s.io/kube-proxy v0.34.1
+
+replace k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.34.1
+
+replace k8s.io/kubectl => k8s.io/kubectl v0.34.1
+
+replace k8s.io/kubelet => k8s.io/kubelet v0.34.1
+
+replace k8s.io/metrics => k8s.io/metrics v0.34.1
+
+replace k8s.io/mount-utils => k8s.io/mount-utils v0.34.1
+
+replace k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.34.1
+
+replace k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.34.1
+
+replace k8s.io/endpointslice => k8s.io/endpointslice v0.34.1
+
+replace k8s.io/externaljwt => k8s.io/externaljwt v0.34.1
+
+replace k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20250710124328-f3f2b991d03b
+
+replace k8s.io/utils => k8s.io/utils v0.0.0-20250604170112-4c0f3b243397
+
+replace sigs.k8s.io/json => sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8

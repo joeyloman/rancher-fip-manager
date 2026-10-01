@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	secret "github.com/joeyloman/rancher-fip-cluster-manager/internal/secret"
@@ -30,7 +29,7 @@ func HandleConfigSecrets(
 	caCrt []byte,
 ) (ctrl.Result, error) {
 	projectID := project.Name
-	secretName := fmt.Sprintf("rancher-fip-config-%s", projectID)
+	secretName := configSecretPrefix + projectID
 	var secretExists bool = false
 
 	// Check if the secret already exists in the local cluster
