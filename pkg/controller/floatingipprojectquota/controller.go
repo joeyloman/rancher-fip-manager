@@ -20,13 +20,19 @@ import (
 	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta2"
 	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta2"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 )
 
 const controllerAgentName = "floatingipprojectquota-controller"
 
+const quotaFinalizerName = "rancher.k8s.binbash.org/floatingipprojectquota-cleanup"
+
+const projectNameLabel = "rancher.k8s.binbash.org/project-name"
+
 // Controller is the controller implementation for FloatingIPProjectQuota resources.
-// It is currently a passive controller that primarily serves to make FloatingIPProjectQuota
-// objects available to other controllers via its informer/lister.
+// It keeps the FloatingIPProjectQuota status in sync with its attached FloatingIPs and cascades
+// FloatingIPProjectQuota deletion: a FloatingIPProjectQuota being deleted first deletes all FloatingIPs labeled
+// with its name, and only then releases itself via its finalizer.
 type Controller struct {
 	clientset                    clientset.Interface
 	kubeClient                   kubernetes.Interface
@@ -64,6 +70,9 @@ func New(
 	logrus.Info("Setting up event handlers for FloatingIPProjectQuota controller")
 	floatingIPProjectQuotaInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.handleFloatingIPProjectQuotaCreate,
+		UpdateFunc: func(_, newObj interface{}) {
+			controller.enqueueFloatingIPProjectQuota(newObj)
+		},
 	})
 
 	return controller
@@ -165,6 +174,26 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 	logrus.Infof("Syncing FloatingIPProjectQuota %s", name)
 
+	// FloatingIPProjectQuota is being deleted: cascade-delete all attached FloatingIPs before
+	// letting the quota go away.
+	if !floatingIPProjectQuota.GetDeletionTimestamp().IsZero() {
+		return c.handleFloatingIPProjectQuotaDelete(ctx, key, name)
+	}
+
+	// Ensure the cleanup finalizer is present so deletion can be cascaded.
+	if !containsString(floatingIPProjectQuota.GetFinalizers(), quotaFinalizerName) {
+		logrus.Infof("Adding finalizer to FloatingIPProjectQuota %s", name)
+		quotaWithFinalizer := floatingIPProjectQuota.DeepCopy()
+		quotaWithFinalizer.Finalizers = append(quotaWithFinalizer.GetFinalizers(), quotaFinalizerName)
+		_, err = c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Update(ctx, quotaWithFinalizer, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to add finalizer to FloatingIPProjectQuota %s: %w", name, err)
+		}
+		// Continue syncing from the updated object so the status update below
+		// does not overwrite the object with a pre-finalizer copy.
+		floatingIPProjectQuota = quotaWithFinalizer
+	}
+
 	fips, err := c.fipLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list floatingips: %w", err)
@@ -173,7 +202,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	newFipsStatus := make(map[string]*v1beta2.FipInfo)
 
 	for _, fip := range fips {
-		projectName, ok := fip.Labels["rancher.k8s.binbash.org/project-name"]
+		projectName, ok := fip.Labels[projectNameLabel]
 		if !ok || projectName != name {
 			continue
 		}
@@ -229,6 +258,66 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	return nil
 }
 
+// handleFloatingIPProjectQuotaDelete cascades the deletion of a FloatingIPProjectQuota: all
+// FloatingIPs labeled with the FloatingIPProjectQuota's name are deleted first. Each FloatingIP
+// releases its IPAM allocation and pool slot via its own floatingip-cleanup
+// finalizer (which tolerates the FloatingIPProjectQuota already being gone). The FloatingIPProjectQuota finalizer
+// is only removed once no attached FloatingIPs remain.
+func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key, name string) error {
+	fips, err := c.fipLister.List(labels.SelectorFromSet(labels.Set{projectNameLabel: name}))
+	if err != nil {
+		return fmt.Errorf("failed to list floatingips for FloatingIPProjectQuota %s: %w", name, err)
+	}
+
+	if len(fips) > 0 {
+		logrus.Infof("FloatingIPProjectQuota %s is being deleted: deleting %d attached FloatingIP(s) first", name, len(fips))
+		for _, fip := range fips {
+			err = c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).Delete(ctx, fip.Name, metav1.DeleteOptions{})
+			if errors.IsNotFound(err) {
+				// Informer cache is stale; the requeue below waits for it to catch up.
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("failed to delete floatingip %s/%s during FloatingIPProjectQuota %s deletion: %w", fip.Namespace, fip.Name, name, err)
+			}
+			logrus.Infof("Deleted FloatingIP %s/%s as part of FloatingIPProjectQuota %s deletion", fip.Namespace, fip.Name, name)
+		}
+
+		// FloatingIPs are gone from the API but the informer cache may still
+		// list them; requeue until the list is empty and their finalizers ran.
+		c.workqueue.AddAfter(key, 2*time.Second)
+		return nil
+	}
+
+	quota, err := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get FloatingIPProjectQuota %s: %w", name, err)
+	}
+
+	if !containsString(quota.GetFinalizers(), quotaFinalizerName) {
+		return nil
+	}
+
+	logrus.Infof("All FloatingIPs for FloatingIPProjectQuota %s are deleted, removing finalizer", name)
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		currentQuota, errGet := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
+		if errGet != nil {
+			return errGet
+		}
+		quotaCopy := currentQuota.DeepCopy()
+		quotaCopy.Finalizers = removeString(quotaCopy.GetFinalizers(), quotaFinalizerName)
+		_, errUpdate := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Update(ctx, quotaCopy, metav1.UpdateOptions{})
+		return errUpdate
+	})
+	if err != nil {
+		return fmt.Errorf("failed to remove finalizer from FloatingIPProjectQuota %s: %w", name, err)
+	}
+	return nil
+}
+
 func (c *Controller) handleFloatingIPProjectQuotaCreate(obj interface{}) {
 	_, ok := obj.(*v1beta2.FloatingIPProjectQuota)
 	if !ok {
@@ -247,4 +336,25 @@ func (c *Controller) enqueueFloatingIPProjectQuota(obj interface{}) {
 		return
 	}
 	c.workqueue.Add(key)
+}
+
+// containsString checks if a string is in a slice of strings.
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// removeString removes a string from a slice of strings.
+func removeString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }

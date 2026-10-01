@@ -6,7 +6,7 @@ Rancher FloatingIP Manager is a Kubernetes controller designed to manage the lif
 
 This controller introduces three Custom Resource Definitions (CRDs):
 - **`FloatingIPPool`**: A cluster-scoped resource that defines a pool of available IPv4 and/or IPv6 addresses.
-- **`FloatingIPProjectQuota`**: A cluster-scoped resource that defines FIP quotas for a specific project.
+- **`FloatingIPProjectQuota`**: A cluster-scoped resource that defines FIP quotas for a specific project. Deleting a FloatingIPProjectQuota cascades: all FloatingIPs labeled with the FloatingIPProjectQuota's name are deleted first (releasing their IPAM allocations and pool slots), and the FloatingIPProjectQuota is only removed afterwards.
 - **`FloatingIP`**: A namespaced resource that represents a request for a specific floating IP to be assigned to a service.
 
 The controller runs with high availability using a leader election mechanism, ensuring that only one instance is active at any time.
