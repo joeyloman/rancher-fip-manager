@@ -15,6 +15,7 @@ import (
 	provisioningv1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -522,6 +523,27 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		err := fmt.Errorf("project not found")
 		log.WithError(err).Errorf("unable to find project with ID %s", projectID)
 		return ctrl.Result{}, nil // Do not requeue
+	}
+
+	// The FloatingIPProjectQuota is the single source of truth for "this
+	// project is FIP-enabled". Without it, config secrets created here would
+	// be resurrected on every reconcile after the FloatingIPProjectQuota was
+	// deleted. Requeue (instead of giving up) so guest clusters provisioned
+	// before their FloatingIPProjectQuota pick it up as soon as it appears —
+	// a requeue never creates a secret while the quota is absent.
+	var floatingIPProjectQuota rbbv1beta2.FloatingIPProjectQuota
+	if err := r.Get(ctx, types.NamespacedName{Name: projectID}, &floatingIPProjectQuota); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Requeue instead of giving up so guest clusters provisioned
+			// before their FloatingIPProjectQuota pick it up as soon as it
+			// appears — a requeue never creates a secret while the quota is
+			// absent. Note the wait re-runs the whole reconcile (helm install
+			// included), hence the generous interval.
+			log.Infof("No FloatingIPProjectQuota for project %s yet, requeuing FIP secret creation for cluster %s [%s]", projectID, cluster.Name, cluster.Spec.DisplayName)
+			return ctrl.Result{RequeueAfter: 15 * time.Minute}, nil
+		}
+		log.WithError(err).Error("unable to fetch FloatingIPProjectQuota")
+		return ctrl.Result{}, err
 	}
 
 	// Label the RancherFipLBControllerNamespace with the projectID in the downstream cluster so we can determine the project

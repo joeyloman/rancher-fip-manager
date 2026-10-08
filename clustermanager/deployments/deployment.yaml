@@ -21,6 +21,8 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - rancher.k8s.binbash.org
@@ -67,6 +69,8 @@ rules:
   - secrets
   verbs:
   - create
+  - delete
+  - deletecollection
   - get
   - list
   - update
