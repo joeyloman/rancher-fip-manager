@@ -2,6 +2,7 @@ package ipam
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -409,5 +410,76 @@ func TestIpam(t *testing.T) {
 				t.Errorf("got %q, wanted %q", got, releaseIPv6s[i].want)
 			}
 		}
+	}
+}
+
+// TestIpamConcurrency exercises concurrent allocations/releases against
+// concurrent read-only access (Used/Available/Usage/GetUsage). Run with
+// -race: before locking these readers, this reliably trips
+// "concurrent map read and map write".
+func TestIpamConcurrency(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("race/subnet", "192.168.100.0/24", "192.168.100.10", "192.168.100.110"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	const workers = 8
+	const allocsPerWorker = 50
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for range workers {
+		go func() {
+			defer wg.Done()
+
+			var allocated []string
+			for range allocsPerWorker {
+				ip, err := ti.GetIP("race/subnet", "")
+				if err == nil {
+					allocated = append(allocated, ip)
+				}
+
+				// Read-only paths racing with allocations.
+				_ = ti.Used("race/subnet")
+				_ = ti.Available("race/subnet")
+				_ = ti.GetUsage()
+				ti.Usage("race/subnet")
+
+				if err != nil && ti.Used("missing/subnet") != 0 {
+					t.Errorf("Used on missing subnet should be 0")
+				}
+			}
+
+			for _, ip := range allocated {
+				if err := ti.ReleaseIP("race/subnet", ip); err != nil {
+					t.Errorf("ReleaseIP(%s): %v", ip, err)
+				}
+			}
+		}()
+	}
+
+	// Concurrent RefreshSubnet on another subnet exercises the writer path
+	// against the readers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for range 10 {
+			if err := ti.RefreshSubnet("race/subnet2", "192.168.101.0/24", "192.168.101.10", "192.168.101.110", nil, nil); err != nil {
+				t.Errorf("RefreshSubnet: %v", err)
+			}
+			_ = ti.Used("race/subnet2")
+			_ = ti.GetUsage()
+		}
+	}()
+
+	wg.Wait()
+
+	if used := ti.Used("race/subnet"); used != 0 {
+		t.Errorf("all IPs should be released, used=%d", used)
+	}
+	if got, err := ti.GetIP("race/subnet", "192.168.100.99"); err != nil || got != "192.168.100.99" {
+		t.Errorf("GetIP after release: got (%q, %v), wanted %q", got, err, "192.168.100.99")
 	}
 }

@@ -186,12 +186,12 @@ func (a *IPAllocator) DeleteSubnet(name string) {
 // requested (givenIP is not empty), it attempts to allocate that IP. Otherwise,
 // it allocates the next available IP from the pool.
 func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		return "", fmt.Errorf("network %s does not exists", name)
 	}
-
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
 	if givenIP != "" {
 		gIP, err := netip.ParseAddr(givenIP)
@@ -249,12 +249,12 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 // ReleaseIP returns an IP address to the specified subnet's pool, making it
 // available for future allocations.
 func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		return fmt.Errorf("network %s does not exists", name)
 	}
-
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
 	if givenIP == "" {
 		return fmt.Errorf("given ip is empty")
@@ -283,6 +283,9 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 
 // Used returns the number of allocated IPs in the specified subnet.
 func (a *IPAllocator) Used(name string) (i int) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		logrus.Warnf("(ipam.Used) network %s does not exists", name)
 
@@ -300,6 +303,9 @@ func (a *IPAllocator) Used(name string) (i int) {
 
 // Available returns the number of available (unallocated) IPs in the specified subnet.
 func (a *IPAllocator) Available(name string) (i int) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		logrus.Warnf("(ipam.Available) network %s does not exists", name)
 
@@ -318,32 +324,43 @@ func (a *IPAllocator) Available(name string) (i int) {
 // Usage logs a summary of the IP allocation status for the specified subnet,
 // including which IPs are currently allocated.
 func (a *IPAllocator) Usage(name string) {
+	a.mutex.Lock()
+
 	if _, exists := a.ipam[name]; !exists {
+		a.mutex.Unlock()
 		logrus.Warnf("(ipam.Usage) network %s does not exists", name)
 
 		return
 	}
 
+	subnet := a.ipam[name]
+	poolSize := len(subnet.ips)
+	var allocatedIPs []string
+	for ip, allocated := range subnet.ips {
+		if allocated {
+			allocatedIPs = append(allocatedIPs, ip)
+		}
+	}
+	sort.Strings(allocatedIPs)
+
+	a.mutex.Unlock()
+
 	logrus.Infof("(ipam.Usage) %s: cidr=%s, start=%s, end=%s, broadcast=%s",
 		name,
-		a.ipam[name].cidr.String(),
-		a.ipam[name].start.String(),
-		a.ipam[name].end.String(),
-		a.ipam[name].broadcast.String(),
+		subnet.cidr.String(),
+		subnet.start.String(),
+		subnet.end.String(),
+		subnet.broadcast.String(),
 	)
 
-	var i int = 0
 	logrus.Infof("(ipam.Usage) allocated ips:")
-	for ip, allocated := range a.ipam[name].ips {
-		if allocated {
-			logrus.Infof("- %s", ip)
-			i++
-		}
+	for _, ip := range allocatedIPs {
+		logrus.Infof("- %s", ip)
 	}
 
 	logrus.Infof("(ipam.Usage) ipsinpool=%d, usedips=%d",
-		len(a.ipam[name].ips),
-		i,
+		poolSize,
+		len(allocatedIPs),
 	)
 }
 
