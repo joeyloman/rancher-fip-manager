@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 	ctx, cancel = context.WithCancel(context.TODO())
 
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "deployments", "charts", "rancher-fip-manager", "crds")},
 		ErrorIfCRDPathMissing: true,
 	}
 
