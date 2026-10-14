@@ -103,7 +103,29 @@ func (a *IPAllocator) RefreshSubnet(name, subnet, start, end string, excludes []
 		}
 	}
 
-	// 4. Atomically swap
+	// 4. Carry live owned claims across the swap. GetIPOwned records an
+	// owner the moment a claim is granted, but the caller's allocations list
+	// is derived from persisted FIP statuses through an informer cache, so a
+	// claim granted after that list was built is missing from it. Dropping
+	// such a claim here would let a second FloatingIP take an address that
+	// has already been handed out, so ownership is authoritative and always
+	// survives a refresh. Claims that fall outside the refreshed range (the
+	// pool was shrunk around them) are dropped: the owning FloatingIP's
+	// retry will re-allocate and the status will converge.
+	if old, ok := a.ipam[name]; ok {
+		for ipStr, owner := range old.owners {
+			if owner == "" || !old.ips[ipStr] {
+				continue
+			}
+			if err := a.markIPUsed(&s, ipStr); err != nil {
+				logrus.Warnf("dropping owned claim %s (%s) in subnet %s: outside refreshed range: %v", ipStr, owner, name, err)
+				continue
+			}
+			s.owners[ipStr] = owner
+		}
+	}
+
+	// 5. Atomically swap
 	a.ipam[name] = s
 	return nil
 }

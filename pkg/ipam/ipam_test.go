@@ -617,3 +617,53 @@ func TestIpamOwnedClaims(t *testing.T) {
 		t.Errorf("plain ReleaseIP must release the unowned claim: used=%d, wanted 3", used)
 	}
 }
+
+func TestRefreshSubnetPreservesOwnedClaims(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("refresh/owned", "192.168.60.0/24", "192.168.60.10", "192.168.60.20"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	// Claim granted but not yet visible in the pool-status-derived
+	// allocations list (informer lag, the live duplicate-IP scenario).
+	ip, err := ti.GetIPOwned("refresh/owned", "", "ns/fip-a")
+	if err != nil {
+		t.Fatalf("GetIPOwned: %v", err)
+	}
+
+	// A refresh built from a stale allocation list (empty here) must not
+	// drop the in-flight owned claim.
+	if err := ti.RefreshSubnet("refresh/owned", "192.168.60.0/24", "192.168.60.10", "192.168.60.20", nil, nil); err != nil {
+		t.Fatalf("RefreshSubnet: %v", err)
+	}
+
+	// A second owner must not get the granted address...
+	if _, err := ti.GetIPOwned("refresh/owned", ip, "ns/fip-b"); err == nil {
+		t.Errorf("duplicate allocation after refresh: fip-b got %s already owned by fip-a", ip)
+	}
+
+	// ...while the owning FIP can still idempotently re-claim its own.
+	if got, err := ti.GetIPOwned("refresh/owned", ip, "ns/fip-a"); err != nil || got != ip {
+		t.Errorf("owner re-claim after refresh: got (%q, %v), wanted (%s, nil)", got, err, ip)
+	}
+
+	// Auto-allocation must also skip the carried-over claim.
+	if ip2, err := ti.GetIPOwned("refresh/owned", "", "ns/fip-c"); err != nil || ip2 == ip {
+		t.Errorf("auto-allocation after refresh: got (%q, %v), must differ from %s", ip2, err, ip)
+	}
+
+	// A claim that falls outside the range after shrinking is dropped
+	// instead of failing the whole refresh.
+	if _, err := ti.GetIPOwned("refresh/owned", "192.168.60.15", "ns/fip-d"); err != nil {
+		t.Fatalf("GetIPOwned fip-d: %v", err)
+	}
+	if err := ti.RefreshSubnet("refresh/owned", "192.168.60.0/24", "192.168.60.10", "192.168.60.10", nil, nil); err != nil {
+		t.Fatalf("RefreshSubnet shrink: %v", err)
+	}
+	if err := ti.ReleaseIPOwned("refresh/owned", "192.168.60.15", "ns/fip-d"); err == nil {
+		t.Errorf("claim outside shrunk range should have been dropped, got successful release")
+	}
+	if used := ti.Used("refresh/owned"); used != 1 {
+		t.Errorf("used=%d after shrink, wanted 1 (only the in-range carried claim)", used)
+	}
+}
