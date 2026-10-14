@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	rfmv2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
@@ -23,9 +24,28 @@ import (
 
 type Handler struct {
 	ctx        context.Context
+	mu         sync.Mutex
+	serving    bool
 	httpServer *http.Server
 	clientset  kubernetes.Interface
 	dynamic    dynamic.Interface
+}
+
+// IsServing reports whether a Run goroutine currently owns the HTTPS server.
+// Run returns (serving=false) when the listener failed to bind — e.g. missing
+// or unusable certificate files at startup — so the renewal scheduler knows
+// to restart it once the TLS material is repaired.
+func (h *Handler) IsServing() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.serving
+}
+
+func (h *Handler) setServing(serving bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.serving = serving
 }
 
 func Register(ctx context.Context) *Handler {
@@ -500,15 +520,21 @@ func (h *Handler) Run() {
 	mux.HandleFunc("/validate-floatingip", h.validateFloatingIPAdmission)
 	mux.HandleFunc("/validate-floatingippool", h.validateFloatingIPPoolAdmission)
 
-	h.httpServer = &http.Server{
+	srv := &http.Server{
 		Addr:           ":8443",
 		Handler:        mux,
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		MaxHeaderBytes: 1 << 20, // 1048576
 	}
+	h.mu.Lock()
+	h.httpServer = srv
+	h.mu.Unlock()
 
-	if err := h.httpServer.ListenAndServeTLS(certPath, keyPath); err != nil {
+	h.setServing(true)
+	defer h.setServing(false)
+
+	if err := srv.ListenAndServeTLS(certPath, keyPath); err != nil {
 		if err != http.ErrServerClosed {
 			log.Errorf("HTTP server error: %v", err)
 		}
@@ -516,5 +542,12 @@ func (h *Handler) Run() {
 }
 
 func (h *Handler) Stop() error {
-	return h.httpServer.Shutdown(h.ctx)
+	h.mu.Lock()
+	srv := h.httpServer
+	h.mu.Unlock()
+	if srv == nil {
+		return nil
+	}
+
+	return srv.Shutdown(h.ctx)
 }

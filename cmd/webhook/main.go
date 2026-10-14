@@ -104,7 +104,9 @@ func main() {
 	)
 
 	configHandler.Init()
-	configHandler.Run(certRenewalPeriod)
+	if _, err := configHandler.Run(certRenewalPeriod); err != nil {
+		log.Errorf("webhook TLS setup incomplete, renewal scheduler will retry: %s", err.Error())
+	}
 	admissionHandler.Init()
 	scheduler.StartCertRenewalScheduler(configHandler, serviceHandler, certRenewalPeriod)
 	go serviceHandler.Run()
