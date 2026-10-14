@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joeyloman/rancher-fip-api-server/internal/kubebuilder"
 	"github.com/joeyloman/rancher-fip-api-server/pkg/types"
 	fipv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	"github.com/sirupsen/logrus"
@@ -66,6 +67,11 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Error building fip rest client: %s", err.Error())
 	}
 
+	fipWatchClient, err := kubebuilder.NewFipRestClient(cfg, fipScheme)
+	if err != nil {
+		log.Fatalf("Error building fip watch client: %s", err.Error())
+	}
+
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		log.Fatalf("failed to generate private key: %v", err)
@@ -73,11 +79,12 @@ func TestMain(m *testing.M) {
 
 	// create the app struct with test config
 	app = &types.App{
-		Clientset:     clientset,
-		DynamicClient: dynamicClient,
-		FipRestClient: fipRestClient,
-		PrivateKey:    privateKey,
-		Log:           logrus.New(),
+		Clientset:      clientset,
+		DynamicClient:  dynamicClient,
+		FipRestClient:  fipRestClient,
+		FipWatchClient: fipWatchClient,
+		PrivateKey:     privateKey,
+		Log:            logrus.New(),
 	}
 
 	code := m.Run()
@@ -2661,6 +2668,11 @@ func TestFIPRequestHandlerWithoutIPAddress(t *testing.T) {
 // timeout occurs waiting for IP allocation.
 func TestFIPRequestHandlerTimeout(t *testing.T) {
 	ctx := context.Background()
+
+	// Shorten the allocation wait so this test does not burn 30 real seconds.
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 2 * time.Second
+	defer func() { allocationWaitTimeout = origTimeout }()
 
 	// Create a namespace for the test.
 	ns := &corev1.Namespace{

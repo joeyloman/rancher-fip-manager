@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rsa"
 	"flag"
 	"net/http"
 	"os"
@@ -10,33 +9,25 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/gorilla/mux"
 	"github.com/joeyloman/rancher-fip-api-server/internal/auth"
 	"github.com/joeyloman/rancher-fip-api-server/internal/handlers"
+	"github.com/joeyloman/rancher-fip-api-server/internal/kubebuilder"
 	"github.com/joeyloman/rancher-fip-api-server/internal/middleware"
 	"github.com/joeyloman/rancher-fip-api-server/pkg/types"
 	fipv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	"github.com/sirupsen/logrus"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/leaderelection"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
 	kubeconfig                        string
 	kubecontext                       string
-	leaderElect                       bool
-	leaseLockName                     string
-	leaseLockNamespace                string
 	jwtGenerateKey                    bool
 	jwtSecretName                     string
 	jwtSecretNamespace                string
@@ -48,6 +39,9 @@ var (
 	tlsEnabled                        bool
 	tlsCertFile                       string
 	tlsKeyFile                        string
+	kubeAPIQPS                        float64
+	kubeAPIBurst                      int
+	maxBodySize                       int64
 )
 
 func main() {
@@ -60,9 +54,10 @@ func main() {
 	// Command-line flags
 	flag.StringVar(&kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "Path to a kubeconfig file.")
 	flag.StringVar(&kubecontext, "kubecontext", os.Getenv("KUBECONTEXT"), "The name of the kubeconfig context to use.")
-	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election for controller.")
-	flag.StringVar(&leaseLockName, "lease-lock-name", "rancher-fip-api-server-lock", "The name of the leader election lock.")
-	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "rancher-fip-manager", "The namespace of the leader election lock.")
+	// No leader election: the API server is stateless (all state lives in
+	// FloatingIP CRs; reconciliation is done by the manager controller), so
+	// every replica serves. Leader-only binding previously made readiness
+	// probes wedge rollouts (REPORT.md 4.5).
 	flag.BoolVar(&jwtGenerateKey, "jwt-generate-key", true, "Generate a new JWT private key.")
 	flag.StringVar(&jwtSecretName, "jwt-secret-name", "jwt-private-key", "The name of the secret containing the JWT private key.")
 	flag.StringVar(&jwtSecretNamespace, "jwt-secret-namespace", "rancher-fip-manager", "The namespace of the secret containing the JWT private key.")
@@ -72,6 +67,9 @@ func main() {
 	flag.BoolVar(&tlsEnabled, "tls-enabled", false, "Enable TLS for HTTPS.")
 	flag.StringVar(&tlsCertFile, "tls-cert-file", "", "Path to the TLS certificate file.")
 	flag.StringVar(&tlsKeyFile, "tls-key-file", "", "Path to the TLS key file.")
+	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50, "QPS for the Kubernetes client rate limiter.")
+	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100, "Burst for the Kubernetes client rate limiter.")
+	flag.Int64Var(&maxBodySize, "max-body-size", 1<<20, "Maximum accepted request body size in bytes.")
 	flag.Parse()
 
 	// Create root context
@@ -101,6 +99,12 @@ func main() {
 		log.Fatalf("Failed to create Kubernetes config: %v", err)
 	}
 
+	// client-go silently falls back to 5 QPS / burst 10 when QPS is unset;
+	// that shared bucket is the service's real throughput ceiling under load,
+	// so configure it explicitly instead.
+	config.QPS = float32(kubeAPIQPS)
+	config.Burst = kubeAPIBurst
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Failed to create Kubernetes clientset: %v", err)
@@ -111,73 +115,20 @@ func main() {
 		log.Fatalf("Failed to create dynamic client: %v", err)
 	}
 
-	if !leaderElect {
-		run(ctx, log, config, clientset, dynamicClient)
-		logrus.Info("Controller finished")
-		return
-	}
-
-	// Leader-election logic
-	id := uuid.New().String()
-	lock := &resourcelock.LeaseLock{
-		LeaseMeta: metav1.ObjectMeta{
-			Name:      leaseLockName,
-			Namespace: leaseLockNamespace,
-		},
-		Client: clientset.CoordinationV1(),
-		LockConfig: resourcelock.ResourceLockConfig{
-			Identity: id,
-		},
-	}
-
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-		Lock:            lock,
-		ReleaseOnCancel: true,
-		LeaseDuration:   15 * time.Second,
-		RenewDeadline:   10 * time.Second,
-		RetryPeriod:     2 * time.Second,
-		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) {
-				run(ctx, log, config, clientset, dynamicClient)
-			},
-			OnStoppedLeading: func() {
-				logrus.Infof("leader lost: %s", id)
-				os.Exit(0)
-			},
-			OnNewLeader: func(identity string) {
-				if identity == id {
-					// I just became the leader
-					return
-				}
-				logrus.Infof("new leader elected: %s", identity)
-			},
-		},
-	})
+	run(ctx, log, config, clientset, dynamicClient)
+	log.Info("Server finished")
 }
 
 func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface) {
 	logrus.Info("Starting rancher-fip-api-server")
 
-	var privateKey *rsa.PrivateKey
-	privateKey, err := auth.GetPrivateKey(ctx, clientset, jwtSecretNamespace, jwtSecretName, "key")
+	// Every replica serves unconditionally, so two pods can race to create
+	// the key on first boot; EnsurePrivateKey adopts the winner's key on
+	// that race — a key mismatch would silently invalidate tokens issued by
+	// the other replica.
+	privateKey, err := auth.EnsurePrivateKey(ctx, clientset, jwtSecretNamespace, jwtSecretName, jwtGenerateKey)
 	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			if jwtGenerateKey {
-				// Generate the private key
-				privateKey, err = auth.GeneratePrivateKey()
-				if err != nil {
-					log.Fatalf("Failed to generate private key: %v", err)
-				}
-				// Save the key to the secret
-				if err := auth.SavePrivateKey(ctx, clientset, jwtSecretNamespace, jwtSecretName, privateKey); err != nil {
-					log.Fatalf("Failed to save private key: %v", err)
-				}
-			} else {
-				log.Fatalf("Private key not found in secret %s/%s", jwtSecretNamespace, jwtSecretName)
-			}
-		} else {
-			log.Fatalf("Failed to get private key: %v", err)
-		}
+		log.Fatalf("Failed to prepare JWT private key: %v", err)
 	}
 
 	fipScheme := runtime.NewScheme()
@@ -190,12 +141,21 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 		log.Fatalf("Failed to create fip rest client: %v", err)
 	}
 
+	// Dedicated REST client for watching FloatingIP resources: separate from
+	// the controller-runtime client so watch traffic gets its own rate-limiter
+	// bucket and never queues behind handler List/Create/Update calls.
+	fipWatchClient, err := kubebuilder.NewFipRestClient(config, fipScheme)
+	if err != nil {
+		log.Fatalf("Failed to create fip watch client: %v", err)
+	}
+
 	app := &types.App{
-		FipRestClient: fipRestClient,
-		Clientset:     clientset,
-		DynamicClient: dynamicClient,
-		Log:           log,
-		PrivateKey:    privateKey,
+		FipRestClient:  fipRestClient,
+		FipWatchClient: fipWatchClient,
+		Clientset:      clientset,
+		DynamicClient:  dynamicClient,
+		Log:            log,
+		PrivateKey:     privateKey,
 	}
 
 	log.Infof("Successfully connected to Kubernetes cluster: %s", clientset.Discovery().RESTClient().Get().URL())
@@ -203,6 +163,7 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 	// Set up HTTP server
 	r := mux.NewRouter()
 	r.Use(middleware.RateLimitMiddleware(rateLimitPerSecond, rateLimitBurst))
+	r.Use(middleware.BodyLimitMiddleware(maxBodySize))
 	r.HandleFunc("/v1/auth/token", handlers.TokenHandler(app)).Methods("POST")
 
 	// Protected routes
@@ -217,6 +178,14 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 	server := &http.Server{
 		Addr:    listenAddress,
 		Handler: r,
+		// Bounded server timeouts: FIPRequestHandler legitimately holds a
+		// connection for up to the 30s allocation wait, so the read/write
+		// budgets must exceed that, while slow clients cannot pin a
+		// connection indefinitely (slowloris).
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
