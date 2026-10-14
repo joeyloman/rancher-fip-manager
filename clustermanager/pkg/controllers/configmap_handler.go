@@ -6,6 +6,7 @@ import (
 	rbbv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -87,7 +88,14 @@ func HandleNetworkConfigMap(ctx context.Context, localClient client.Client, down
 		return err
 	}
 
-	// Update the ConfigMap
+	// Update the ConfigMap only when the mappings actually changed: the
+	// provisioning path re-runs on a timer, and a write per tick per cluster
+	// would be pure API server load.
+	if apiequality.Semantic.DeepEqual(cm.Data, configMapData) {
+		log.Debugf("configmap %s/%s is already up to date", appNamespace, configMapName)
+		return nil
+	}
+
 	cm.Data = configMapData
 	if err := downstreamClient.Update(ctx, cm); err != nil {
 		log.WithError(err).Error("failed to update configmap")

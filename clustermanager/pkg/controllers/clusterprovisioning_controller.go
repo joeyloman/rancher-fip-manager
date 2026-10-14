@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/joeyloman/rancher-fip-cluster-manager/internal/helm"
@@ -21,9 +20,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -43,26 +42,64 @@ type ClusterProvisioningReconciler struct {
 	AppNamespace string
 	// NewDownstreamClientFunc is a function that returns a new downstream client.
 	NewDownstreamClientFunc func(config *rest.Config) (client.Client, error)
-	// previousLabels stores the previous "rancher-fip" label values for UPDATE event comparison
-	previousLabels sync.Map
+	// MaxConcurrentReconciles is the number of clusters reconciled in
+	// parallel. Zero selects defaultMaxConcurrentReconciles.
+	MaxConcurrentReconciles int
 }
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
+const (
+	// fipEnabledLabel is the Rancher Cluster label that opts a downstream
+	// cluster into FloatingIP support.
+	fipEnabledLabel = "rancher-fip"
+	// fipLBTypeLabel selects the load balancer implementation installed
+	// downstream; unset means purelb.
+	fipLBTypeLabel = "rancher-fip-lbtype"
+	// clusterProviderLabel is the Rancher provider label. Harvester
+	// management clusters are never provisioned here.
+	clusterProviderLabel = "provider.cattle.io"
+	// defaultMaxConcurrentReconciles is the worker count used when the
+	// reconciler is constructed without MaxConcurrentReconciles. A single
+	// worker lets one blackholed downstream cluster (or one Helm wait)
+	// stall every other cluster.
+	defaultMaxConcurrentReconciles = 4
+	// provisioningReconcileInterval is how often a cluster that has been
+	// through the provisioning path re-runs it. Steady state is cheap (the
+	// Helm wrapper skips a deployed release on the desired chart), and in
+	// exchange a cluster whose provisioning gave up — or whose release
+	// wedged, or whose resources were deleted by hand downstream —
+	// converges on its own instead of waiting for the next Rancher event on
+	// the Cluster object.
+	provisioningReconcileInterval = 30 * time.Minute
+)
+
+// provisioningTriggerChanged reports whether a Cluster update changes what
+// this controller has to provision: the rancher-fip enablement label or the
+// load balancer type label. Everything else — status churn, Rancher writing
+// annotations, periodic resyncs — is noise, and acting on it would re-run the
+// Helm phase for a cluster that did not change.
+func provisioningTriggerChanged(oldObj, newObj client.Object) bool {
+	if oldObj == nil || newObj == nil {
+		return true
+	}
+	if oldObj.GetLabels()[fipEnabledLabel] != newObj.GetLabels()[fipEnabledLabel] {
+		return true
+	}
+	if oldObj.GetLabels()[fipLBTypeLabel] != newObj.GetLabels()[fipLBTypeLabel] {
+		return true
+	}
+	return false
+}
+
+// Reconcile brings a Rancher management cluster into the state FloatingIP
+// support requires: the lb-controller and load balancer charts installed in
+// the downstream cluster, plus the per-project config secret.
 //
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.4/pkg/reconcile
-func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
-	clusterKey := req.NamespacedName.String()
-
-	// Remove the clusterKey from the previousLabels map if the reconciliation fails or is requeued
-	defer func() {
-		if result.RequeueAfter > 0 {
-			// Delete the clusterKey from the previousLabels map so rancher-fip relabeling will trigger a new reconciliation if the cluster is requeued
-			r.previousLabels.Delete(clusterKey)
-		}
-	}()
-
+// Which events are worth reconciling is decided by the predicates in
+// SetupWithManager, from the event's own old/new objects rather than from
+// process memory. Requeued work (a returned error or RequeueAfter) re-enters
+// here without passing through the predicates, so a retry always re-runs the
+// provisioning steps.
+func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logrus.WithFields(logrus.Fields{
 		"controller": "clusterprovisioning",
 		"name":       req.NamespacedName,
@@ -74,9 +111,6 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		if client.IgnoreNotFound(err) == nil {
 			// Object not found, treat as deleted
 			log.Infof("Cluster %s not found, checking for FloatingIP cleanup", req.Name)
-
-			// Delete the clusterKey from the previousLabels map
-			r.previousLabels.Delete(clusterKey)
 
 			// Run cleanup
 			if err := r.releaseFloatingIPs(ctx, log, req.Name); err != nil {
@@ -91,54 +125,10 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	// Filter out clusters that should not be reconciled
 	if cluster.Name == "local" ||
-		cluster.Labels["provider.cattle.io"] == "harvester" ||
-		cluster.Labels["rancher-fip"] != "enabled" {
+		cluster.Labels[clusterProviderLabel] == "harvester" ||
+		cluster.Labels[fipEnabledLabel] != "enabled" {
 		log.Debugf("Skipping reconciliation for cluster: %s [%s]", cluster.Name, cluster.Spec.DisplayName)
-
-		// Delete the clusterKey from the previousLabels map so rancher-fip relabeling will trigger a new reconciliation
-		r.previousLabels.Delete(clusterKey)
-
 		return ctrl.Result{}, nil
-	}
-
-	// Check if this is an UPDATE event by checking if we have a previous label value stored
-	previousLabelValue, isUpdate := r.previousLabels.Load(clusterKey)
-
-	if isUpdate {
-		// This is an UPDATE event - check the "rancher-fip" label change
-		oldLabelValue, _ := previousLabelValue.(string)
-		newLabelValue := cluster.Labels["rancher-fip"]
-
-		// Check if old object had the label
-		oldHadLabel := oldLabelValue != ""
-
-		// Check if new object has the label
-		newHasLabel := newLabelValue != ""
-
-		// Continue only if:
-		// 1. Old object had the label and new object has a different value, OR
-		// 2. Old object didn't have the label but new object does
-		shouldContinue := false
-		if oldHadLabel && newHasLabel && oldLabelValue != newLabelValue {
-			// Label value changed
-			shouldContinue = true
-			log.Debugf("rancher-fip label value changed from '%s' to '%s' for cluster %s [%s]", oldLabelValue, newLabelValue, cluster.Name, cluster.Spec.DisplayName)
-		} else if !oldHadLabel && newHasLabel {
-			// Label was added
-			shouldContinue = true
-			log.Debugf("rancher-fip label was added with value '%s' for cluster %s [%s]", newLabelValue, cluster.Name, cluster.Spec.DisplayName)
-		}
-
-		// Update the stored label value for future comparisons
-		r.previousLabels.Store(clusterKey, newLabelValue)
-
-		if !shouldContinue {
-			log.Debugf("Skipping reconciliation for UPDATE event - rancher-fip label condition not met for cluster: %s [%s]", cluster.Name, cluster.Spec.DisplayName)
-			return ctrl.Result{}, nil
-		}
-	} else {
-		// This is a CREATE event - store the current label value for future UPDATE comparisons
-		r.previousLabels.Store(clusterKey, cluster.Labels["rancher-fip"])
 	}
 
 	log.Infof("Reconciling cluster: %s [%s]", cluster.Name, cluster.Spec.DisplayName)
@@ -177,7 +167,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 	}
 
-	downstreamConfig, err := clientcmd.RESTConfigFromKubeConfig(downstreamKubeconfig)
+	downstreamConfig, err := newDownstreamRESTConfig(downstreamKubeconfig)
 	if err != nil {
 		log.WithError(err).Error("unable to create REST config from kubeconfig")
 		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
@@ -233,7 +223,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	// Determine the load balancer type from the cluster label
 	loadBalancerType := "purelb"
-	if cluster.Labels["rancher-fip-lbtype"] == "metallb" {
+	if cluster.Labels[fipLBTypeLabel] == "metallb" {
 		loadBalancerType = "metallb"
 	}
 
@@ -247,7 +237,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		}
 		if chartInstalled {
 			log.Errorf("load balancer type is set to purelb, but metallb is already installed, skipping reconciliation")
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 		}
 	} else if loadBalancerType == "metallb" {
 		chartInstalled, err := r.HelmClient.CheckIfChartIsInstalled(ctx, downstreamConfig, r.Config.PureLBControllerChartName, r.Config.PureLBControllerNamespace)
@@ -257,7 +247,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		}
 		if chartInstalled {
 			log.Errorf("load balancer type is set to metallb, but purelb is already installed, skipping reconciliation")
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 		}
 	}
 
@@ -351,7 +341,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 	if provisioningCluster.Spec.CloudCredentialSecretName == "" {
 		log.Infof("No Harvester cloudCredentialSecretName found for cluster %s [%s], skipping client/server secret creation", cluster.Name, cluster.Spec.DisplayName)
 
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 	}
 
 	var harvesterConfigName string
@@ -367,7 +357,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	if harvesterConfigName == "" {
 		log.Info("No HarvesterConfig found for control plane nodes, skipping reconciliation")
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 	}
 
 	// Get the HarvesterConfig.rke-machine-config.cattle.io object from the "fleet-default" namespace named harvesterConfigName
@@ -466,7 +456,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	harvesterKubeConfig := harvesterKubeConfigSecret.Data["value"]
 
-	harvesterClientConfig, err := clientcmd.RESTConfigFromKubeConfig(harvesterKubeConfig)
+	harvesterClientConfig, err := newDownstreamRESTConfig(harvesterKubeConfig)
 	if err != nil {
 		log.WithError(err).Errorf("error while creating REST config from Harvester kubeconfig")
 		return ctrl.Result{}, err
@@ -491,7 +481,9 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 	if !ok {
 		err := fmt.Errorf("projectId label not found on cluster")
 		log.WithError(err).Error("unable to get project ID")
-		return ctrl.Result{}, nil // Do not requeue, as this is a configuration issue
+		// Re-check on the provisioning interval: the annotation is owned by
+		// Harvester, so no event on this Cluster will ever signal the fix.
+		return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 	}
 	log.Infof("found projectID in namespace annotations: %s", projectID)
 
@@ -522,7 +514,9 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 	if !projectFound {
 		err := fmt.Errorf("project not found")
 		log.WithError(err).Errorf("unable to find project with ID %s", projectID)
-		return ctrl.Result{}, nil // Do not requeue
+		// Re-check on the provisioning interval: the project lives outside
+		// this object, so no Cluster event will signal its creation.
+		return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 	}
 
 	// The FloatingIPProjectQuota is the single source of truth for "this
@@ -557,7 +551,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{RequeueAfter: 1 * time.Minute}, err
 	}
 
-	return HandleConfigSecrets(
+	if result, err := HandleConfigSecrets(
 		ctx, r.Client,
 		downstreamClient,
 		r.Config.RancherFipLBControllerNamespace,
@@ -568,7 +562,12 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		cluster.Name,
 		loadBalancerType,
 		r.Config.CaCrt,
-	)
+	); err != nil {
+		return result, err
+	}
+
+	// Keep the cluster on the convergence loop.
+	return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 }
 
 func (r *ClusterProvisioningReconciler) releaseFloatingIPs(ctx context.Context, log *logrus.Entry, clusterName string) error {
@@ -622,23 +621,45 @@ func (r *ClusterProvisioningReconciler) createChartSpec(name, ref, version, name
 	return spec
 }
 
+// clusterProvisioningPredicate decides which informer events are worth a
+// reconcile.
+//
+// The create-vs-update distinction the provisioning path relies on is derived
+// from the event itself — the informer hands the predicate both objects —
+// instead of from a map of "labels I have already seen". A gate kept in
+// process memory drops work: controller-runtime requeues (rate-limited
+// retries and RequeueAfter alike) re-enter Reconcile without passing through
+// the predicates, so a cluster left in such a map by a bare error return was
+// reconciled as a no-op on every retry.
+func clusterProvisioningPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return provisioningTriggerChanged(e.ObjectOld, e.ObjectNew)
+		},
+		// Deletes must reach Reconcile: that is where the FloatingIPs
+		// assigned to the cluster get released.
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return true
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterProvisioningReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	maxConcurrentReconciles := r.MaxConcurrentReconciles
+	if maxConcurrentReconciles <= 0 {
+		maxConcurrentReconciles = defaultMaxConcurrentReconciles
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&managementv3.Cluster{}).
-		WithEventFilter(predicate.Funcs{
-			CreateFunc: func(e event.CreateEvent) bool {
-				return true
-			},
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				return true
-			},
-			DeleteFunc: func(e event.DeleteEvent) bool {
-				return true
-			},
-			GenericFunc: func(e event.GenericEvent) bool {
-				return false
-			},
-		}).
+		WithEventFilter(clusterProvisioningPredicate()).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}).
 		Complete(r)
 }
