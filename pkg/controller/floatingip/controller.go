@@ -276,10 +276,13 @@ func (c *Controller) setCondition(conditions []metav1.Condition, newCondition me
 func (c *Controller) reconcile(ctx context.Context, fip *v1beta2.FloatingIP) error {
 	logrus.Infof("Reconciling FloatingIP %s/%s", fip.Namespace, fip.Name)
 
-	// Check if the FloatingIP is in an Error state
+	// A previous allocation attempt failed (Status.State == "Error"). This is
+	// not a dead end: fall through and re-attempt the work. Failed
+	// allocations return an error, so the workqueue requeues this key with
+	// rate-limited backoff; a successful attempt sets State back to
+	// "Allocated" below.
 	if fip.Status.State == "Error" {
-		logrus.Errorf("FloatingIP %s/%s is in Error state. Skipping reconciliation.", fip.Namespace, fip.Name)
-		return nil // Skip further processing if in Error state
+		logrus.Infof("FloatingIP %s/%s is in Error state from a previous failed allocation. Re-attempting.", fip.Namespace, fip.Name)
 	}
 
 	// If IP is already assigned in status, our main work is done.
@@ -470,11 +473,15 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta2.FloatingIP) err
 		return err
 	}
 
-	// Allocate IP
+	// Allocate IP. Claims are owner-aware (namespace/name) so that a retry
+	// after a partially persisted allocation (spec update landed, status
+	// update failed) idempotently re-claims this FIP's own IP instead of
+	// failing with "already allocated" forever.
+	fipOwner := fip.Namespace + "/" + fip.Name
 	var allocatedIP string
 	var fipForSpecUpdate *v1beta2.FloatingIP = fip
 	if fip.Spec.IPAddr != nil && *fip.Spec.IPAddr != "" {
-		allocatedIP, err = c.ipam.GetIP(poolName, *fip.Spec.IPAddr)
+		allocatedIP, err = c.ipam.GetIPOwned(poolName, *fip.Spec.IPAddr, fipOwner)
 		if err != nil {
 			errMsg := fmt.Sprintf("failed to allocate requested IP %s from pool %s: %v", *fip.Spec.IPAddr, poolName, err)
 			logrus.Error(errMsg)
@@ -484,7 +491,7 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta2.FloatingIP) err
 			return fmt.Errorf("%s", errMsg)
 		}
 	} else {
-		allocatedIP, err = c.ipam.GetIP(poolName, "")
+		allocatedIP, err = c.ipam.GetIPOwned(poolName, "", fipOwner)
 		if err != nil {
 			errMsg := fmt.Sprintf("failed to allocate an IP from pool %s: %v", poolName, err)
 			logrus.Error(errMsg)
@@ -636,6 +643,24 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta2.FloatingI
 
 	// The source of truth for an allocated IP is the status field.
 	if fip.Status.IPAddr == "" {
+		// A partially persisted allocation (spec update landed, status update
+		// failed) leaves an owned IPAM claim behind. Release it on the way out
+		// so the address is not burned until a pool refresh or restart.
+		// Owner-aware: an IP held by another FIP is never released here.
+		if fip.Spec.IPAddr != nil && *fip.Spec.IPAddr != "" {
+			switch err := c.ipam.ReleaseIPOwned(fip.Spec.FloatingIPPool, *fip.Spec.IPAddr, fip.Namespace+"/"+fip.Name); {
+			case err == nil:
+				logrus.Infof("FloatingIP %s/%s: released spec IP %s from IPAM", fip.Namespace, fip.Name, *fip.Spec.IPAddr)
+			case ipam.IsForeignClaim(err):
+				logrus.Warnf("FloatingIP %s/%s: spec IP %s is held by another claim in pool %s, not releasing it: %v",
+					fip.Namespace, fip.Name, *fip.Spec.IPAddr, fip.Spec.FloatingIPPool, err)
+			default:
+				// Requested but never granted, or the claim was already wiped
+				// by a pool refresh — a normal no-op, not an anomaly.
+				logrus.Debugf("FloatingIP %s/%s: spec IP %s has no IPAM claim to release in pool %s: %v",
+					fip.Namespace, fip.Name, *fip.Spec.IPAddr, fip.Spec.FloatingIPPool, err)
+			}
+		}
 		logrus.Infof("No IP assigned in status for FloatingIP %s/%s. Removing finalizer.", fip.Namespace, fip.Name)
 		return c.removeFinalizer(ctx, fip)
 	}
@@ -723,14 +748,28 @@ func (c *Controller) reconcileDelete(ctx context.Context, fip *v1beta2.FloatingI
 }
 
 func (c *Controller) updateFipStatusWithError(ctx context.Context, fip *v1beta2.FloatingIP, reason, message string) error {
-	fipCopy := fip.DeepCopy()
-	fipCopy.Status.State = "Error"
 	condition := metav1.Condition{
 		Type:    "Ready",
 		Status:  metav1.ConditionFalse,
 		Reason:  reason,
 		Message: message,
 	}
+
+	// Failed allocations are retried with rate-limited backoff. Skip the
+	// status write when the object already records this exact failure,
+	// otherwise every retry rewrites an identical status.
+	if fip.Status.State == "Error" {
+		if last := len(fip.Status.Conditions) - 1; last >= 0 {
+			lastCond := fip.Status.Conditions[last]
+			if lastCond.Type == condition.Type && lastCond.Status == condition.Status &&
+				lastCond.Reason == condition.Reason && lastCond.Message == condition.Message {
+				return nil
+			}
+		}
+	}
+
+	fipCopy := fip.DeepCopy()
+	fipCopy.Status.State = "Error"
 	fipCopy.Status.Conditions = c.setCondition(fipCopy.Status.Conditions, condition)
 
 	_, err := c.clientset.RancherV1beta2().FloatingIPs(fip.Namespace).UpdateStatus(ctx, fipCopy, metav1.UpdateOptions{})

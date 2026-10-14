@@ -1,6 +1,7 @@
 package ipam
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -9,6 +10,16 @@ import (
 
 	"github.com/sirupsen/logrus"
 )
+
+// ErrForeignClaim is returned by ReleaseIPOwned when the requested IP is
+// allocated to a different owner.
+var ErrForeignClaim = errors.New("ip is allocated to a different owner")
+
+// IsForeignClaim reports whether err was caused by a release attempt on an IP
+// owned by a different claimant.
+func IsForeignClaim(err error) bool {
+	return errors.Is(err, ErrForeignClaim)
+}
 
 // UsageData contains usage information for a single subnet.
 type UsageData struct {
@@ -30,6 +41,7 @@ type IPSubnet struct {
 	end       net.IP
 	broadcast net.IP
 	ips       map[string]bool
+	owners    map[string]string
 }
 
 // IPAllocator manages the allocation of IP addresses from one or more subnets.
@@ -150,6 +162,7 @@ func (a *IPAllocator) buildSubnet(subnet, start, end string) (IPSubnet, error) {
 		allocatedIPs[ip.Unmap().String()] = false
 	}
 	s.ips = allocatedIPs
+	s.owners = make(map[string]string)
 
 	return s, nil
 }
@@ -184,11 +197,41 @@ func (a *IPAllocator) DeleteSubnet(name string) {
 
 // GetIP allocates an IP address from the specified subnet. If a specific IP is
 // requested (givenIP is not empty), it attempts to allocate that IP. Otherwise,
-// it allocates the next available IP from the pool.
+// it allocates the next available IP from the pool. Claims made through GetIP
+// are unowned: they can only be released, never idempotently re-claimed.
 func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
+	return a.getIP(name, givenIP, "")
+}
+
+// GetIPOwned allocates an IP address from the specified subnet on behalf of
+// owner (a FloatingIP namespace/name). Re-claiming an IP that is already
+// allocated to the same owner is an idempotent no-op success; this makes the
+// allocate-then-persist sequence retry-safe when the spec update landed but
+// the status update did not. An IP held by a different owner (or an unowned
+// claim) is rejected, so one FloatingIP can never steal another's address.
+func (a *IPAllocator) GetIPOwned(name, givenIP, owner string) (string, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if owner == "" {
+		return "", fmt.Errorf("owner must not be empty")
+	}
+
+	if givenIP != "" {
+		if subnet, ok := a.ipam[name]; ok {
+			if subnet.ips[givenIP] && subnet.owners[givenIP] == owner {
+				return givenIP, nil
+			}
+		}
+	}
+
+	return a.getIP(name, givenIP, owner)
+}
+
+func (a *IPAllocator) getIP(name string, givenIP string, owner string) (string, error) {
 	if _, exists := a.ipam[name]; !exists {
 		return "", fmt.Errorf("network %s does not exists", name)
 	}
@@ -212,6 +255,7 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 				return "", fmt.Errorf("given ip %s is already allocated", givenIP)
 			}
 			a.ipam[name].ips[givenIP] = true
+			a.ipam[name].owners[givenIP] = owner
 			return givenIP, nil
 		} else {
 			return "", fmt.Errorf("given ip %s not found in network pool %s", givenIP, name)
@@ -239,6 +283,7 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 		ipStr := ip.String()
 		if !a.ipam[name].ips[ipStr] {
 			a.ipam[name].ips[ipStr] = true
+			a.ipam[name].owners[ipStr] = owner
 			return ipStr, nil
 		}
 	}
@@ -252,6 +297,34 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
+	return a.releaseIP(name, givenIP)
+}
+
+// ReleaseIPOwned releases an IP address on behalf of owner. The release only
+// succeeds when the claim is recorded as owned by owner, so deleting a
+// FloatingIP whose requested IP is held by another FIP can never release the
+// other FIP's claim. Unowned claims (e.g. restored by RefreshSubnet) are also
+// refused — they may back another FIP's persisted allocation.
+func (a *IPAllocator) ReleaseIPOwned(name, givenIP, owner string) error {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if owner == "" {
+		return fmt.Errorf("owner must not be empty")
+	}
+
+	subnet, exists := a.ipam[name]
+	if !exists {
+		return fmt.Errorf("network %s does not exists", name)
+	}
+	if allocated, ok := subnet.ips[givenIP]; ok && allocated && subnet.owners[givenIP] != owner {
+		return fmt.Errorf("given ip %s is allocated to %s: %w", givenIP, subnet.owners[givenIP], ErrForeignClaim)
+	}
+
+	return a.releaseIP(name, givenIP)
+}
+
+func (a *IPAllocator) releaseIP(name string, givenIP string) (err error) {
 	if _, exists := a.ipam[name]; !exists {
 		return fmt.Errorf("network %s does not exists", name)
 	}
@@ -272,6 +345,7 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	if allocated, ok := a.ipam[name].ips[givenIP]; ok {
 		if allocated {
 			a.ipam[name].ips[givenIP] = false
+			delete(a.ipam[name].owners, givenIP)
 			return nil
 		} else {
 			return fmt.Errorf("given ip %s was not allocated", givenIP)
