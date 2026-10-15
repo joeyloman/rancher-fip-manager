@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"flag"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,6 +33,7 @@ var (
 	jwtGenerateKey                    bool
 	jwtSecretName                     string
 	jwtSecretNamespace                string
+	healthProbeBindAddress            string
 	authorizedProjectsSecretName      string
 	authorizedProjectsSecretNamespace string
 	rateLimitPerSecond                float64
@@ -42,6 +45,14 @@ var (
 	kubeAPIQPS                        float64
 	kubeAPIBurst                      int
 	maxBodySize                       int64
+
+	// apiListenerReady gates /readyz: true only while the TLS/HTTP API
+	// listener is actually accepting, so a passing readiness probe keeps
+	// meaning "the service port answers" — the property the old tcpSocket
+	// probe on the api port guaranteed and an unconditional /readyz would
+	// have silently dropped. /healthz stays unconditional so liveness
+	// works from process start.
+	apiListenerReady atomic.Bool
 )
 
 func main() {
@@ -70,6 +81,7 @@ func main() {
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50, "QPS for the Kubernetes client rate limiter.")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100, "Burst for the Kubernetes client rate limiter.")
 	flag.Int64Var(&maxBodySize, "max-body-size", 1<<20, "Maximum accepted request body size in bytes.")
+	flag.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "Address of the dependency-free /healthz probe server.")
 	flag.Parse()
 
 	// Create root context
@@ -84,6 +96,12 @@ func main() {
 		log.Info("Shutting down...")
 		cancel()
 	}()
+
+	// The probe endpoints are served by a dependency-free listener bound
+	// before the API server starts: both probes are plain HTTP on their own
+	// port, so kubelet never TCP-dials the TLS listener and the log stays
+	// free of the per-probe "TLS handshake error" noise.
+	go serveHealthProbe(ctx, log, healthProbeBindAddress)
 
 	// Set up Kubernetes client
 	var config *rest.Config
@@ -117,6 +135,38 @@ func main() {
 
 	run(ctx, log, config, clientset, dynamicClient)
 	log.Info("Server finished")
+}
+
+// serveHealthProbe binds the liveness/readiness endpoints independently of
+// the API server: kubelet probes are plain HTTP on a dedicated port, so a
+// TCP probe can never hit the TLS listener and log a handshake error per
+// tick. Mirrors serveHealthProbe in cmd/manager and cmd/cluster-manager.
+func serveHealthProbe(ctx context.Context, log *logrus.Logger, addr string) {
+	mux := http.NewServeMux()
+	handler := func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) }
+	readyHandler := func(w http.ResponseWriter, _ *http.Request) {
+		if !apiListenerReady.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("api listener not ready"))
+			return
+		}
+		w.Write([]byte("ok"))
+	}
+	mux.HandleFunc("/healthz", handler)
+	mux.HandleFunc("/readyz", readyHandler)
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Errorf("health probe server shutdown failed: %s", err.Error())
+		}
+	}()
+	log.Infof("starting health probe server on %s", addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Errorf("health probe server failed to start on %s: %s", addr, err.Error())
+	}
 }
 
 func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface) {
@@ -189,15 +239,24 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 	}
 
 	go func() {
+		// Bind explicitly so apiListenerReady flips exactly when the
+		// socket accepts: storing before ListenAndServe would leave a
+		// window where /readyz is green but nothing is bound yet.
+		ln, err := net.Listen("tcp", listenAddress)
+		if err != nil {
+			log.Fatalf("Could not listen on %s: %v\n", listenAddress, err)
+		}
 		if tlsEnabled {
 			log.Infof("Starting server on %s with TLS", listenAddress)
-			if err := server.ListenAndServeTLS(tlsCertFile, tlsKeyFile); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Could not listen on %s: %v\n", listenAddress, err)
+			apiListenerReady.Store(true)
+			if err := server.ServeTLS(ln, tlsCertFile, tlsKeyFile); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("Could not serve on %s: %v\n", listenAddress, err)
 			}
 		} else {
 			log.Infof("Starting server on %s", listenAddress)
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Could not listen on %s: %v\n", listenAddress, err)
+			apiListenerReady.Store(true)
+			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("Could not serve on %s: %v\n", listenAddress, err)
 			}
 		}
 	}()
@@ -208,6 +267,10 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 	// Shutdown the server gracefully
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
+	// Flip readiness before draining: kubelet must stop sending traffic
+	// (remove the pod from Service endpoints) at the start of the SIGTERM
+	// window, not after in-flight requests have drained.
+	apiListenerReady.Store(false)
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("Server shutdown failed: %v", err)
 	}

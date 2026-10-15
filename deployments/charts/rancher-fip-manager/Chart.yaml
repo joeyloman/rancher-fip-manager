@@ -1,6 +1,6 @@
 apiVersion: v2
 name: rancher-fip-manager
-description: A Helm chart for Kubernetes
+description: Helm chart deploying the rancher-fip-manager components (manager, webhook, cluster-manager, api-server)
 
 # A chart can be either an 'application' or a 'library' chart.
 #

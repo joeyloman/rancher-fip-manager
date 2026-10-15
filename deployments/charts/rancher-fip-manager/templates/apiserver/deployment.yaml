@@ -58,6 +58,7 @@ spec:
             - --jwt-secret-name=jwt-private-key
             - --jwt-secret-namespace={{ .Release.Namespace | default "kube-system" }}
             - --listen-address=:{{ .Values.apiserver.service.apiPort | default 8080 }}
+            - --health-probe-bind-address=:8081
 {{- if .Values.apiserver.service.tls.enabled }}
             - --tls-enabled=true
             - --tls-cert-file=/etc/tls/tls.crt
@@ -71,21 +72,30 @@ spec:
           - name: api
             containerPort: {{ .Values.apiserver.service.apiPort | default 8080 }}
             protocol: TCP
+          - name: healthz
+            containerPort: 8081
+            protocol: TCP
           imagePullPolicy: {{ .Values.apiserver.image.pullPolicy }}
           resources:
             {{- toYaml .Values.apiserver.resources | nindent 12 }}
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
+          # /healthz and /readyz are served by a dependency-free plain-HTTP
+          # listener (cmd/api-server/main.go, serveHealthProbe). The old
+          # tcpSocket probes dialed the TLS listener on the api port, which
+          # logged a "TLS handshake error" line per probe tick.
           readinessProbe:
-            tcpSocket:
-              port: api
+            httpGet:
+              path: /readyz
+              port: healthz
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
-            tcpSocket:
-              port: api
+            httpGet:
+              path: /healthz
+              port: healthz
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 5

@@ -92,11 +92,17 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 2
-          # tcpSocket only catches a dead process or a failed rebind; the
-          # threshold outlives any rebind recovery window.
+          # httpGet instead of tcpSocket: a TCP probe dials the TLS listener
+          # and closes without a ClientHello, logging a "TLS handshake
+          # error" line per tick. /readyz is the endpoint readiness already
+          # uses (scheme HTTPS, served from the atomic certificate); the
+          # generous failure threshold still outlives any rebind recovery
+          # window.
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /readyz
               port: https
+              scheme: HTTPS
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
