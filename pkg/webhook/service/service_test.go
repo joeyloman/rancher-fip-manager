@@ -2,10 +2,24 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	rfmv2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -211,6 +225,28 @@ func TestValidateFloatingIP(t *testing.T) {
 				Spec: rfmv2.FloatingIPSpec{
 					FloatingIPPool: "test-pool",
 					IPAddr:         &ipAddr,
+				},
+			},
+			existingPools:   []runtime.Object{fipPool},
+			existingPLBCs:   []runtime.Object{plbc},
+			expectedAllowed: true,
+		},
+		{
+			name: "deletion of an out-of-range fip is always allowed",
+			fip: &rfmv2.FloatingIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-fip",
+					Namespace:         "default",
+					Labels:            fip.Labels,
+					DeletionTimestamp: &metav1.Time{},
+					Finalizers:        []string{"floatingip-cleanup"},
+				},
+				Spec: rfmv2.FloatingIPSpec{
+					FloatingIPPool: "test-pool",
+					// Outside subnet, outside range, absent from status:
+					// every re-validation would deny this update were it
+					// not a deletion.
+					IPAddr: func() *string { s := "192.168.9.9"; return &s }(),
 				},
 			},
 			existingPools:   []runtime.Object{fipPool},
@@ -546,4 +582,163 @@ func getUnstructuredList(objects []runtime.Object) ([]runtime.Object, error) {
 		unstructuredList = append(unstructuredList, &unstructured.Unstructured{Object: unstructuredMap})
 	}
 	return unstructuredList, nil
+}
+
+// TestStopWithoutServerIsNil pins the nil-safety half of REPORT.md 2.5.
+func TestStopWithoutServerIsNil(t *testing.T) {
+	h := &Handler{ctx: context.Background()}
+	require.NoError(t, h.Stop())
+}
+
+// TestStopIsBoundedByTimeout pins REPORT.md 2.5: Stop used to be bounded
+// only by the app context (SIGTERM), so a wedged in-flight request could
+// block a renewal/rebind indefinitely. Stop must now return with a
+// deadline error within shutdownTimeout even while a handler hangs.
+func TestStopIsBoundedByTimeout(t *testing.T) {
+	old := shutdownTimeout
+	shutdownTimeout = 1 * time.Second
+	t.Cleanup(func() { shutdownTimeout = old })
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+
+	srv := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		<-blocked
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go srv.Serve(ln)
+
+	h := &Handler{ctx: context.Background()}
+	h.mu.Lock()
+	h.httpServer = srv
+	h.mu.Unlock()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "GET /hung HTTP/1.1\r\nHost: localhost\r\n\r\n")
+	require.NoError(t, err)
+	// let the request reach the (blocking) handler
+	time.Sleep(200 * time.Millisecond)
+
+	start := time.Now()
+	err = h.Stop()
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "Shutdown of a server with a wedged handler must report the deadline")
+	assert.GreaterOrEqual(t, elapsed, shutdownTimeout)
+	assert.Less(t, elapsed, shutdownTimeout+3*time.Second, "Stop must be bounded by shutdownTimeout, not by the wedged handler")
+}
+
+func newServingPEM(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		Subject:   pkix.Name{CommonName: "rancher-fip-manager-webhook.rancher-fip-manager.svc"},
+		DNSNames:  []string{"rancher-fip-manager-webhook.rancher-fip-manager.svc"},
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	require.NoError(t, err)
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+
+	return certPEM, keyPEM
+}
+
+// TestServesRotatedCertificateInPlace pins the central REPORT.md 2.4 claim:
+// renewal swaps the served certificate on the LIVE listener — pair A is
+// served, then pair B is pushed, and the very next handshake serves B
+// without the listener ever being stopped (the old path ran Stop →
+// sleep(2s) → restart per renewal, a recurring write-blackout window under
+// failurePolicy Fail).
+func TestServesRotatedCertificateInPlace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	h := &Handler{ctx: context.Background()}
+	go h.Run()
+	require.Eventually(t, h.IsServing, 5*time.Second, 10*time.Millisecond, "listener must bind even before any material exists")
+
+	dial := func() (*x509.Certificate, error) {
+		conn, err := tls.Dial("tcp", "127.0.0.1:8443", &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+
+		return conn.ConnectionState().PeerCertificates[0], nil
+	}
+
+	// No material anywhere yet: the handshake must fail closed, /readyz
+	// must be red, and the process must still be up to recover.
+	_, err := dial()
+	require.Error(t, err, "handshake without any serving material must fail")
+
+	certPEM, keyPEM := newServingPEM(t)
+	pairA, err := tls.X509KeyPair(certPEM, keyPEM)
+	require.NoError(t, err)
+	h.SetCertificate(&pairA)
+
+	peerA, err := dial()
+	require.NoError(t, err)
+
+	certPEM, keyPEM = newServingPEM(t)
+	pairB, err := tls.X509KeyPair(certPEM, keyPEM)
+	require.NoError(t, err)
+	h.SetCertificate(&pairB)
+
+	peerB, err := dial()
+	require.NoError(t, err)
+	require.NotEqual(t, peerA.Raw, peerB.Raw, "the pushed material must be served on the next handshake without a restart")
+
+	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}).Get("https://127.0.0.1:8443/readyz")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "readyz must be green while serving rotated material")
+
+	assert.True(t, h.IsServing(), "rotation must never tear down the listener")
+	require.NoError(t, h.Stop())
+}
+
+// TestReadyzReportsServingMaterial pins the readiness half of REPORT.md
+// 5.1: /readyz must be red while no TLS material can produce a successful
+// handshake (endpoint shed under Fail policy), and green after either a
+// pushed (renewed) certificate or with the on-disk pair.
+func TestReadyzReportsServingMaterial(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	h := &Handler{ctx: context.Background()}
+	rec := httptest.NewRecorder()
+	h.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "no material anywhere must not advertise Ready")
+
+	// pushed material (post-renewal state)
+	h.SetCertificate(&tls.Certificate{Certificate: [][]byte{{0x30, 0x00}}})
+	rec = httptest.NewRecorder()
+	h.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// file fallback: fresh handler, valid on-disk pair, nothing pushed
+	certPEM, keyPEM := newServingPEM(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.crt"), certPEM, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.key"), keyPEM, 0600))
+	h2 := &Handler{ctx: context.Background()}
+	rec = httptest.NewRecorder()
+	h2.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// broken on-disk key must stay red
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.key"), []byte("not a key"), 0600))
+	h3 := &Handler{ctx: context.Background()}
+	rec = httptest.NewRecorder()
+	h3.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }

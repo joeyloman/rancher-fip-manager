@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"flag"
+	"net/http"
 	"os"
 	"time"
 
@@ -48,12 +49,13 @@ import (
 )
 
 var (
-	kubeContext        string
-	appNamespace       string
-	leaderElect        bool
-	leaseLockName      string
-	leaseLockNamespace string
-	scheme             = runtime.NewScheme()
+	kubeContext            string
+	appNamespace           string
+	leaderElect            bool
+	leaseLockName          string
+	leaseLockNamespace     string
+	healthProbeBindAddress string
+	scheme                 = runtime.NewScheme()
 )
 
 func init() {
@@ -72,6 +74,7 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election for controller.")
 	flag.StringVar(&leaseLockName, "lease-lock-name", "rancher-fip-cluster-manager-lock", "The name of the leader election lock.")
 	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "rancher-fip-manager", "The namespace of the leader election lock.")
+	flag.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "Address the health/readiness probe server binds to.")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -90,6 +93,15 @@ func main() {
 
 	// set up signals so we handle the first shutdown signal gracefully
 	ctx := signals.SetupSignalHandler()
+
+	// Bind the probe endpoints BEFORE leader election. controller-runtime
+	// only starts its probe server inside mgr.Start(), and mgr.Start is
+	// gated on OnStartedLeading here - a candidate that relied on it could
+	// never go Ready while the old leader held the lease, so the ReplicaSet
+	// never terminated the old pod and liveness killed the candidate every
+	// 50s (rollout deadlock). This dependency-free listener answers for the
+	// standby; controller-runtime's own binding is disabled below.
+	go serveHealthProbe(ctx, healthProbeBindAddress)
 
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
@@ -193,6 +205,10 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
+		// Disabled: /healthz and /readyz are served by serveHealthProbe
+		// (pre-election) on healthProbeBindAddress. Binding them here too
+		// would collide on the same address once leadership is acquired.
+		HealthProbeBindAddress: "0",
 	})
 	if err != nil {
 		logrus.Fatalf("unable to start manager: %s", err.Error())
@@ -223,5 +239,28 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 	logrus.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
 		logrus.Fatalf("problem running manager: %s", err.Error())
+	}
+}
+
+// serveHealthProbe binds the liveness/readiness endpoints independently of
+// leadership, so a standby candidate passes its probes and the rollout can
+// terminate the old leader (which then releases the lease).
+func serveHealthProbe(ctx context.Context, addr string) {
+	mux := http.NewServeMux()
+	handler := func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) }
+	mux.HandleFunc("/healthz", handler)
+	mux.HandleFunc("/readyz", handler)
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logrus.Errorf("health probe server shutdown failed: %s", err.Error())
+		}
+	}()
+	logrus.Infof("starting health probe server on %s", addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logrus.Errorf("health probe server failed to start on %s: %s", addr, err.Error())
 	}
 }

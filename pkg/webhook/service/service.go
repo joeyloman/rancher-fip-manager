@@ -3,11 +3,14 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	rfmv2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
@@ -22,10 +25,60 @@ import (
 )
 
 type Handler struct {
-	ctx        context.Context
-	httpServer *http.Server
-	clientset  kubernetes.Interface
-	dynamic    dynamic.Interface
+	ctx         context.Context
+	mu          sync.Mutex
+	serving     bool
+	httpServer  *http.Server
+	clientset   kubernetes.Interface
+	dynamic     dynamic.Interface
+	servingCert atomic.Pointer[tls.Certificate]
+}
+
+// SetCertificate installs TLS material served by the HTTPS listener without
+// touching the listener itself. net/http loads the certificate per
+// handshake via GetCertificate, so a renewal is an in-memory pointer swap:
+// the admission endpoint never goes down while the CSR round-trip runs
+// (REPORT.md 2.4: renewal used to Stop the server, sleep 2s and restart it).
+func (h *Handler) SetCertificate(pair *tls.Certificate) {
+	h.servingCert.Store(pair)
+}
+
+// servingMaterialReady reports whether a TLS handshake can currently
+// succeed: either renewed material was pushed in memory, or the on-disk
+// pair from the last config.Run is loadable. Drives /readyz so the
+// Service endpoint is only advertised while admission calls can actually be
+// served, instead of failing closed against a dead handshake (5.1).
+func (h *Handler) servingMaterialReady() bool {
+	if h.servingCert.Load() != nil {
+		return true
+	}
+	certPath, keyPath := certKeyPaths()
+	_, err := tls.LoadX509KeyPair(certPath, keyPath)
+
+	return err == nil
+}
+
+func certKeyPaths() (certPath string, keyPath string) {
+	homedir := os.Getenv("HOME")
+
+	return fmt.Sprintf("%s/tls.crt", homedir), fmt.Sprintf("%s/tls.key", homedir)
+}
+
+// IsServing reports whether a Run goroutine currently owns the HTTPS server.
+// Run returns (serving=false) when the listener failed to bind — e.g. missing
+// or unusable certificate files at startup — so the renewal scheduler knows
+// to restart it once the TLS material is repaired.
+func (h *Handler) IsServing() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.serving
+}
+
+func (h *Handler) setServing(serving bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.serving = serving
 }
 
 func Register(ctx context.Context) *Handler {
@@ -51,6 +104,18 @@ func Register(ctx context.Context) *Handler {
 func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admissionv1.AdmissionReview, fip *rfmv2.FloatingIP, oldFIP *rfmv2.FloatingIP, h *Handler) *admissionv1.AdmissionResponse {
 	// Determine if this is an UPDATE operation
 	isUpdate := oldFIP != nil
+
+	// An object being deleted must always be admitted. Its release path
+	// rewrites the spec (finalizer removal, bookkeeping) and must never be
+	// blocked by re-validating pool range, exclusions, availability or
+	// quota: an admin shrinking a pool below an assigned IP must not make
+	// the FloatingIP undeletable.
+	if fip.DeletionTimestamp != nil {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: true,
+		}
+	}
 
 	// 1. Check if the specified FloatingIPPool exists.
 	fipGVR := schema.GroupVersionResource{
@@ -491,30 +556,83 @@ func (h *Handler) validateFloatingIPPoolAdmission(w http.ResponseWriter, r *http
 }
 
 func (h *Handler) Run() {
-	homedir := os.Getenv("HOME")
-	keyPath := fmt.Sprintf("%s/tls.key", homedir)
-	certPath := fmt.Sprintf("%s/tls.crt", homedir)
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, req *http.Request) { w.Write([]byte("ok")) })
+	mux.HandleFunc("/readyz", h.handleReadyz)
 	mux.HandleFunc("/validate-floatingip", h.validateFloatingIPAdmission)
 	mux.HandleFunc("/validate-floatingippool", h.validateFloatingIPPoolAdmission)
 
-	h.httpServer = &http.Server{
+	srv := &http.Server{
 		Addr:           ":8443",
 		Handler:        mux,
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		MaxHeaderBytes: 1 << 20, // 1048576
-	}
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			// Material is resolved per handshake: a certificate pushed
+			// via SetCertificate takes effect on the next connection
+			// without touching the listener (renewal no longer bounces
+			// the admission endpoint), and before the first push the
+			// files written by config.Run are loaded as before.
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				if pair := h.servingCert.Load(); pair != nil {
+					return pair, nil
+				}
+				certPath, keyPath := certKeyPaths()
+				pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+				if err != nil {
+					return nil, err
+				}
 
-	if err := h.httpServer.ListenAndServeTLS(certPath, keyPath); err != nil {
+				return &pair, nil
+			},
+		},
+	}
+	h.mu.Lock()
+	h.httpServer = srv
+	h.mu.Unlock()
+
+	h.setServing(true)
+	defer h.setServing(false)
+
+	if err := srv.ListenAndServeTLS("", ""); err != nil {
 		if err != http.ErrServerClosed {
 			log.Errorf("HTTP server error: %v", err)
 		}
 	}
 }
 
+// handleReadyz reports ready only while a TLS handshake can actually
+// succeed. With failurePolicy Fail, a Ready webhook that cannot serve
+// admissions is worse than a NotReady one: the endpoint stays advertised and
+// every write is denied instead of shed.
+func (h *Handler) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	if !h.servingMaterialReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("no serving certificate"))
+
+		return
+	}
+	w.Write([]byte("ok"))
+}
+
+// shutdownTimeout bounds Stop's wait for in-flight admission requests;
+// overridable in tests.
+var shutdownTimeout = 15 * time.Second
+
 func (h *Handler) Stop() error {
-	return h.httpServer.Shutdown(h.ctx)
+	h.mu.Lock()
+	srv := h.httpServer
+	h.mu.Unlock()
+	if srv == nil {
+		return nil
+	}
+
+	// REPORT.md 2.5: Shutdown(h.ctx) alone ended only on SIGTERM, so a
+	// wedged handler could block a renewal restart indefinitely. Deriving a
+	// timeout context bounds Stop at shutdownTimeout regardless.
+	ctx, cancel := context.WithTimeout(h.ctx, shutdownTimeout)
+	defer cancel()
+
+	return srv.Shutdown(ctx)
 }

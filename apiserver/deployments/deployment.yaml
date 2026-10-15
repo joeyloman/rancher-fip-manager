@@ -140,9 +140,6 @@ spec:
           - --jwt-generate-key=true
           - --jwt-secret-name=jwt-private-key
           - --jwt-secret-namespace=rancher-fip-manager
-          - --leader-elect=true
-          - --lease-lock-name=rancher-fip-api-server-lock
-          - --lease-lock-namespace=rancher-fip-manager
           - --listen-address=:8443
           - --tls-enabled=true
           - --tls-cert-file=/etc/tls/tls.crt

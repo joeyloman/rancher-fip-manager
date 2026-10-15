@@ -75,6 +75,23 @@ func New(
 		},
 	})
 
+	// FloatingIP events must trigger a quota status rebuild: the syncHandler
+	// recomputes the status from the FloatingIP lister, but without these
+	// handlers nothing enqueues the quota when a FloatingIP is released
+	// (deleted), leaving its IP in the quota's allocated map forever — the
+	// project then stays over-counted and the webhook denies new requests
+	// despite free pool capacity.
+	fipInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.enqueueQuotaForFloatingIP,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			// Enqueue both sides so a removed/changed project label also
+			// triggers a rebuild for the project it used to belong to.
+			controller.enqueueQuotaForFloatingIP(oldObj)
+			controller.enqueueQuotaForFloatingIP(newObj)
+		},
+		DeleteFunc: controller.enqueueQuotaForFloatingIP,
+	})
+
 	return controller
 }
 
@@ -336,6 +353,39 @@ func (c *Controller) enqueueFloatingIPProjectQuota(obj interface{}) {
 		return
 	}
 	c.workqueue.Add(key)
+}
+
+// enqueueQuotaForFloatingIP enqueues the FloatingIPProjectQuota owning the
+// given FloatingIP (matched by the project-name label, which equals the
+// cluster-scoped quota's name). Tombstones from delete events are unwrapped so
+// a released FloatingIP still enqueues its project. FloatingIPs without a
+// project label or without a matching quota are ignored: the syncHandler only
+// counts labeled FloatingIPs anyway.
+func (c *Controller) enqueueQuotaForFloatingIP(obj interface{}) {
+	fip, ok := obj.(*v1beta2.FloatingIP)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			runtime.HandleError(fmt.Errorf("error decoding floatingip object, invalid type"))
+			return
+		}
+		fip, ok = tombstone.Obj.(*v1beta2.FloatingIP)
+		if !ok {
+			runtime.HandleError(fmt.Errorf("error decoding floatingip tombstone object, invalid type"))
+			return
+		}
+	}
+
+	projectName, ok := fip.Labels[projectNameLabel]
+	if !ok || projectName == "" {
+		return
+	}
+
+	if _, err := c.floatingIPProjectQuotaLister.Get(projectName); err != nil {
+		return
+	}
+
+	c.workqueue.Add(projectName)
 }
 
 // containsString checks if a string is in a slice of strings.

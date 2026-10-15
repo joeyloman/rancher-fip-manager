@@ -63,8 +63,14 @@ func (s *Server) Start(ctx context.Context) {
 
 func (s *Server) createHandler() *http.ServeMux {
 	mux := http.NewServeMux()
+	// /healthz kept on the HTTP service for in-cluster smoke checks; the
+	// deployment's liveness/readiness probes target the dependency-free
+	// pre-election listener instead (cmd/manager/main.go,
+	// serveHealthProbe on :8081) so the rollout is not gated on leadership.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("/ipam", s.handleIPAM)
 	mux.Handle("/metrics", promhttp.HandlerFor(s.createRegistry(), promhttp.HandlerOpts{}))
+
 	return mux
 }
 

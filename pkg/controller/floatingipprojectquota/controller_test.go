@@ -231,3 +231,90 @@ func TestFloatingIPProjectQuotaController_addsFinalizer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, updatedQuota.Finalizers, "rancher.k8s.binbash.org/floatingipprojectquota-cleanup")
 }
+
+// Regression: releasing (deleting) a FloatingIP must enqueue the owning
+// project's quota so its status drops the released IP. Without the FloatingIP
+// event handlers the quota kept the deleted IP in its allocated map forever,
+// leaving the project over-counted and the webhook denying new requests
+// despite free pool capacity.
+func TestFloatingIPProjectQuotaController_fipDeleteEnqueuesQuota(t *testing.T) {
+	quota := &v1beta2.FloatingIPProjectQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-project",
+		},
+	}
+	fip := &v1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-fip",
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				"rancher.k8s.binbash.org/project-name": "test-project",
+			},
+		},
+		Spec: v1beta2.FloatingIPSpec{
+			FloatingIPPool: "test-pool",
+		},
+		Status: v1beta2.FloatingIPStatus{
+			IPAddr: "192.168.1.10",
+		},
+	}
+
+	clientset := fake.NewSimpleClientset(quota, fip)
+	kubeClient := k8sfake.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
+
+	projectInformer := informerFactory.Rancher().V1beta2().FloatingIPProjectQuotas()
+	fipInformer := informerFactory.Rancher().V1beta2().FloatingIPs()
+	fipPoolInformer := informerFactory.Rancher().V1beta2().FloatingIPPools()
+
+	projectInformer.Informer().GetIndexer().Add(quota)
+
+	controller := New(clientset, kubeClient, projectInformer, fipInformer, fipPoolInformer)
+
+	// Simulate the delete event as the informer delivers it: the object may
+	// arrive wrapped in a DeletedFinalStateUnknown tombstone.
+	controller.enqueueQuotaForFloatingIP(cache.DeletedFinalStateUnknown{Key: "test-ns/test-fip", Obj: fip})
+
+	// Assert queue membership before Get(): Get() blocks on an empty queue,
+	// so a regression must fail here instead of hanging the suite.
+	require.Equal(t, 1, controller.workqueue.Len(), "FIP delete event must enqueue the owning project's quota")
+	queued, _ := controller.workqueue.Get()
+	assert.Equal(t, "test-project", queued)
+	controller.workqueue.Done(queued)
+
+	// End-to-end status contract, present-then-absent: with the FloatingIP
+	// still in the lister the rebuild must count it, and after it is deleted
+	// the rebuild must drop it again.
+	fipInformer.Informer().GetIndexer().Add(fip)
+	fipPoolInformer.Informer().GetIndexer().Add(&v1beta2.FloatingIPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool"},
+		Spec: v1beta2.FloatingIPPoolSpec{
+			IPConfig: &v1beta2.IPConfig{Family: "IPv4"},
+		},
+	})
+	require.NoError(t, controller.syncHandler(context.Background(), "test-project"))
+	updatedQuota, err := clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), "test-project", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, updatedQuota.Status.FloatingIPs, "test-pool", "allocated FIP must be counted before release")
+	assert.Equal(t, map[string]string{"192.168.1.10": "Unassigned"}, updatedQuota.Status.FloatingIPs["test-pool"].Allocated)
+	assert.Equal(t, 1, updatedQuota.Status.FloatingIPs["test-pool"].Used)
+
+	fipInformer.Informer().GetIndexer().Delete(fip)
+	require.NoError(t, controller.syncHandler(context.Background(), "test-project"))
+	updatedQuota, err = clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), "test-project", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, updatedQuota.Status.FloatingIPs, "test-pool", "released FIP must be dropped from the quota status")
+
+	// A FloatingIP without a project label must not enqueue anything.
+	unlabeled := fip.DeepCopy()
+	unlabeled.Labels = nil
+	controller.enqueueQuotaForFloatingIP(unlabeled)
+	controller.enqueueQuotaForFloatingIP(nil)
+	assert.Equal(t, 0, controller.workqueue.Len(), "unlabeled or invalid objects must not enqueue a quota")
+
+	// A labeled FloatingIP without a matching quota must not enqueue anything.
+	orphan := fip.DeepCopy()
+	orphan.Labels = map[string]string{"rancher.k8s.binbash.org/project-name": "no-such-quota"}
+	controller.enqueueQuotaForFloatingIP(orphan)
+	assert.Equal(t, 0, controller.workqueue.Len(), "FloatingIP without a matching quota must not enqueue")
+}

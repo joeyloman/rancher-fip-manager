@@ -58,6 +58,7 @@ spec:
             - --lease-lock-name={{ include "rancher-fip-cluster-manager.fullname" . }}-lock
             - --lease-lock-namespace={{ .Release.Namespace | default "kube-system" }}
             - --app-namespace={{ .Release.Namespace | default "kube-system" }}
+            - --health-probe-bind-address=:8081
           {{- with .Values.clustermanager.env }}
           env:
             {{- toYaml . | nindent 12 }}
@@ -67,3 +68,27 @@ spec:
             {{- toYaml .Values.clustermanager.resources | nindent 12 }}
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
+          ports:
+            - name: healthz
+              containerPort: 8081
+              protocol: TCP
+          # /healthz and /readyz are served by a dependency-free listener
+          # bound before leader election (cmd/cluster-manager/main.go,
+          # serveHealthProbe): controller-runtime binds its own probe server
+          # only inside mgr.Start, which is gated on OnStartedLeading here -
+          # probing that instead deadlocked rollouts, and a wedged manager
+          # process was invisible to Kubernetes.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5

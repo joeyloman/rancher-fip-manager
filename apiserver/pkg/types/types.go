@@ -8,6 +8,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -15,6 +16,10 @@ import (
 type App struct {
 	// FipRestClient is a Kubernetes client for FloatingIP custom resources.
 	FipRestClient client.Client
+	// FipWatchClient is a raw REST client used to watch FloatingIP resources
+	// (client.Client does not support watch); it has its own rate limiter so
+	// watch traffic never queues behind List/Create/Update calls.
+	FipWatchClient *rest.RESTClient
 	// Clientset is a standard Kubernetes clientset.
 	Clientset *kubernetes.Clientset
 	// DynamicClient is a dynamic Kubernetes client.

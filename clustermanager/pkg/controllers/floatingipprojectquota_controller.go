@@ -22,8 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
@@ -45,9 +43,6 @@ const (
 	// FloatingIPProjectQuota (and the Rancher project deletion that cascaded
 	// to it) can never be wedged by an unreachable cluster.
 	floatingIPProjectQuotaDeletionGraceWindow = 10 * time.Minute
-	// downstreamOperationTimeout bounds every single downstream API call made
-	// by the deletion cleanup and the orphan sweep.
-	downstreamOperationTimeout = 30 * time.Second
 )
 
 // FloatingIPProjectQuotaReconciler reconciles a FloatingIPProjectQuota object.
@@ -292,7 +287,7 @@ func (r *FloatingIPProjectQuotaReconciler) getDownstreamClient(ctx context.Conte
 		return nil, fmt.Errorf("kubeconfig secret %s does not contain 'value' key", kubeconfigSecret.Name)
 	}
 
-	downstreamConfig, err := clientcmd.RESTConfigFromKubeConfig(downstreamKubeconfig)
+	downstreamConfig, err := newDownstreamRESTConfig(downstreamKubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create REST config from kubeconfig: %w", err)
 	}

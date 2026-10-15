@@ -38,7 +38,7 @@ sequenceDiagram
 - **Authentication**: JWT (RS256) issued by the API server
 - **Authorization**: Project-scoped `rancher-fip-config-<project>` Secrets
 - **Kubernetes-native**: Interacts with `FloatingIP` CRDs and Rancher `Project`s
-- **Leader election**: High availability via LeaseLock
+- **Stateless replicas**: every replica serves; no leader election (safe to scale out)
 - **Rate limiting**: Configurable RPS and burst
 - **TLS support**: Optional HTTPS with provided TLS Secret
 
@@ -160,9 +160,9 @@ Defaults are defined in `cmd/api-server/main.go` and surfaced in the manifest.
 | ---- | ----------- | ------- |
 | `--kubeconfig` | Path to kubeconfig file | env `KUBECONFIG` or in-cluster |
 | `--kubecontext` | Kubeconfig context to use | env `KUBECONTEXT` |
-| `--leader-elect` | Enable leader election | `true` |
-| `--lease-lock-name` | Leader election lock name | `rancher-fip-api-server-lock` |
-| `--lease-lock-namespace` | Leader election lock namespace | `rancher-fip-manager` |
+| `--kube-api-qps` | Kubernetes client QPS limit | `50` |
+| `--kube-api-burst` | Kubernetes client burst limit | `100` |
+| `--max-body-size` | Max request body size in bytes | `1048576` (1 MiB) |
 | `--jwt-generate-key` | Generate JWT key if missing | `true` |
 | `--jwt-secret-name` | Secret name for JWT private key | `jwt-private-key` |
 | `--jwt-secret-namespace` | Namespace for JWT secret | `rancher-fip-manager` |

@@ -55,3 +55,30 @@ func TestParseAppEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestParseAppEnvCertRenewalPeriod pins REPORT.md 2.4: CERTRENEWALPERIOD is
+// minutes with a sane range. Previously only 0 and parse errors fell back
+// to the default, so an oversized value (e.g. 1000000 ≈ 694 days on a
+// ~1-year cert) drove the renewal tick to its 1-minute floor and bounced
+// the admission endpoint every minute.
+func TestParseAppEnvCertRenewalPeriod(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want int64
+	}{
+		{"unset uses the 30 day default", "", certRenewalPeriodDefault},
+		{"zero uses the default", "0", certRenewalPeriodDefault},
+		{"garbage uses the default", "not-a-number", certRenewalPeriodDefault},
+		{"sub-minute clamps to the minimum", "30", certRenewalPeriodMin},
+		{"negative clamps to the minimum", "-5", certRenewalPeriodMin},
+		{"oversized clamps to the maximum", "100000000", certRenewalPeriodMax},
+		{"valid value passes through", "43200", 43200},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CERTRENEWALPERIOD", c.env)
+			assert.Equal(t, c.want, parseAppEnv().certRenewalPeriod)
+		})
+	}
+}

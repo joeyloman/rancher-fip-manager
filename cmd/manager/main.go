@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path"
 	"runtime"
@@ -29,12 +30,13 @@ import (
 )
 
 var (
-	kubeconfig         string
-	kubeContext        string
-	leaderElect        bool
-	leaseLockName      string
-	leaseLockNamespace string
-	httpServicePort    string
+	kubeconfig             string
+	kubeContext            string
+	leaderElect            bool
+	leaseLockName          string
+	leaseLockNamespace     string
+	httpServicePort        string
+	healthProbeBindAddress string
 )
 
 func main() {
@@ -44,6 +46,7 @@ func main() {
 	flag.StringVar(&leaseLockName, "lease-lock-name", "rancher-fip-manager-lock", "The name of the leader election lock.")
 	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "rancher-fip-manager", "The namespace of the leader election lock.")
 	flag.StringVar(&httpServicePort, "http-service-port", "8080", "The port to listen on for HTTP requests.")
+	flag.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "Address of the leader-election-independent /healthz probe server.")
 	flag.Parse()
 
 	logrus.SetReportCaller(true)
@@ -60,6 +63,16 @@ func main() {
 
 	// set up signals so we handle the first shutdown signal gracefully
 	ctx := signals.SetupSignalHandler()
+
+	// The probe server must bind BEFORE leader election: the chart probes
+	// made a candidate that only served /healthz after acquiring the lease
+	// unable to go Ready while the old leader still held it - the
+	// ReplicaSet never terminated the old pod and liveness killed the
+	// candidate every 50s (rollout deadlock). This listener has no
+	// dependencies (no listers, no API calls), so it can safely answer for
+	// the standby. The /healthz on the HTTP service port stays for
+	// in-cluster smoke checks.
+	go serveHealthProbe(ctx, healthProbeBindAddress)
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -118,6 +131,31 @@ func main() {
 			},
 		},
 	})
+}
+
+// serveHealthProbe binds the liveness/readiness endpoints independently of
+// leadership, so a standby candidate passes its probes and the rollout can
+// terminate the old leader (which then releases the lease). It never
+// returns an error to the caller: a bind failure is logged fatally by the
+// caller's supervisor via process health, matching the HTTP service.
+func serveHealthProbe(ctx context.Context, addr string) {
+	mux := http.NewServeMux()
+	handler := func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) }
+	mux.HandleFunc("/healthz", handler)
+	mux.HandleFunc("/readyz", handler)
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logrus.Errorf("health probe server shutdown failed: %s", err.Error())
+		}
+	}()
+	logrus.Infof("starting health probe server on %s", addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logrus.Errorf("health probe server failed to start on %s: %s", addr, err.Error())
+	}
 }
 
 func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clientset.Interface) {

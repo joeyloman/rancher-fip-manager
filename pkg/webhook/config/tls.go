@@ -8,16 +8,48 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
 	certsv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
+
+// CSR signing wait tunables; overridable in tests.
+var (
+	// csrSigningTimeout bounds how long createAndSignCSR waits for the CSR
+	// signer to populate Status.Certificate after approval.
+	csrSigningTimeout = 30 * time.Second
+	// csrPollInterval is the poll period while waiting for the CSR to sign.
+	csrPollInterval = 500 * time.Millisecond
+	// csrExpirationSeconds requests a bounded one-year lifetime on the CSR
+	// (REPORT.md 2.4: lifetime was entirely the signer's decision). The
+	// signer may clamp the request, and the parsed NotAfter of the material
+	// it actually returns remains the source of truth (certNotAfter).
+	csrExpirationSeconds int32 = 365 * 24 * 60 * 60
+)
+
+// errCertUnusable marks certificate material that is present but cannot be
+// served (empty, undecodable, unparseable, or missing from disk). Renewal
+// treats it as must-renew; the scheduler treats it as "retry soon".
+// Transient API errors NEVER carry this sentinel.
+var errCertUnusable = errors.New("unusable webhook certificate")
+
+func certFilePath() string {
+	return fmt.Sprintf("%s/tls.crt", os.Getenv("HOME"))
+}
+
+func keyFilePath() string {
+	return fmt.Sprintf("%s/tls.key", os.Getenv("HOME"))
+}
 
 func (h *Handler) generateTLSKeyAndCert() (tlsPair tls.Certificate, err error) {
 	var DNSnames []string
@@ -57,6 +89,11 @@ func (h *Handler) generateTLSKeyAndCert() (tlsPair tls.Certificate, err error) {
 	if err != nil {
 		return
 	}
+	// Status.Certificate is PEM material (same form the serving files carry);
+	// reject material we could never serve instead of writing it to the secret.
+	if _, err := certNotAfter(cert); err != nil {
+		return tlsPair, fmt.Errorf("certificate returned by the signer for %s is unusable: %s", h.csrName, err.Error())
+	}
 
 	tlsPair.Certificate = append(tlsPair.Certificate, cert)
 	tlsPair.PrivateKey = key
@@ -64,9 +101,16 @@ func (h *Handler) generateTLSKeyAndCert() (tlsPair tls.Certificate, err error) {
 	return
 }
 
-func (h *Handler) checkCSR() bool {
+func (h *Handler) checkCSR() (bool, error) {
 	_, err := h.getCSR()
-	return err == nil
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("error checking certificate signing request: %s", err.Error())
+	}
+
+	return true, nil
 }
 
 func (h *Handler) getCSR() (*certsv1.CertificateSigningRequest, error) {
@@ -88,6 +132,7 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 		certsv1.UsageKeyEncipherment,
 		certsv1.UsageServerAuth,
 	}
+	newCsrObj.Spec.ExpirationSeconds = &csrExpirationSeconds
 	csrObj, err := h.clientset.CertificatesV1().CertificateSigningRequests().Create(context.TODO(), &newCsrObj, metav1.CreateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error while creating signing request: %s", err.Error())
@@ -110,28 +155,57 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 		return nil, fmt.Errorf("error while approving signing request: %s", err.Error())
 	}
 
-	time.Sleep(2 * time.Second)
+	// The signer populates Status.Certificate asynchronously; a fixed sleep
+	// raced it and handed back an empty certificate, which previously bricked
+	// the webhook. Poll until the certificate shows up and fail instead.
+	var cert []byte
+	err = wait.PollUntilContextTimeout(context.TODO(), csrPollInterval, csrSigningTimeout, true,
+		func(ctx context.Context) (bool, error) {
+			updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(ctx, h.csrName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, err
+				}
 
-	updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), h.csrName, metav1.GetOptions{})
+				return false, nil
+			}
+
+			for _, condition := range updatedCsr.Status.Conditions {
+				if condition.Type == certsv1.CertificateDenied {
+					return false, fmt.Errorf("signing request was denied: %s", condition.Message)
+				}
+			}
+
+			if len(updatedCsr.Status.Certificate) > 0 {
+				cert = updatedCsr.Status.Certificate
+
+				return true, nil
+			}
+
+			return false, nil
+		})
 	if err != nil {
-		return nil, fmt.Errorf("error while getting the updated signing request: %s", err.Error())
+		return nil, fmt.Errorf("error waiting for signing request %s to be signed: %s", h.csrName, err.Error())
 	}
 
-	return updatedCsr.Status.Certificate, nil
+	return cert, nil
 }
 
 func (h *Handler) getTLSDataFromSecret() (tlsPair tls.Certificate, err error) {
-	s := h.getSecret()
+	s, err := h.getSecret()
+	if err != nil {
+		return tlsPair, fmt.Errorf("cannot fetch webhook TLS secret: %s", err.Error())
+	}
 
 	cert, exists := s.Data["tls.crt"]
-	if !exists {
-		return tlsPair, fmt.Errorf("tls.crt not found in secret")
+	if !exists || len(cert) == 0 {
+		return tlsPair, fmt.Errorf("%w: tls.crt not found in secret or empty", errCertUnusable)
 	}
 	tlsPair.Certificate = append(tlsPair.Certificate, cert)
 
 	key, exists := s.Data["tls.key"]
-	if !exists {
-		return tlsPair, fmt.Errorf("tls.key not found in secret")
+	if !exists || len(key) == 0 {
+		return tlsPair, fmt.Errorf("%w: tls.key not found in secret or empty", errCertUnusable)
 	}
 	tlsPair.PrivateKey = key
 
@@ -139,76 +213,166 @@ func (h *Handler) getTLSDataFromSecret() (tlsPair tls.Certificate, err error) {
 }
 
 func (h *Handler) writeTLSDataFromSecret() (err error) {
-	homedir := os.Getenv("HOME")
-	keyPath := fmt.Sprintf("%s/tls.key", homedir)
-	certPath := fmt.Sprintf("%s/tls.crt", homedir)
-
 	tlsPair, err := h.getTLSDataFromSecret()
 	if err != nil {
-		return fmt.Errorf("cannot while fetching TLS data: %s", err.Error())
+		return fmt.Errorf("error while fetching TLS data: %s", err.Error())
 	}
 
-	if err = os.WriteFile(keyPath, []byte(fmt.Sprintf("%s", tlsPair.PrivateKey)), 0600); err != nil {
+	keyPEM, ok := tlsPair.PrivateKey.([]byte)
+	if !ok || len(keyPEM) == 0 {
+		return fmt.Errorf("%w: tls.key is not PEM material", errCertUnusable)
+	}
+
+	// Atomic replaces: the HTTPS server can load this pair per handshake
+	// (file fallback), so a torn intermediate state must never be readable.
+	if err := atomicReplace(keyFilePath(), keyPEM, 0600); err != nil {
 		return fmt.Errorf("error while writing private key file: %s", err.Error())
 	}
 
-	if err = os.WriteFile(certPath, tlsPair.Certificate[0], 0644); err != nil {
+	if err := atomicReplace(certFilePath(), tlsPair.Certificate[0], 0644); err != nil {
 		return fmt.Errorf("error while writing certificate file: %s", err.Error())
 	}
 
 	return
 }
 
+// atomicReplace writes data to a temp file in the target's directory and
+// renames it over the target, so concurrent readers see either the old or
+// the new file, never a partial one.
+func atomicReplace(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp.Name(), path)
+}
+
+// ServingCertificate returns the current TLS material from the webhook
+// secret. The scheduler pushes it into the HTTPS server after a renewal so
+// the new certificate is served immediately without a listener restart
+// (in-place rotation); errors are the caller's to log and retry.
+func (h *Handler) ServingCertificate() (*tls.Certificate, error) {
+	pair, err := h.getTLSDataFromSecret()
+	if err != nil {
+		return nil, err
+	}
+
+	keyPEM, ok := pair.PrivateKey.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("%w: tls.key is not PEM material", errCertUnusable)
+	}
+
+	// X509KeyPair (not the raw secret bytes) yields a servable
+	// tls.Certificate: crypto/tls requires a parsed private key, and this
+	// also rejects a secret whose key does not match its certificate
+	// before the HTTPS server would fail every handshake serving it.
+	serving, err := tls.X509KeyPair(pair.Certificate[0], keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot build serving key pair: %s", errCertUnusable, err.Error())
+	}
+
+	return &serving, nil
+}
+
 func (h *Handler) renewTLSPair() (err error) {
-	if h.checkCSR() {
+	csrExists, err := h.checkCSR()
+	if err != nil {
+		return
+	}
+	if csrExists {
 		if err = h.deleteCSR(); err != nil {
 			return
 		}
 	}
 
+	// Generate the replacement material first: the existing secret is never
+	// touched until a fully signed certificate is in hand, so a slow or
+	// failing signer can no longer destroy the only valid TLS material.
 	tlsPair, err := h.generateTLSKeyAndCert()
 	if err != nil {
 		return
 	}
 
-	if err = h.deleteSecret(); err != nil {
-		return
-	}
-
-	return h.createSecret(tlsPair)
+	return h.updateSecret(tlsPair)
 }
 
-func (h *Handler) GetCertExpireDate() (expireDate time.Time, err error) {
-	tlsPair, err := h.getTLSDataFromSecret()
-	if err != nil {
-		return time.Time{}, fmt.Errorf("cannot while fetching TLS data: %s", err.Error())
+// certNotAfter parses PEM certificate material and returns its expiry.
+// Material that is present but cannot be understood is reported with the
+// errCertUnusable sentinel so callers can distinguish it from API errors.
+func certNotAfter(pemCert []byte) (time.Time, error) {
+	if len(pemCert) == 0 {
+		return time.Time{}, fmt.Errorf("%w: certificate is empty", errCertUnusable)
 	}
-
-	if len(tlsPair.Certificate[0]) == 0 {
-		return time.Time{}, fmt.Errorf("certificate is empty")
-	}
-	b, _ := pem.Decode(tlsPair.Certificate[0])
+	b, _ := pem.Decode(pemCert)
 	if b == nil {
-		return time.Time{}, fmt.Errorf("cannot decode TLS PEM data: %s", err.Error())
+		return time.Time{}, fmt.Errorf("%w: cannot decode TLS PEM data", errCertUnusable)
 	}
-
 	cert, err := x509.ParseCertificate(b.Bytes)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("cannot parse TLS PEM data: %s", err.Error())
+		return time.Time{}, fmt.Errorf("%w: cannot parse TLS PEM data: %s", errCertUnusable, err.Error())
 	}
 
-	return cert.NotAfter, err
+	return cert.NotAfter, nil
 }
 
-func (h *Handler) checkCertExpireDate(certRenewalPeriod int64) bool {
-	expireDate, err := h.GetCertExpireDate()
+// GetCertExpireDate reports the expiry of the certificate the HTTPS server
+// actually serves, i.e. the on-disk material. A missing or broken file is
+// reported with the errCertUnusable sentinel; the scheduler retries the
+// renewal pipeline instead of panicking.
+func (h *Handler) GetCertExpireDate() (expireDate time.Time, err error) {
+	certPath := certFilePath()
+
+	pemCert, err := os.ReadFile(certPath)
 	if err != nil {
-		log.Errorf("%s", err.Error())
+		return time.Time{}, fmt.Errorf("%w: cannot read certificate file %s: %s", errCertUnusable, certPath, err.Error())
+	}
+
+	return certNotAfter(pemCert)
+}
+
+// checkCertExpireDate reports whether the certificate stored in the webhook
+// secret must be renewed. Unusable material (empty, undecodable or
+// unparseable — e.g. left behind by a slow CSR signer) counts as must-renew,
+// so it is repaired automatically instead of wedging the renewal scheduler.
+// Transient API errors count as "not now" and are retried on a later tick.
+func (h *Handler) checkCertExpireDate(certRenewalPeriod int64) bool {
+	tlsPair, err := h.getTLSDataFromSecret()
+	if err != nil {
+		if errors.Is(err, errCertUnusable) {
+			log.Errorf("webhook TLS material is unusable, forcing renewal: %s", err.Error())
+
+			return true
+		}
+		log.Errorf("cannot read webhook TLS secret, skipping renewal this cycle: %s", err.Error())
 
 		return false
 	}
 
+	expireDate, err := certNotAfter(tlsPair.Certificate[0])
+	if err != nil {
+		log.Errorf("webhook TLS material is unusable, forcing renewal: %s", err.Error())
+
+		return true
+	}
+
 	currentDate := time.Now().UTC()
 	difference := expireDate.Sub(currentDate)
+
 	return int64(difference.Minutes()) < certRenewalPeriod
 }

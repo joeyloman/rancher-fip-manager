@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/joeyloman/rancher-fip-manager/pkg/webhook/admission"
 	"github.com/joeyloman/rancher-fip-manager/pkg/webhook/config"
@@ -19,6 +18,16 @@ import (
 var progname string = "rancher-fip-manager-webhook"
 
 var certRenewalPeriod int64
+
+// Sane bounds for CERTRENEWALPERIOD, in minutes (REPORT.md 2.4: the value
+// was only checked against 0, so any positive int64 was accepted; raising
+// it past the cert lifetime collapsed the renewal tick to a per-minute
+// bounce of the admission endpoint).
+const (
+	certRenewalPeriodDefault int64 = 30 * 24 * 60 // 30 days
+	certRenewalPeriodMin     int64 = 60           // 1 hour
+	certRenewalPeriodMax     int64 = 90 * 24 * 60 // 90 days
+)
 
 type appConfig struct {
 	logLevel          string
@@ -39,7 +48,15 @@ func parseAppEnv() *appConfig {
 	certRenewal, err := strconv.ParseInt(os.Getenv("CERTRENEWALPERIOD"), 10, 64)
 	if err != nil || certRenewal == 0 {
 		// default the cert renewal expire interval to 30 days
-		certRenewal = 30 * 24 * 60
+		certRenewal = certRenewalPeriodDefault
+	}
+	if certRenewal < certRenewalPeriodMin {
+		log.Warnf("CERTRENEWALPERIOD %d is below the sane minimum of %d minute(s); using the minimum", certRenewal, certRenewalPeriodMin)
+		certRenewal = certRenewalPeriodMin
+	}
+	if certRenewal > certRenewalPeriodMax {
+		log.Warnf("CERTRENEWALPERIOD %d exceeds the sane maximum of %d minute(s); using the maximum", certRenewal, certRenewalPeriodMax)
+		certRenewal = certRenewalPeriodMax
 	}
 	cfg.certRenewalPeriod = certRenewal
 
@@ -104,11 +121,19 @@ func main() {
 	)
 
 	configHandler.Init()
-	configHandler.Run(certRenewalPeriod)
+	if _, err := configHandler.Run(certRenewalPeriod); err != nil {
+		log.Errorf("webhook TLS setup incomplete, renewal scheduler will retry: %s", err.Error())
+	} else if pair, err := configHandler.ServingCertificate(); err != nil {
+		log.Errorf("webhook TLS material unreadable after setup, HTTPS server will fall back to the disk pair until renewal retries: %s", err.Error())
+	} else {
+		// Serve the secret material straight from memory: the first
+		// renewal later on is then a pointer swap with zero listener
+		// downtime (REPORT.md 2.4).
+		serviceHandler.SetCertificate(pair)
+	}
 	admissionHandler.Init()
 	scheduler.StartCertRenewalScheduler(configHandler, serviceHandler, certRenewalPeriod)
 	go serviceHandler.Run()
-	go Run()
 
 	log.Infof("%s is running", progname)
 
@@ -116,12 +141,9 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Infof("%s received shutdown signal, gracefully shutting down...", progname)
+	if err := serviceHandler.Stop(); err != nil {
+		log.Errorf("admission endpoint shutdown did not complete cleanly: %s", err.Error())
+	}
 	cancel()
 	os.Exit(0)
-}
-
-func Run() {
-	for {
-		time.Sleep(time.Second)
-	}
 }

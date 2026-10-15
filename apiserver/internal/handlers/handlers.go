@@ -4,6 +4,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,9 +16,12 @@ import (
 	"github.com/joeyloman/rancher-fip-api-server/pkg/types"
 	fipv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
 	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -63,6 +67,85 @@ func serviceAlreadyExists(labels map[string]string, serviceName, serviceNamespac
 		}
 	}
 	return false
+}
+
+var (
+	// allocationWaitTimeout bounds how long FIPRequestHandler waits for the
+	// manager controller to populate Status.IPAddr. A variable so tests can
+	// shorten it.
+	allocationWaitTimeout = 30 * time.Second
+
+	// cleanupTimeout bounds post-watch cleanup deletes. The request context is
+	// already expired/cancelled at that point, so cleanup runs on a fresh
+	// bounded background context rather than an unbounded context.Background().
+	cleanupTimeout = 10 * time.Second
+
+	// fipUpdateBackoff bounds conflict retries for FloatingIP
+	// read-modify-write updates; worst case ~1s, far below the request deadline.
+	fipUpdateBackoff = wait.Backoff{
+		Steps:    8,
+		Duration: 10 * time.Millisecond,
+		Factor:   1.5,
+		Jitter:   0.1,
+		Cap:      500 * time.Millisecond,
+	}
+)
+
+// updateFloatingIP applies mutate to a freshly fetched copy of desired and
+// retries on resourceVersion conflicts. Without the re-fetch, a concurrent
+// writer (the manager controller or another request claiming the same FIP)
+// would silently lose the labels this request just wrote, and a stale
+// resourceVersion would surface as an opaque 500.
+// On success desired reflects the persisted object.
+func updateFloatingIP(ctx context.Context, cl client.Client, desired *fipv1beta2.FloatingIP, mutate func(*fipv1beta2.FloatingIP)) error {
+	return retry.RetryOnConflict(fipUpdateBackoff, func() error {
+		fresh := &fipv1beta2.FloatingIP{}
+		if err := cl.Get(ctx, client.ObjectKey{Namespace: desired.Namespace, Name: desired.Name}, fresh); err != nil {
+			return err
+		}
+		mutate(fresh)
+		if err := cl.Update(ctx, fresh); err != nil {
+			return err
+		}
+		*desired = *fresh
+		return nil
+	})
+}
+
+// applyFIPRequestLabels writes the project, cluster, service and group labels
+// for a FIP request onto the object. It is idempotent: safe to call repeatedly
+// on freshly fetched objects during conflict retry. It returns false when the
+// service was already registered on the FIP.
+func applyFIPRequestLabels(fip *fipv1beta2.FloatingIP, project, cluster, serviceName, serviceNamespace, group string) bool {
+	if fip.Labels == nil {
+		fip.Labels = make(map[string]string)
+	}
+	fip.Labels["rancher.k8s.binbash.org/project-name"] = project
+	fip.Labels["rancher.k8s.binbash.org/cluster-name"] = cluster
+
+	added := true
+	if !serviceAlreadyExists(fip.Labels, serviceName, serviceNamespace) {
+		serviceID := getNextServiceID(fip.Labels)
+		fip.Labels["rancher.k8s.binbash.org/service-"+serviceID+"-name"] = serviceName
+		fip.Labels["rancher.k8s.binbash.org/service-"+serviceID+"-namespace"] = serviceNamespace
+	} else {
+		added = false
+	}
+
+	if group != "" {
+		fip.Labels["rancher.k8s.binbash.org/floatingip-group"] = group
+	}
+	return added
+}
+
+// writeUpdateError maps a FloatingIP update failure to a client-appropriate
+// status: exhausted conflict retries are retryable (409), everything else 500.
+func writeUpdateError(w http.ResponseWriter, err error) {
+	if k8serrors.IsConflict(err) {
+		errors.WriteJSONError(w, http.StatusConflict, "conflict updating floating IP, retry the request")
+		return
+	}
+	errors.WriteJSONError(w, http.StatusInternalServerError, "failed to update floating IP")
 }
 
 // TokenHandler handles requests for authentication tokens.
@@ -151,6 +234,11 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 			return
 		}
 
+		// createdNew records whether this request created the FloatingIP
+		// resource (versus reusing a pre-existing one). Only resources created
+		// by this request may be cleaned up when the allocation watch fails.
+		createdNew := false
+
 		var floatingIP *fipv1beta2.FloatingIP
 		if fipRequest.IPAddress != "" {
 			// IP address is given in the request
@@ -200,30 +288,14 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 
 				// It exists but is not assigned, so we can use it.
 				floatingIP = existingFIP
-				if floatingIP.Labels == nil {
-					floatingIP.Labels = make(map[string]string)
-				}
-				floatingIP.Labels["rancher.k8s.binbash.org/project-name"] = project.Name
-				floatingIP.Labels["rancher.k8s.binbash.org/cluster-name"] = fipRequest.Cluster
-
-				// Check if the service already exists in the labels to avoid duplicates
-				if !serviceAlreadyExists(floatingIP.Labels, fipRequest.ServiceName, fipRequest.ServiceNamespace) {
-					// Determine the service ID to use
-					serviceID := getNextServiceID(floatingIP.Labels)
-					floatingIP.Labels["rancher.k8s.binbash.org/service-"+serviceID+"-name"] = fipRequest.ServiceName
-					floatingIP.Labels["rancher.k8s.binbash.org/service-"+serviceID+"-namespace"] = fipRequest.ServiceNamespace
-				} else {
-					app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
-						fipRequest.ServiceNamespace, fipRequest.ServiceName, floatingIP.Namespace, floatingIP.Name)
-				}
-
-				if fipRequest.FloatingIPGroup != "" {
-					floatingIP.Labels["rancher.k8s.binbash.org/floatingip-group"] = fipRequest.FloatingIPGroup
-				}
-
-				if err := app.FipRestClient.Update(r.Context(), floatingIP); err != nil {
+				if err := updateFloatingIP(r.Context(), app.FipRestClient, floatingIP, func(f *fipv1beta2.FloatingIP) {
+					if !applyFIPRequestLabels(f, project.Name, fipRequest.Cluster, fipRequest.ServiceName, fipRequest.ServiceNamespace, fipRequest.FloatingIPGroup) {
+						app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
+							fipRequest.ServiceNamespace, fipRequest.ServiceName, floatingIP.Namespace, floatingIP.Name)
+					}
+				}); err != nil {
 					app.Log.Errorf("failed to update floatingip: %s", err.Error())
-					errors.WriteJSONError(w, http.StatusInternalServerError, "failed to update floating IP")
+					writeUpdateError(w, err)
 					return
 				}
 				app.Log.Infof("Updated existing FloatingIP %s/%s with new service labels", floatingIP.Namespace, floatingIP.Name)
@@ -257,6 +329,7 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 					errors.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 					return
 				}
+				createdNew = true
 				app.Log.Infof("Created FloatingIP %s/%s", floatingIP.Namespace, floatingIP.Name)
 			}
 		} else {
@@ -295,30 +368,14 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 			if existingFIP != nil {
 				// There is an existing FloatingIP in the project but it's not assigned, so we can use it.
 				floatingIP = existingFIP
-				if floatingIP.Labels == nil {
-					floatingIP.Labels = make(map[string]string)
-				}
-				floatingIP.Labels["rancher.k8s.binbash.org/project-name"] = project.Name
-				floatingIP.Labels["rancher.k8s.binbash.org/cluster-name"] = fipRequest.Cluster
-
-				// Check if the service already exists in the labels to avoid duplicates
-				if !serviceAlreadyExists(floatingIP.Labels, fipRequest.ServiceName, fipRequest.ServiceNamespace) {
-					// Determine the service ID to use
-					serviceID := getNextServiceID(floatingIP.Labels)
-					floatingIP.Labels["rancher.k8s.binbash.org/service-"+serviceID+"-name"] = fipRequest.ServiceName
-					floatingIP.Labels["rancher.k8s.binbash.org/service-"+serviceID+"-namespace"] = fipRequest.ServiceNamespace
-				} else {
-					app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
-						fipRequest.ServiceNamespace, fipRequest.ServiceName, floatingIP.Namespace, floatingIP.Name)
-				}
-
-				if fipRequest.FloatingIPGroup != "" {
-					floatingIP.Labels["rancher.k8s.binbash.org/floatingip-group"] = fipRequest.FloatingIPGroup
-				}
-
-				if err := app.FipRestClient.Update(r.Context(), floatingIP); err != nil {
+				if err := updateFloatingIP(r.Context(), app.FipRestClient, floatingIP, func(f *fipv1beta2.FloatingIP) {
+					if !applyFIPRequestLabels(f, project.Name, fipRequest.Cluster, fipRequest.ServiceName, fipRequest.ServiceNamespace, fipRequest.FloatingIPGroup) {
+						app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
+							fipRequest.ServiceNamespace, fipRequest.ServiceName, floatingIP.Namespace, floatingIP.Name)
+					}
+				}); err != nil {
 					app.Log.Errorf("failed to update floatingip: %s", err.Error())
-					errors.WriteJSONError(w, http.StatusInternalServerError, "failed to update floating IP")
+					writeUpdateError(w, err)
 					return
 				}
 				app.Log.Infof("Updated existing FloatingIP %s/%s with new service labels", floatingIP.Namespace, floatingIP.Name)
@@ -349,32 +406,45 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 					errors.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 					return
 				}
+				createdNew = true
 				app.Log.Infof("Created FloatingIP %s/%s", floatingIP.Namespace, floatingIP.Name)
 			}
 		}
 
 		// Watch for the IP address to be allocated
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), allocationWaitTimeout)
 		defer cancel()
 
-		finalFip, err := kubebuilder.WatchFloatingIP(ctx, app.FipRestClient, floatingIP)
+		finalFip, err := kubebuilder.WatchFloatingIP(ctx, app.FipWatchClient, floatingIP)
 		if err != nil {
 			app.Log.Errorf("error watching floating ip: %s", err.Error())
 
-			// Clean up the FloatingIP resource on timeout
-			if ctx.Err() == context.DeadlineExceeded {
-				err := app.FipRestClient.Delete(context.Background(), floatingIP)
-				if err != nil {
-					app.Log.Errorf("failed to delete floatingip after timeout: %s", err.Error())
+			switch {
+			case stderrors.Is(err, context.DeadlineExceeded), stderrors.Is(err, context.Canceled):
+				// Clean up only a FloatingIP this request created; a reused
+				// pre-existing FIP belongs to the project and must survive a
+				// controller backlog that pushes allocation past the deadline.
+				if createdNew {
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cleanupTimeout)
+					defer cleanupCancel()
+					if delErr := app.FipRestClient.Delete(cleanupCtx, floatingIP); delErr != nil {
+						app.Log.Errorf("failed to delete floatingip after watch ended: %s", delErr.Error())
+					} else {
+						app.Log.Infof("Deleted FloatingIP %s/%s after failed allocation", floatingIP.Namespace, floatingIP.Name)
+					}
 				} else {
-					app.Log.Infof("Deleted FloatingIP %s/%s after timeout", floatingIP.Namespace, floatingIP.Name)
+					app.Log.Infof("Keeping pre-existing FloatingIP %s/%s after failed allocation", floatingIP.Namespace, floatingIP.Name)
+				}
+				if stderrors.Is(err, context.Canceled) {
+					// Client disconnected; nothing to report to.
+					return
 				}
 				errors.WriteJSONError(w, http.StatusGatewayTimeout, "timeout waiting for IP allocation")
 				return
+			default:
+				errors.WriteJSONError(w, http.StatusInternalServerError, "failed to get ip address")
+				return
 			}
-
-			errors.WriteJSONError(w, http.StatusInternalServerError, "failed to get ip address")
-			return
 		}
 
 		// Get the subnet from the floating IP pool
@@ -528,63 +598,65 @@ func FIPReleaseHandler(app *types.App) http.HandlerFunc {
 			return
 		}
 
-		// Find and delete the service labels that match the requested service name and namespace
-		// Look for all service-<id>-name labels and find the one matching the request
-		for labelKey, labelValue := range fipToUpdate.Labels {
-			if strings.HasPrefix(labelKey, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(labelKey, "-name") {
-				// Extract the service ID from the label key (e.g., "service-0-name" -> "0")
-				serviceID := strings.TrimPrefix(strings.TrimSuffix(labelKey, "-name"), "rancher.k8s.binbash.org/service-")
-				namespaceKey := "rancher.k8s.binbash.org/service-" + serviceID + "-namespace"
+		// Find and delete the service labels that match the requested service
+		// name and namespace, then drop the group/cluster labels that nothing
+		// references anymore. The mutation is re-applied to a freshly fetched
+		// copy on every conflict-retry attempt so concurrent writers cannot
+		// make this update silently lose their changes.
+		releaseMutate := func(fip *fipv1beta2.FloatingIP) {
+			for labelKey, labelValue := range fip.Labels {
+				if strings.HasPrefix(labelKey, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(labelKey, "-name") {
+					// Extract the service ID from the label key (e.g., "service-0-name" -> "0")
+					serviceID := strings.TrimPrefix(strings.TrimSuffix(labelKey, "-name"), "rancher.k8s.binbash.org/service-")
+					namespaceKey := "rancher.k8s.binbash.org/service-" + serviceID + "-namespace"
 
-				// Check if the namespace label exists and matches the requested service namespace
-				if namespaceValue, ok := fipToUpdate.Labels[namespaceKey]; ok {
-					if namespaceValue == fipReleaseRequest.ServiceNamespace && labelValue == fipReleaseRequest.ServiceName {
-						// Found the matching service labels, delete them
-						delete(fipToUpdate.Labels, labelKey)
-						delete(fipToUpdate.Labels, namespaceKey)
-						app.Log.Infof("Deleted service labels %s and %s for service %s/%s",
-							labelKey, namespaceKey, fipReleaseRequest.ServiceNamespace, fipReleaseRequest.ServiceName)
-						break
+					// Check if the namespace label exists and matches the requested service namespace
+					if namespaceValue, ok := fip.Labels[namespaceKey]; ok {
+						if namespaceValue == fipReleaseRequest.ServiceNamespace && labelValue == fipReleaseRequest.ServiceName {
+							// Found the matching service labels, delete them
+							delete(fip.Labels, labelKey)
+							delete(fip.Labels, namespaceKey)
+							app.Log.Infof("Deleted service labels %s and %s for service %s/%s",
+								labelKey, namespaceKey, fipReleaseRequest.ServiceNamespace, fipReleaseRequest.ServiceName)
+							break
+						}
 					}
 				}
 			}
-		}
 
-		// Check if this is the last service before removing the floatingip-group label
-		if fipToUpdate.Labels["rancher.k8s.binbash.org/floatingip-group"] != "" {
-			// Count remaining service labels
-			remainingServices := 0
-			for labelKey := range fipToUpdate.Labels {
-				if strings.HasPrefix(labelKey, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(labelKey, "-name") {
-					remainingServices++
+			// Check if this is the last service before removing the floatingip-group label
+			if fip.Labels["rancher.k8s.binbash.org/floatingip-group"] != "" {
+				// Count remaining service labels
+				remainingServices := 0
+				for labelKey := range fip.Labels {
+					if strings.HasPrefix(labelKey, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(labelKey, "-name") {
+						remainingServices++
+					}
+				}
+				// Only delete the floatingip-group label if no services remain
+				if remainingServices == 0 {
+					delete(fip.Labels, "rancher.k8s.binbash.org/floatingip-group")
 				}
 			}
-			// Only delete the floatingip-group label if no services remain
-			if remainingServices == 0 {
-				delete(fipToUpdate.Labels, "rancher.k8s.binbash.org/floatingip-group")
+
+			// If no service labels remain, drop the cluster-name label; the
+			// status assigned and conditions are updated by the
+			// rancher-fip-manager controller.
+			hasServiceLabels := false
+			for labelKey := range fip.Labels {
+				if strings.HasPrefix(labelKey, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(labelKey, "-name") {
+					hasServiceLabels = true
+					break
+				}
+			}
+			if !hasServiceLabels {
+				delete(fip.Labels, "rancher.k8s.binbash.org/cluster-name")
 			}
 		}
 
-		// Check if there are still service-<id>-name and service-<id>-namespace labels remaining
-		// If so, skip the cluster-name label deletion
-		hasServiceLabels := false
-		for labelKey := range fipToUpdate.Labels {
-			if strings.HasPrefix(labelKey, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(labelKey, "-name") {
-				hasServiceLabels = true
-				break
-			}
-		}
-
-		if !hasServiceLabels {
-			delete(fipToUpdate.Labels, "rancher.k8s.binbash.org/cluster-name")
-		}
-
-		// the status assigned and conditions will be updated by the rancher-fip-manager controller
-
-		err = app.FipRestClient.Update(r.Context(), &fipToUpdate)
-		if err != nil {
+		if err := updateFloatingIP(r.Context(), app.FipRestClient, &fipToUpdate, releaseMutate); err != nil {
 			app.Log.Errorf("failed to update floatingip: %s", err.Error())
-			errors.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+			writeUpdateError(w, err)
 			return
 		}
 

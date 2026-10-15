@@ -2,6 +2,7 @@ package ipam
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -409,5 +410,356 @@ func TestIpam(t *testing.T) {
 				t.Errorf("got %q, wanted %q", got, releaseIPv6s[i].want)
 			}
 		}
+	}
+}
+
+// TestIpamConcurrency exercises concurrent allocations/releases against
+// concurrent read-only access (Used/Available/Usage/GetUsage). Run with
+// -race: before locking these readers, this reliably trips
+// "concurrent map read and map write".
+func TestIpamConcurrency(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("race/subnet", "192.168.100.0/24", "192.168.100.10", "192.168.100.110"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	const workers = 8
+	const allocsPerWorker = 50
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for range workers {
+		go func() {
+			defer wg.Done()
+
+			var allocated []string
+			for range allocsPerWorker {
+				ip, err := ti.GetIP("race/subnet", "")
+				if err == nil {
+					allocated = append(allocated, ip)
+				}
+
+				// Read-only paths racing with allocations.
+				_ = ti.Used("race/subnet")
+				_ = ti.Available("race/subnet")
+				_ = ti.GetUsage()
+				ti.Usage("race/subnet")
+
+				if err != nil && ti.Used("missing/subnet") != 0 {
+					t.Errorf("Used on missing subnet should be 0")
+				}
+			}
+
+			for _, ip := range allocated {
+				if err := ti.ReleaseIP("race/subnet", ip); err != nil {
+					t.Errorf("ReleaseIP(%s): %v", ip, err)
+				}
+			}
+		}()
+	}
+
+	// Concurrent RefreshSubnet on another subnet exercises the writer path
+	// against the readers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for range 10 {
+			if err := ti.RefreshSubnet("race/subnet2", "192.168.101.0/24", "192.168.101.10", "192.168.101.110", nil, nil); err != nil {
+				t.Errorf("RefreshSubnet: %v", err)
+			}
+			_ = ti.Used("race/subnet2")
+			_ = ti.GetUsage()
+		}
+	}()
+
+	wg.Wait()
+
+	if used := ti.Used("race/subnet"); used != 0 {
+		t.Errorf("all IPs should be released, used=%d", used)
+	}
+	if got, err := ti.GetIP("race/subnet", "192.168.100.99"); err != nil || got != "192.168.100.99" {
+		t.Errorf("GetIP after release: got (%q, %v), wanted %q", got, err, "192.168.100.99")
+	}
+}
+
+// TestIpamOwnedConcurrency races the owners map: concurrent GetIPOwned /
+// ReleaseIPOwned with per-worker owners plus read-only paths and a concurrent
+// RefreshSubnet rebuild. Run under -race this turns the locking of the
+// owner-tracking state from an inspected invariant into a checked one.
+func TestIpamOwnedConcurrency(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("race/owned", "192.168.102.0/24", "192.168.102.10", "192.168.102.210"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	const workers = 8
+	const allocsPerWorker = 50
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for i := range workers {
+		owner := fmt.Sprintf("ns/fip-%d", i)
+		go func() {
+			defer wg.Done()
+
+			var allocated []string
+			for range allocsPerWorker {
+				ip, err := ti.GetIPOwned("race/owned", "", owner)
+				if err == nil {
+					allocated = append(allocated, ip)
+				}
+
+				// Read-only paths racing with owned allocations.
+				_ = ti.Used("race/owned")
+				_ = ti.Available("race/owned")
+				_ = ti.GetUsage()
+				ti.Usage("race/owned")
+			}
+
+			for _, ip := range allocated {
+				if err := ti.ReleaseIPOwned("race/owned", ip, owner); err != nil {
+					t.Errorf("ReleaseIPOwned(%s, %s): %v", owner, ip, err)
+				}
+			}
+		}()
+	}
+
+	// Concurrent RefreshSubnet on another subnet races the owners-map rebuild
+	// against owned claims and readers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for range 10 {
+			if err := ti.RefreshSubnet("race/owned2", "192.168.103.0/24", "192.168.103.10", "192.168.103.110", nil, nil); err != nil {
+				t.Errorf("RefreshSubnet: %v", err)
+			}
+			_ = ti.Used("race/owned2")
+		}
+	}()
+
+	wg.Wait()
+
+	if used := ti.Used("race/owned"); used != 0 {
+		t.Errorf("all owned IPs should be released, used=%d", used)
+	}
+}
+
+func TestIpamOwnedClaims(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("owned/subnet", "192.168.50.0/24", "192.168.50.10", "192.168.50.20"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	// Owner-aware claim of a specific IP.
+	ip, err := ti.GetIPOwned("owned/subnet", "192.168.50.10", "ns/fip-a")
+	if err != nil || ip != "192.168.50.10" {
+		t.Fatalf("GetIPOwned: got (%q, %v), wanted (192.168.50.10, nil)", ip, err)
+	}
+
+	// Re-claim by the same owner is an idempotent no-op success.
+	ip, err = ti.GetIPOwned("owned/subnet", "192.168.50.10", "ns/fip-a")
+	if err != nil || ip != "192.168.50.10" {
+		t.Errorf("idempotent re-claim: got (%q, %v), wanted (192.168.50.10, nil)", ip, err)
+	}
+
+	// A different owner must not steal the IP.
+	if _, err := ti.GetIPOwned("owned/subnet", "192.168.50.10", "ns/fip-b"); err == nil {
+		t.Errorf("cross-owner re-claim: expected error, got nil")
+	}
+
+	// An unowned claim (GetIP) must not be re-claimable by any owner.
+	if _, err := ti.GetIP("owned/subnet", "192.168.50.11"); err != nil {
+		t.Fatalf("GetIP: %v", err)
+	}
+	if _, err := ti.GetIPOwned("owned/subnet", "192.168.50.11", "ns/fip-a"); err == nil {
+		t.Errorf("re-claim of unowned claim: expected error, got nil")
+	}
+
+	// Auto-allocation records the owner too.
+	ip, err = ti.GetIPOwned("owned/subnet", "", "ns/fip-c")
+	if err != nil || ip != "192.168.50.12" {
+		t.Fatalf("auto GetIPOwned: got (%q, %v), wanted (192.168.50.12, nil)", ip, err)
+	}
+
+	// Release clears the owner; the IP becomes claimable by anyone.
+	if err := ti.ReleaseIP("owned/subnet", "192.168.50.10"); err != nil {
+		t.Fatalf("ReleaseIP: %v", err)
+	}
+	if _, err := ti.GetIPOwned("owned/subnet", "192.168.50.10", "ns/fip-b"); err != nil {
+		t.Errorf("claim after release: unexpected error %v", err)
+	}
+
+	// Empty owner is rejected.
+	if _, err := ti.GetIPOwned("owned/subnet", "192.168.50.13", ""); err == nil {
+		t.Errorf("empty owner: expected error, got nil")
+	}
+
+	// ReleaseIPOwned refuses unowned claims (e.g. RefreshSubnet-restored
+	// allocations that may back another FIP's persisted status), while plain
+	// ReleaseIP still releases them (the main delete path keeps working).
+	if _, err := ti.GetIP("owned/subnet", "192.168.50.14"); err != nil {
+		t.Fatalf("GetIP: %v", err)
+	}
+	if err := ti.ReleaseIPOwned("owned/subnet", "192.168.50.14", "ns/fip-a"); err == nil {
+		t.Errorf("ReleaseIPOwned on unowned claim: expected error, got nil")
+	}
+	if used := ti.Used("owned/subnet"); used != 4 {
+		t.Errorf("unowned claim must survive the owned release attempt: used=%d, wanted 4", used)
+	}
+	if err := ti.ReleaseIP("owned/subnet", "192.168.50.14"); err != nil {
+		t.Errorf("plain ReleaseIP on unowned claim: unexpected error %v", err)
+	}
+	if used := ti.Used("owned/subnet"); used != 3 {
+		t.Errorf("plain ReleaseIP must release the unowned claim: used=%d, wanted 3", used)
+	}
+}
+
+func TestRefreshSubnetPreservesOwnedClaims(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("refresh/owned", "192.168.60.0/24", "192.168.60.10", "192.168.60.20"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	// Claim granted but not yet visible in the pool-status-derived
+	// allocations list (informer lag, the live duplicate-IP scenario).
+	ip, err := ti.GetIPOwned("refresh/owned", "", "ns/fip-a")
+	if err != nil {
+		t.Fatalf("GetIPOwned: %v", err)
+	}
+
+	// A refresh built from a stale allocation list (empty here) must not
+	// drop the in-flight owned claim.
+	if err := ti.RefreshSubnet("refresh/owned", "192.168.60.0/24", "192.168.60.10", "192.168.60.20", nil, nil); err != nil {
+		t.Fatalf("RefreshSubnet: %v", err)
+	}
+
+	// A second owner must not get the granted address...
+	if _, err := ti.GetIPOwned("refresh/owned", ip, "ns/fip-b"); err == nil {
+		t.Errorf("duplicate allocation after refresh: fip-b got %s already owned by fip-a", ip)
+	}
+
+	// ...while the owning FIP can still idempotently re-claim its own.
+	if got, err := ti.GetIPOwned("refresh/owned", ip, "ns/fip-a"); err != nil || got != ip {
+		t.Errorf("owner re-claim after refresh: got (%q, %v), wanted (%s, nil)", got, err, ip)
+	}
+
+	// Auto-allocation must also skip the carried-over claim.
+	if ip2, err := ti.GetIPOwned("refresh/owned", "", "ns/fip-c"); err != nil || ip2 == ip {
+		t.Errorf("auto-allocation after refresh: got (%q, %v), must differ from %s", ip2, err, ip)
+	}
+
+	// A claim that falls outside the range after shrinking is dropped
+	// instead of failing the whole refresh.
+	if _, err := ti.GetIPOwned("refresh/owned", "192.168.60.15", "ns/fip-d"); err != nil {
+		t.Fatalf("GetIPOwned fip-d: %v", err)
+	}
+	if err := ti.RefreshSubnet("refresh/owned", "192.168.60.0/24", "192.168.60.10", "192.168.60.10", nil, nil); err != nil {
+		t.Fatalf("RefreshSubnet shrink: %v", err)
+	}
+	if err := ti.ReleaseIPOwned("refresh/owned", "192.168.60.15", "ns/fip-d"); err == nil {
+		t.Errorf("claim outside shrunk range should have been dropped, got successful release")
+	}
+	if used := ti.Used("refresh/owned"); used != 1 {
+		t.Errorf("used=%d after shrink, wanted 1 (only the in-range carried claim)", used)
+	}
+}
+
+// TestRefreshSubnetDropsOutOfRangeAllocations pins the shrink-below-owned
+// wedge: a status-reported allocation outside the new range must NOT abort
+// the swap (aborting kept the stale range alive while the spec said
+// otherwise and error-looped the pool controller forever). The new range
+// must be applied, in-range allocations preserved, and the dropped address
+// must never be handed out again.
+func TestRefreshSubnetDropsOutOfRangeAllocations(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("refresh/oor", "192.168.61.0/24", "192.168.61.10", "192.168.61.20"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	// .16 is owned in IPAM and also appears in the stale FIP-status-derived
+	// allocations list; .11 is a normal persisted allocation.
+	if _, err := ti.GetIPOwned("refresh/oor", "192.168.61.16", "ns/fip-a"); err != nil {
+		t.Fatalf("GetIPOwned: %v", err)
+	}
+	if err := ti.RefreshSubnet("refresh/oor", "192.168.61.0/24", "192.168.61.10", "192.168.61.12",
+		nil, []string{"192.168.61.11", "192.168.61.16"}); err != nil {
+		t.Fatalf("RefreshSubnet with out-of-range allocations: %v", err)
+	}
+
+	usage, ok := ti.GetUsage()["refresh/oor"]
+	if !ok {
+		t.Fatalf("subnet missing from usage")
+	}
+	if usage.Start != "192.168.61.10" || usage.End != "192.168.61.12" || usage.Total != 3 {
+		t.Errorf("new range not applied after shrink: start=%s end=%s total=%d", usage.Start, usage.End, usage.Total)
+	}
+	if usage.Used != 1 || len(usage.UsedIPs) != 1 || usage.UsedIPs[0] != "192.168.61.11" {
+		t.Errorf("used=%d ips=%v, wanted exactly the in-range allocation 192.168.61.11", usage.Used, usage.UsedIPs)
+	}
+
+	// The dropped address is gone from the pool map: nobody can be handed
+	// it again, not even by explicit request.
+	if _, err := ti.GetIPOwned("refresh/oor", "192.168.61.16", "ns/fip-b"); err == nil {
+		t.Errorf("out-of-range address was re-granted after the shrink")
+	}
+}
+
+// TestReleaseAllByOwner pins the claim sweep for deletion: every claim
+// tagged with the owner goes, foreign and unowned claims stay.
+func TestReleaseAllByOwner(t *testing.T) {
+	ti := New()
+	if err := ti.NewSubnet("sweep/sub", "192.168.62.0/24", "192.168.62.10", "192.168.62.20"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	abandoned1, err := ti.GetIPOwned("sweep/sub", "", "ns/fip-a")
+	if err != nil {
+		t.Fatalf("GetIPOwned abandoned1: %v", err)
+	}
+	abandoned2, err := ti.GetIPOwned("sweep/sub", "", "ns/fip-a")
+	if err != nil {
+		t.Fatalf("GetIPOwned abandoned2: %v", err)
+	}
+	if _, err := ti.GetIPOwned("sweep/sub", "", "ns/fip-b"); err != nil {
+		t.Fatalf("GetIPOwned foreign: %v", err)
+	}
+	unowned, err := ti.GetIP("sweep/sub", "")
+	if err != nil {
+		t.Fatalf("GetIP unowned: %v", err)
+	}
+
+	if freed := ti.ReleaseAllByOwner("sweep/sub", "ns/fip-a"); freed != 2 {
+		t.Errorf("freed=%d, wanted 2 (both abandoned claims)", freed)
+	}
+	if used := ti.Used("sweep/sub"); used != 2 {
+		t.Errorf("used=%d after sweep, wanted 2 (foreign + unowned)", used)
+	}
+	if freed := ti.ReleaseAllByOwner("sweep/sub", "ns/fip-a"); freed != 0 {
+		t.Errorf("second sweep freed=%d, wanted 0 (idempotent)", freed)
+	}
+	if freed := ti.ReleaseAllByOwner("sweep/sub", ""); freed != 0 {
+		t.Errorf("empty owner freed=%d, wanted 0 (never sweep unowned)", freed)
+	}
+	if freed := ti.ReleaseAllByOwner("sweep/missing", "ns/fip-b"); freed != 0 {
+		t.Errorf("missing subnet freed=%d, wanted 0", freed)
+	}
+
+	// Unowned claims are never reachable through an owner-based release.
+	if err := ti.ReleaseIPOwned("sweep/sub", unowned, "ns/fip-a"); err == nil {
+		t.Errorf("unowned claim must refuse owner-based release")
+	}
+
+	// The abandoned addresses are grantable again, and come back in pool
+	// order (lowest freed address first).
+	got, err := ti.GetIPOwned("sweep/sub", "", "ns/fip-c")
+	if err != nil || got != abandoned1 {
+		t.Errorf("re-allocation after sweep: got (%q,%v), wanted %s", got, err, abandoned1)
+	}
+	if got == abandoned2 {
+		t.Errorf("re-allocation returned %q out of pool order", got)
 	}
 }

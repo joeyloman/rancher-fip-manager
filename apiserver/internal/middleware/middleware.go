@@ -8,6 +8,7 @@ import (
 
 	"bytes"
 	"encoding/json"
+	stderrors "errors"
 	"io"
 
 	"golang.org/x/time/rate"
@@ -69,6 +70,11 @@ func AuthorizeMiddleware(app *types.App) func(http.Handler) http.Handler {
 			app.Log.Info("AuthorizeMiddleware called")
 			bodyBytes, err := io.ReadAll(r.Body)
 			if err != nil {
+				var maxBytesErr *http.MaxBytesError
+				if stderrors.As(err, &maxBytesErr) {
+					errors.WriteJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+					return
+				}
 				errors.WriteJSONError(w, http.StatusInternalServerError, "Failed to read request body")
 				return
 			}
@@ -90,6 +96,22 @@ func AuthorizeMiddleware(app *types.App) func(http.Handler) http.Handler {
 				return
 			}
 
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// BodyLimitMiddleware caps the size of a request body so that a chunked or
+// lying client cannot stream unbounded data into memory (json.Decode and
+// io.ReadAll in the handlers read through this wrapper).
+func BodyLimitMiddleware(maxBytes int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ContentLength > maxBytes {
+				errors.WriteJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 			next.ServeHTTP(w, r)
 		})
 	}

@@ -7,9 +7,25 @@ import (
 	"github.com/joeyloman/rancher-fip-manager/pkg/webhook/util"
 	log "github.com/sirupsen/logrus"
 	admregv1 "k8s.io/api/admissionregistration/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+// Explicit admission control knobs (REPORT.md 2.5/5.1): failurePolicy and
+// timeoutSeconds were never set, so the API defaults (Fail / 10s) applied
+// invisibly. Pin the intent in the object: Fail is deliberate — an
+// unreachable webhook must not wave through FloatingIP/Pool writes that
+// would double-allocate — and the 10s timeout is the bound the webhook's
+// own request path (including its quota-sleep) must fit inside.
+const (
+	admissionTimeoutSeconds int32 = 10
+)
+
+func setAdmissionPolicy(webhook *admregv1.ValidatingWebhook) {
+	webhook.FailurePolicy = new(admregv1.Fail)
+	webhook.TimeoutSeconds = new(admissionTimeoutSeconds)
+}
 
 type Handler struct {
 	ctx                         context.Context
@@ -47,12 +63,6 @@ func (h *Handler) Init() {
 	if err := h.AddValidatingWebhookConfiguration(); err != nil {
 		log.Panicf("%s", err.Error())
 	}
-}
-
-func (h *Handler) checkValidatingWebhookConfiguration() bool {
-	_, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), h.validatingWebhookConfigName, metav1.GetOptions{})
-
-	return err == nil
 }
 
 func (h *Handler) getRancherFloatingIPWebhook() (webhook admregv1.ValidatingWebhook, err error) {
@@ -96,6 +106,7 @@ func (h *Handler) getRancherFloatingIPWebhook() (webhook admregv1.ValidatingWebh
 	webhook.ClientConfig = clientconfig
 
 	webhook.AdmissionReviewVersions = []string{"v1"}
+	setAdmissionPolicy(&webhook)
 
 	return
 }
@@ -141,15 +152,26 @@ func (h *Handler) getRancherFloatingIPPoolWebhook() (webhook admregv1.Validating
 	webhook.ClientConfig = clientconfig
 
 	webhook.AdmissionReviewVersions = []string{"v1"}
+	setAdmissionPolicy(&webhook)
 
 	return
 }
 
 func (h *Handler) AddValidatingWebhookConfiguration() (err error) {
-	if h.checkValidatingWebhookConfiguration() {
-		return
+	existing, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), h.validatingWebhookConfigName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return h.createValidatingWebhookConfiguration()
+	}
+	if err != nil {
+		return fmt.Errorf("error checking validating webhook configuration: %s", err.Error())
 	}
 
+	// A configuration created by an older release predates the explicit
+	// policy fields; reconcile them so upgrades are not silent no-ops.
+	return h.syncAdmissionPolicy(existing)
+}
+
+func (h *Handler) createValidatingWebhookConfiguration() (err error) {
 	vwc := admregv1.ValidatingWebhookConfiguration{}
 	vwc.ObjectMeta.Name = h.validatingWebhookConfigName
 
@@ -168,4 +190,35 @@ func (h *Handler) AddValidatingWebhookConfiguration() (err error) {
 	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(context.TODO(), &vwc, metav1.CreateOptions{})
 
 	return
+}
+
+// syncAdmissionPolicy pins failurePolicy/TimeoutSeconds on a pre-existing
+// ValidatingWebhookConfiguration. Only those two fields are reconciled;
+// rules and the caBundle remain operator-owned (caBundle rotation is
+// REPORT.md 2.8, deliberately out of scope here).
+func (h *Handler) syncAdmissionPolicy(existing *admregv1.ValidatingWebhookConfiguration) error {
+	changed := false
+
+	for i := range existing.Webhooks {
+		webhook := &existing.Webhooks[i]
+		if webhook.FailurePolicy == nil || *webhook.FailurePolicy != admregv1.Fail {
+			webhook.FailurePolicy = new(admregv1.Fail)
+			changed = true
+		}
+		if webhook.TimeoutSeconds == nil || *webhook.TimeoutSeconds != admissionTimeoutSeconds {
+			webhook.TimeoutSeconds = new(admissionTimeoutSeconds)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	if _, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.TODO(), existing, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("error pinning validating webhook configuration policy: %s", err.Error())
+	}
+	log.Infof("pinned failurePolicy=Fail timeoutSeconds=%d on validating webhook configuration %s", admissionTimeoutSeconds, h.validatingWebhookConfigName)
+
+	return nil
 }

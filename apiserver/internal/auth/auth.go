@@ -11,6 +11,7 @@ import (
 	"github.com/joeyloman/rancher-fip-api-server/pkg/types"
 	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -135,7 +136,7 @@ func ValidateClientRequest(ctx context.Context, app *types.App, projectRequest s
 }
 
 // GetPrivateKey fetches and parses a PEM-encoded RSA private key from a Kubernetes Secret.
-func GetPrivateKey(ctx context.Context, clientset *kubernetes.Clientset, namespace, secretName, dataKey string) (*rsa.PrivateKey, error) {
+func GetPrivateKey(ctx context.Context, clientset kubernetes.Interface, namespace, secretName, dataKey string) (*rsa.PrivateKey, error) {
 	secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
@@ -164,7 +165,7 @@ func GeneratePrivateKey() (*rsa.PrivateKey, error) {
 }
 
 // SavePrivateKey saves an RSA private key to a Kubernetes Secret.
-func SavePrivateKey(ctx context.Context, clientset *kubernetes.Clientset, namespace, secretName string, privateKey *rsa.PrivateKey) error {
+func SavePrivateKey(ctx context.Context, clientset kubernetes.Interface, namespace, secretName string, privateKey *rsa.PrivateKey) error {
 	privateKeyBytes := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
@@ -187,4 +188,36 @@ func SavePrivateKey(ctx context.Context, clientset *kubernetes.Clientset, namesp
 	}
 
 	return nil
+}
+
+// EnsurePrivateKey returns the RSA private key stored in the given Secret.
+// When the Secret is missing and generate is true it creates it with a fresh
+// key. Every apiserver replica serves unconditionally (no leader election),
+// so two replicas can race on first boot: the loser of the Create race
+// adopts the winner's key — diverging keys would silently invalidate tokens
+// issued by the other replica.
+func EnsurePrivateKey(ctx context.Context, clientset kubernetes.Interface, namespace, secretName string, generate bool) (*rsa.PrivateKey, error) {
+	privateKey, err := GetPrivateKey(ctx, clientset, namespace, secretName, "key")
+	if err == nil {
+		return privateKey, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	if !generate {
+		return nil, fmt.Errorf("private key not found in secret %s/%s and key generation is disabled", namespace, secretName)
+	}
+
+	privateKey, err = GeneratePrivateKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := SavePrivateKey(ctx, clientset, namespace, secretName, privateKey); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, err
+		}
+		// Lost the create race to a concurrent replica: adopt its key.
+		return GetPrivateKey(ctx, clientset, namespace, secretName, "key")
+	}
+	return privateKey, nil
 }
