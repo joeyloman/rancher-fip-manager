@@ -92,6 +92,31 @@ func TestValidateFloatingIP(t *testing.T) {
 			expectedMessage: "the specified floatingippool test-pool does not exist",
 		},
 		{
+			// Regression (stability report 1.4 class): an FIP requesting a
+			// specific IP from a pool without IPConfig used to nil-deref the
+			// pool's Spec.IPConfig and panic the admission connection.
+			name: "ip request against pool without IPConfig is denied",
+			fip: &rfmv2.FloatingIP{
+				ObjectMeta: fip.ObjectMeta,
+				Spec: rfmv2.FloatingIPSpec{
+					FloatingIPPool: "test-pool",
+					IPAddr:         &ipAddr,
+				},
+			},
+			existingPools: []runtime.Object{
+				&rfmv2.FloatingIPPool{
+					TypeMeta:   fipPool.TypeMeta,
+					ObjectMeta: fipPool.ObjectMeta,
+					Spec: rfmv2.FloatingIPPoolSpec{
+						TargetCluster: "test-cluster",
+					},
+				},
+			},
+			existingPLBCs:   []runtime.Object{plbc},
+			expectedAllowed: false,
+			expectedMessage: "the specified floatingippool test-pool has no ipConfig",
+		},
+		{
 			name: "invalid ip address",
 			fip: &rfmv2.FloatingIP{
 				ObjectMeta: fip.ObjectMeta,
@@ -512,6 +537,21 @@ func TestValidateFloatingIPPool(t *testing.T) {
 							Exclude: []string{},
 						},
 					},
+				},
+			},
+			expectedAllowed: true,
+		},
+		{
+			// Regression (stability report 1.4 class): pools without IPConfig
+			// are legal (the pool controller skips them); the validator used to
+			// nil-deref Spec.IPConfig and panic the admission connection.
+			name: "pool without IPConfig is allowed",
+			fipPool: &rfmv2.FloatingIPPool{
+				TypeMeta:   validFipPool.TypeMeta,
+				ObjectMeta: validFipPool.ObjectMeta,
+				Spec: rfmv2.FloatingIPPoolSpec{
+					TargetCluster: "test-cluster",
+					TargetNetwork: "test-network",
 				},
 			},
 			expectedAllowed: true,

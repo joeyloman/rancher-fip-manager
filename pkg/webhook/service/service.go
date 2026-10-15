@@ -116,6 +116,20 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 			}
 		}
 
+		// A FloatingIPPool without IPConfig has no subnet/range to validate
+		// against and its FloatingIPs can never be allocated (the FloatingIPPool
+		// controller skips such pools). Deny explicitly instead of dereferencing
+		// Spec.IPConfig and panicking the admission handler.
+		if fipPool.Spec.IPConfig == nil {
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("the specified floatingippool %s has no ipConfig", fip.Spec.FloatingIPPool),
+				},
+			}
+		}
+
 		// Check if the IP is within the subnet
 		_, subnet, err := net.ParseCIDR(fipPool.Spec.IPConfig.Subnet)
 		if err != nil {
@@ -314,6 +328,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 }
 
 func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview, fipPool *rfmv2.FloatingIPPool) *admissionv1.AdmissionResponse {
+	// FloatingIPPools without IPConfig are legal (the FloatingIPPool controller
+	// skips them); the subnet checks below dereferenced Spec.IPConfig
+	// unconditionally and panicked the admission handler (connection EOF under
+	// failurePolicy=Fail means the write is rejected either way).
+	if fipPool.Spec.IPConfig == nil {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: true,
+		}
+	}
 	// Check if the subnet is valid
 	_, subnet, err := net.ParseCIDR(fipPool.Spec.IPConfig.Subnet)
 	if err != nil {
