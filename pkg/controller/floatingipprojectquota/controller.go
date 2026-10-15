@@ -9,7 +9,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -31,10 +30,6 @@ const controllerAgentName = "floatingipprojectquota-controller"
 const quotaFinalizerName = "rancher.k8s.binbash.org/floatingipprojectquota-cleanup"
 
 const projectNameLabel = "rancher.k8s.binbash.org/project-name"
-
-// cascadeConditionType is surfaced on a Terminating FloatingIPProjectQuota
-// while its attached FloatingIPs are still being deleted.
-const cascadeConditionType = "FloatingIPsReleased"
 
 // Cascade requeue pacing: exponential from baseDelay, capped, so a stalled
 // FloatingIP deletion converges on a bounded poll instead of hammering at a
@@ -376,12 +371,6 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 			logrus.Infof("Deleted FloatingIP %s/%s as part of FloatingIPProjectQuota %s deletion", fip.Namespace, fip.Name, name)
 		}
 
-		// Surface that the quota is stuck Terminating until the attached
-		// FloatingIPs finish their own cleanup finalizers.
-		if err := c.setCascadeCondition(ctx, name, len(fips)); err != nil {
-			return err
-		}
-
 		// FloatingIPs are gone from the API but the informer cache may still
 		// list them; requeue until the list is empty and their finalizers ran.
 		// Passes back off exponentially (2 s doubling, capped at 30 s) so a
@@ -437,40 +426,6 @@ func cascadeRetryDelay(attempt int) time.Duration {
 		delay = cascadeRetryMaxDelay
 	}
 	return delay
-}
-
-// setCascadeCondition records why a Terminating FloatingIPProjectQuota is
-// still held by its finalizer, so `kubectl describe`/jsonpath shows the
-// cascade state instead of requiring controller log access.
-func (c *Controller) setCascadeCondition(ctx context.Context, name string, remaining int) error {
-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		currentQuota, errGet := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
-		if errors.IsNotFound(errGet) {
-			return nil
-		}
-		if errGet != nil {
-			return errGet
-		}
-		newConditions := currentQuota.Status.DeepCopy().Conditions
-		meta.SetStatusCondition(&newConditions, metav1.Condition{
-			Type:    cascadeConditionType,
-			Status:  metav1.ConditionFalse,
-			Reason:  "FloatingIPsStillAttached",
-			Message: fmt.Sprintf("%d attached FloatingIP(s) must finish deleting before the quota can be removed", remaining),
-		})
-		if reflect.DeepEqual(currentQuota.Status.Conditions, newConditions) {
-			// Unchanged; skip the write to avoid API churn on every retry.
-			return nil
-		}
-		quotaCopy := currentQuota.DeepCopy()
-		quotaCopy.Status.Conditions = newConditions
-		_, errUpdate := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().UpdateStatus(ctx, quotaCopy, metav1.UpdateOptions{})
-		return errUpdate
-	})
-	if err != nil {
-		return fmt.Errorf("failed to surface cascade condition on FloatingIPProjectQuota %s: %w", name, err)
-	}
-	return nil
 }
 
 func (c *Controller) handleFloatingIPProjectQuotaCreate(obj interface{}) {

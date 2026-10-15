@@ -7,7 +7,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -31,9 +30,8 @@ func TestCascadeRetryDelay(t *testing.T) {
 }
 
 // Regression for report 1.6: while attached FloatingIPs are still deleting,
-// the cascade must back off exponentially (no fixed 2 s hammering) and must
-// surface why the quota sits in Terminating on the status, not only in logs.
-func TestCascadeDeletionBacksOffAndSurfacesCondition(t *testing.T) {
+// the cascade must back off exponentially (no fixed 2 s hammering).
+func TestCascadeDeletionBacksOff(t *testing.T) {
 	quota := &v1beta2.FloatingIPProjectQuota{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "test-project",
@@ -78,14 +76,6 @@ func TestCascadeDeletionBacksOffAndSurfacesCondition(t *testing.T) {
 	assert.Equal(t, []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}, delays,
 		"cascade requeues must back off exponentially instead of a fixed 2 s loop")
 
-	updated, err := clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), "test-project", metav1.GetOptions{})
-	require.NoError(t, err)
-	cond := meta.FindStatusCondition(updated.Status.Conditions, cascadeConditionType)
-	require.NotNil(t, cond, "cascade progress must be surfaced as a status condition")
-	assert.Equal(t, metav1.ConditionFalse, cond.Status)
-	assert.Equal(t, "FloatingIPsStillAttached", cond.Reason)
-	assert.Contains(t, cond.Message, "1 attached FloatingIP")
-
 	// Once the cache observes the FloatingIP gone: no further requeue, the
 	// retry bookkeeping is reset, and the finalizer is released.
 	fipInformer.Informer().GetIndexer().Delete(attachedFip)
@@ -94,7 +84,7 @@ func TestCascadeDeletionBacksOffAndSurfacesCondition(t *testing.T) {
 	_, pending := controller.cascadeRetries.Load(key)
 	assert.False(t, pending, "cascade retry count must be cleared once the cascade completes")
 
-	updated, err = clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), "test-project", metav1.GetOptions{})
+	updated, err := clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(context.Background(), "test-project", metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.NotContains(t, updated.Finalizers, quotaFinalizerName)
 }

@@ -20,14 +20,12 @@ package v1beta2
 
 import (
 	rancherk8sbinbashorgv1beta2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
-	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
 )
 
 // FloatingIPProjectQuotaStatusApplyConfiguration represents a declarative configuration of the FloatingIPProjectQuotaStatus type for use
 // with apply.
 type FloatingIPProjectQuotaStatusApplyConfiguration struct {
 	FloatingIPs map[string]*rancherk8sbinbashorgv1beta2.FipInfo `json:"fips,omitempty"`
-	Conditions  []v1.ConditionApplyConfiguration                `json:"conditions,omitempty"`
 }
 
 // FloatingIPProjectQuotaStatusApplyConfiguration constructs a declarative configuration of the FloatingIPProjectQuotaStatus type for use with
@@ -46,19 +44,6 @@ func (b *FloatingIPProjectQuotaStatusApplyConfiguration) WithFloatingIPs(entries
 	}
 	for k, v := range entries {
 		b.FloatingIPs[k] = v
-	}
-	return b
-}
-
-// WithConditions adds the given value to the Conditions field in the declarative configuration
-// and returns the receiver, so that objects can be build by chaining "With" function invocations.
-// If called multiple times, values provided by each call will be appended to the Conditions field.
-func (b *FloatingIPProjectQuotaStatusApplyConfiguration) WithConditions(values ...*v1.ConditionApplyConfiguration) *FloatingIPProjectQuotaStatusApplyConfiguration {
-	for i := range values {
-		if values[i] == nil {
-			panic("nil value passed to WithConditions")
-		}
-		b.Conditions = append(b.Conditions, *values[i])
 	}
 	return b
 }
