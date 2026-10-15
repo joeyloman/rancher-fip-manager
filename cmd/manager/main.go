@@ -147,16 +147,25 @@ func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clients
 	// Start informers
 	go fipInformerFactory.Start(ctx.Done())
 
-	// Start controllers
-	go fipPoolController.Run(ctx, 1)
+	// Start controllers. Each Run releases its initial-sync gate on every
+	// exit path (see completeInitialSync in the controllers), so a failed or
+	// cancelled start can never park this function while the lease is held.
+	go startController("FloatingIPPool", func() error { return fipPoolController.Run(ctx, 1) })
 	<-fipPoolController.IsInitialSyncDone()
 
-	go floatingIPProjectQuotaController.Run(ctx, 1)
+	go startController("FloatingIPProjectQuota", func() error { return floatingIPProjectQuotaController.Run(ctx, 1) })
 	<-floatingIPProjectQuotaController.IsInitialSyncDone()
 
-	go fipController.Run(ctx, 2)
+	go startController("FloatingIP", func() error { return fipController.Run(ctx, 2) })
 	<-fipController.IsInitialSyncDone()
 
 	<-ctx.Done()
 	logrus.Info("Shutting down controller")
+}
+
+// startController runs a controller's Run function and logs why it stopped.
+func startController(name string, run func() error) {
+	if err := run(); err != nil {
+		logrus.Errorf("%s controller stopped: %s", name, err)
+	}
 }

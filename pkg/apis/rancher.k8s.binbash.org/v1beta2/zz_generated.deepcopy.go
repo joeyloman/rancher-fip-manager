@@ -354,6 +354,13 @@ func (in *FloatingIPProjectQuotaStatus) DeepCopyInto(out *FloatingIPProjectQuota
 			(*out)[key] = outVal
 		}
 	}
+	if in.Conditions != nil {
+		in, out := &in.Conditions, &out.Conditions
+		*out = make([]v1.Condition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	return
 }
 

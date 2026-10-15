@@ -75,21 +75,27 @@ func (c *Collector) collectPools(ch chan<- prometheus.Metric) {
 		return
 	}
 	for _, pool := range pools {
+		// Pools without IPConfig are legal (the pool controller skips them);
+		// dereferencing Spec.IPConfig here would panic the metrics handler.
+		subnet := ""
+		if pool.Spec.IPConfig != nil {
+			subnet = pool.Spec.IPConfig.Subnet
+		}
 		ch <- prometheus.MustNewConstMetric(c.poolCapacity, prometheus.GaugeValue, float64(pool.Status.Available+pool.Status.Used),
 			pool.Name,
-			pool.Spec.IPConfig.Subnet,
+			subnet,
 			pool.Spec.TargetCluster,
 			pool.Spec.TargetNetwork,
 		)
 		ch <- prometheus.MustNewConstMetric(c.poolAvailable, prometheus.GaugeValue, float64(pool.Status.Available),
 			pool.Name,
-			pool.Spec.IPConfig.Subnet,
+			subnet,
 			pool.Spec.TargetCluster,
 			pool.Spec.TargetNetwork,
 		)
 		ch <- prometheus.MustNewConstMetric(c.poolUsed, prometheus.GaugeValue, float64(pool.Status.Used),
 			pool.Name,
-			pool.Spec.IPConfig.Subnet,
+			subnet,
 			pool.Spec.TargetCluster,
 			pool.Spec.TargetNetwork,
 		)

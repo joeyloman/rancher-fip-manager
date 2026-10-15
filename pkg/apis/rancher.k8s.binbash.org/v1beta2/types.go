@@ -28,6 +28,13 @@ type FloatingIPProjectQuotaSpec struct {
 type FloatingIPProjectQuotaStatus struct {
 	// Fips is a map from pool name to FIP info.
 	FloatingIPs map[string]*FipInfo `json:"fips,omitempty"`
+
+	// Conditions represent the latest available observations of the quota's state,
+	// e.g. progress of the FloatingIP cascade while the quota is Terminating.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // FipInfo contains allocation details for a specific IP version.

@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -16,6 +18,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
+	"github.com/joeyloman/rancher-fip-manager/pkg/controller/controllerutil"
 	clientset "github.com/joeyloman/rancher-fip-manager/pkg/generated/clientset/versioned"
 	informers "github.com/joeyloman/rancher-fip-manager/pkg/generated/informers/externalversions/rancher.k8s.binbash.org/v1beta2"
 	listers "github.com/joeyloman/rancher-fip-manager/pkg/generated/listers/rancher.k8s.binbash.org/v1beta2"
@@ -28,6 +31,18 @@ const controllerAgentName = "floatingipprojectquota-controller"
 const quotaFinalizerName = "rancher.k8s.binbash.org/floatingipprojectquota-cleanup"
 
 const projectNameLabel = "rancher.k8s.binbash.org/project-name"
+
+// cascadeConditionType is surfaced on a Terminating FloatingIPProjectQuota
+// while its attached FloatingIPs are still being deleted.
+const cascadeConditionType = "FloatingIPsReleased"
+
+// Cascade requeue pacing: exponential from baseDelay, capped, so a stalled
+// FloatingIP deletion converges on a bounded poll instead of hammering at a
+// fixed 2 s forever.
+const (
+	cascadeRetryBaseDelay = 2 * time.Second
+	cascadeRetryMaxDelay  = 30 * time.Second
+)
 
 // Controller is the controller implementation for FloatingIPProjectQuota resources.
 // It keeps the FloatingIPProjectQuota status in sync with its attached FloatingIPs and cascades
@@ -44,6 +59,23 @@ type Controller struct {
 	fipPoolSynced                cache.InformerSynced
 	workqueue                    workqueue.RateLimitingInterface
 	initSyncDone                 chan struct{}
+	// initSyncOnce guards initSyncDone so every Run exit path releases the
+	// gate exactly once (see Run).
+	initSyncOnce sync.Once
+
+	// syncHandler is the reconcile entry point, invoked per workqueue key by
+	// the workers. It is a field (bound to syncHandlerImpl in New) so tests
+	// can inject failure/panic behaviour.
+	syncHandler func(ctx context.Context, key string) error
+
+	// cascadeRetries tracks, per quota key, how many cascade passes have
+	// already run while FloatingIPs are still attached. Deleted once the
+	// cascade completes so a future deletion starts at the base delay again.
+	cascadeRetries sync.Map
+
+	// cascadeEnqueueAfter requeues a cascade pass after a backoff delay.
+	// Bound to workqueue.AddAfter in New; a seam for tests.
+	cascadeEnqueueAfter func(key string, delay time.Duration)
 }
 
 // New creates a new Controller for managing FloatingIPProjectQuota resources.
@@ -66,6 +98,10 @@ func New(
 		workqueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "FloatingIPProjectQuotas"),
 		initSyncDone:                 make(chan struct{}),
 	}
+	controller.syncHandler = controller.syncHandlerImpl
+	controller.cascadeEnqueueAfter = func(key string, delay time.Duration) {
+		controller.workqueue.AddAfter(key, delay)
+	}
 
 	logrus.Info("Setting up event handlers for FloatingIPProjectQuota controller")
 	floatingIPProjectQuotaInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -87,36 +123,81 @@ func (c *Controller) IsInitialSyncDone() <-chan struct{} {
 // Run starts the controller, which will process items from the workqueue until the
 // context is cancelled. It will start a number of worker goroutines to process
 // items concurrently.
-func (c *Controller) Run(ctx context.Context, workers int) {
+//
+// Run returns when the context is cancelled or the controller could not
+// start. Every exit path releases IsInitialSyncDone (see completeInitialSync):
+// the previous implementation could park there forever, holding the leader
+// lease with zero workers running.
+func (c *Controller) Run(ctx context.Context, workers int) error {
 	defer runtime.HandleCrash()
 	defer c.workqueue.ShutDown()
+	// Belt and braces: if Run bails out before (or during) the initial sync,
+	// main's <-IsInitialSyncDone() must still be released. The sync.Once
+	// makes this a no-op after the normal completion below.
+	defer c.completeInitialSync()
 
 	logrus.Info("Starting FloatingIPProjectQuota controller")
 
 	logrus.Info("Waiting for informer caches to sync for FloatingIPProjectQuota controller")
 	if ok := cache.WaitForCacheSync(ctx.Done(), c.floatingIPProjectQuotaSynced, c.fipSynced, c.fipPoolSynced); !ok {
-		logrus.Fatal("failed to wait for caches to sync")
+		if ctx.Err() != nil {
+			// Shutting down before the caches synced; not a failure to report.
+			return nil
+		}
+		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
 	logrus.Info("Starting initial sync for FloatingIPProjectQuota controller")
-	queueLen := c.workqueue.Len()
-	logrus.Infof("FloatingIPProjectQuota controller initial sync: processing %d items", queueLen)
-	for i := 0; i < queueLen; i++ {
-		if !c.processNextWorkItem(ctx) {
-			logrus.Fatal("worker shutdown during initial sync")
-		}
-	}
+	c.processInitialSyncItems(ctx)
 	logrus.Info("Finished initial sync for FloatingIPProjectQuota controller")
-	close(c.initSyncDone)
+	c.completeInitialSync()
 
 	logrus.Info("Starting workers for FloatingIPProjectQuota controller")
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
 	logrus.Info("Started workers for FloatingIPProjectQuota controller")
 	<-ctx.Done()
 	logrus.Info("Shutting down workers for FloatingIPProjectQuota controller")
+	return nil
+}
+
+// processInitialSyncItems drains the items the informer's initial list put on
+// the workqueue, before dependent controllers are started by cmd/manager.
+//
+// It never blocks on the workqueue: the old fixed-count loop of
+// processNextWorkItem calls went through workqueue.Get(), which blocks for as
+// long as a failing key sits in the rate limiter's delayed queue (up to
+// ~1000 s with the default limiter) — parking the initial-sync gate, and main
+// with it, while the lease was held. The drain stops as soon as nothing is
+// immediately available; keys still waiting out a backoff are picked up by
+// the workers.
+func (c *Controller) processInitialSyncItems(ctx context.Context) {
+	queueLen := c.workqueue.Len()
+	logrus.Infof("FloatingIPProjectQuota controller initial sync: up to %d items queued", queueLen)
+	for range queueLen {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if c.workqueue.Len() == 0 {
+			// Everything left is delayed for backoff; workers will retry it.
+			return
+		}
+		if !c.processNextWorkItem(ctx) {
+			// Queue shut down; the workers are going away with it.
+			return
+		}
+	}
+}
+
+// completeInitialSync releases the initial-sync gate exactly once.
+func (c *Controller) completeInitialSync() {
+	c.initSyncOnce.Do(func() {
+		close(c.initSyncDone)
+	})
 }
 
 func (c *Controller) runWorker(ctx context.Context) {
@@ -130,9 +211,21 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		return false
 	}
 
-	err := func(obj interface{}) error {
-		defer c.workqueue.Done(obj)
+	// We wrap this block in a func so we can defer c.workqueue.Done. A panic
+	// from the syncHandler is recovered and turned into a rate-limited
+	// requeue: without it, a panicking reconcile propagates out of the
+	// worker goroutine and kills the whole manager process.
+	err := func(obj interface{}) (err error) {
 		var key string
+		defer c.workqueue.Done(obj)
+		defer func() {
+			if r := recover(); r != nil {
+				err = controllerutil.HandleSyncPanic(key, r)
+				if key != "" {
+					c.workqueue.AddRateLimited(key)
+				}
+			}
+		}()
 		var ok bool
 		if key, ok = obj.(string); !ok {
 			c.workqueue.Forget(obj)
@@ -156,7 +249,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-func (c *Controller) syncHandler(ctx context.Context, key string) error {
+func (c *Controller) syncHandlerImpl(ctx context.Context, key string) error {
 	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -283,12 +376,26 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 			logrus.Infof("Deleted FloatingIP %s/%s as part of FloatingIPProjectQuota %s deletion", fip.Namespace, fip.Name, name)
 		}
 
+		// Surface that the quota is stuck Terminating until the attached
+		// FloatingIPs finish their own cleanup finalizers.
+		if err := c.setCascadeCondition(ctx, name, len(fips)); err != nil {
+			return err
+		}
+
 		// FloatingIPs are gone from the API but the informer cache may still
 		// list them; requeue until the list is empty and their finalizers ran.
-		c.workqueue.AddAfter(key, 2*time.Second)
+		// Passes back off exponentially (2 s doubling, capped at 30 s) so a
+		// stalled FloatingIP deletion converges on a bounded retry rate
+		// instead of an unbounded fixed 2 s poll.
+		attempt := 1
+		if prev, ok := c.cascadeRetries.Load(key); ok {
+			attempt = prev.(int) + 1
+		}
+		c.cascadeRetries.Store(key, attempt)
+		c.cascadeEnqueueAfter(key, cascadeRetryDelay(attempt))
 		return nil
 	}
-
+	c.cascadeRetries.Delete(key)
 	quota, err := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return nil
@@ -314,6 +421,54 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 	})
 	if err != nil {
 		return fmt.Errorf("failed to remove finalizer from FloatingIPProjectQuota %s: %w", name, err)
+	}
+	return nil
+}
+
+// cascadeRetryDelay returns the requeue delay for the attempt-th (1-based)
+// cascade pass of a Terminating FloatingIPProjectQuota: 2 s, 4 s, 8 s, …
+// capped at cascadeRetryMaxDelay.
+func cascadeRetryDelay(attempt int) time.Duration {
+	delay := cascadeRetryBaseDelay
+	for i := 1; i < attempt && delay < cascadeRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > cascadeRetryMaxDelay {
+		delay = cascadeRetryMaxDelay
+	}
+	return delay
+}
+
+// setCascadeCondition records why a Terminating FloatingIPProjectQuota is
+// still held by its finalizer, so `kubectl describe`/jsonpath shows the
+// cascade state instead of requiring controller log access.
+func (c *Controller) setCascadeCondition(ctx context.Context, name string, remaining int) error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		currentQuota, errGet := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
+		if errors.IsNotFound(errGet) {
+			return nil
+		}
+		if errGet != nil {
+			return errGet
+		}
+		newConditions := currentQuota.Status.DeepCopy().Conditions
+		meta.SetStatusCondition(&newConditions, metav1.Condition{
+			Type:    cascadeConditionType,
+			Status:  metav1.ConditionFalse,
+			Reason:  "FloatingIPsStillAttached",
+			Message: fmt.Sprintf("%d attached FloatingIP(s) must finish deleting before the quota can be removed", remaining),
+		})
+		if reflect.DeepEqual(currentQuota.Status.Conditions, newConditions) {
+			// Unchanged; skip the write to avoid API churn on every retry.
+			return nil
+		}
+		quotaCopy := currentQuota.DeepCopy()
+		quotaCopy.Status.Conditions = newConditions
+		_, errUpdate := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().UpdateStatus(ctx, quotaCopy, metav1.UpdateOptions{})
+		return errUpdate
+	})
+	if err != nil {
+		return fmt.Errorf("failed to surface cascade condition on FloatingIPProjectQuota %s: %w", name, err)
 	}
 	return nil
 }
