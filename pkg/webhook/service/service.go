@@ -102,6 +102,193 @@ func Register(ctx context.Context) *Handler {
 	}
 }
 
+// quotaGuardSleep is the per-admission quota-race guard sleep (its
+// effectiveness is tracked separately in REPORT.md M7); a var so tests can
+// disable it.
+var quotaGuardSleep = 2 * time.Second
+
+// poolAdmissionLocks serializes the duplicate-IP decision per
+// FloatingIPPool (REPORT.md M6): two concurrent CREATEs of the same
+// spec.ipAddr must not interleave their duplicate checks. The lock covers
+// the check only — never the quota sleep or the response write.
+var poolAdmissionLocks sync.Map // pool name -> *sync.Mutex
+
+// ipReservations closes the residual concurrent-CREATE window: the per-pool
+// mutex is released before the admitted CR is persisted, so two
+// near-simultaneous CREATEs of the same spec.ipAddr could both pass a
+// list-only check. A reservation taken at admission time (before the
+// response is written) makes the second CREATE deterministic; the TTL
+// bounds the false block when an admitted request is later denied by the
+// quota check or the create fails, since there is no hook to clear it.
+var ipReservations sync.Map // "pool/canonicalIP" -> time.Time (expiry)
+
+const (
+	ipReservationTTL = 5 * time.Second
+	// Bounds the live FloatingIP list while the per-pool mutex is held:
+	// an unbounded list call would head-of-line-block every other
+	// admission for the pool (REPORT.md M6 review).
+	ipClaimListTimeout = 3 * time.Second
+)
+
+func lockPoolForAdmission(pool string) func() {
+	if pool == "" {
+		return func() {}
+	}
+	v, _ := poolAdmissionLocks.LoadOrStore(pool, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+
+	return mu.Unlock
+}
+
+// checkIPNotInUse returns a denial when the requested IP is already claimed,
+// nil when the admission may proceed. Three layers, all under the per-pool
+// lock:
+//  1. pool.status.Allocated — the manager controller writes it
+//     asynchronously after the FloatingIP CR persists, so on its own it
+//     lags concurrent CREATEs by a full reconcile.
+//  2. A bounded live FloatingIP list — a CR claiming the same IP is visible
+//     immediately after the apiserver persists it. Terminating CRs still
+//     count as claims: reconcileDelete releases the IPAM lease only just
+//     before removing the finalizer. CRs in Error state without
+//     status.ipAddr are skipped: a failed allocation never made an IPAM
+//     claim, so the CR must not block the retry path for that address.
+//  3. A short-TTL in-process reservation taken on allow, so a second
+//     near-simultaneous CREATE is denied even before either CR persists.
+//
+// Any residual race (multi-replica webhook, reservation expiry) is
+// backstopped by the controller, which fails closed on the actual grant.
+func checkIPNotInUse(ctx context.Context, dynamic dynamic.Interface, ar *admissionv1.AdmissionReview, fip *rfmv2.FloatingIP, allocatedIP string, fipPool *rfmv2.FloatingIPPool, isUpdate bool, oldFIP *rfmv2.FloatingIP) *admissionv1.AdmissionResponse {
+	unlock := lockPoolForAdmission(fip.Spec.FloatingIPPool)
+	defer unlock()
+
+	if _, ok := fipPool.Status.Allocated[allocatedIP]; ok {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("requested IP %s is already allocated", allocatedIP),
+			},
+		}
+	}
+
+	// Canonical form: peers may textually differ (IPv6 zero compression,
+	// IPv4 leading zeros are already rejected by net.ParseIP) while naming
+	// the same address the IPAM would collide on.
+	requestedIP := net.ParseIP(allocatedIP)
+	reservationKey := fip.Spec.FloatingIPPool + "/" + allocatedIP
+	if requestedIP != nil {
+		reservationKey = fip.Spec.FloatingIPPool + "/" + requestedIP.String()
+	}
+
+	// The object under update already owns this exact address (e.g. the
+	// controller's spec rewrite right after a pinned-IP create, while
+	// status.ipAddr is still empty and the outer oldFIP.Status.IPAddr skip
+	// does not fire): it is not claiming anything new, so neither probe
+	// the reservation nor take one. Failing this write open is safe — the
+	// address is the object's own.
+	if isUpdate && oldFIP != nil && oldFIP.Spec.IPAddr != nil {
+		oldIP := net.ParseIP(*oldFIP.Spec.IPAddr)
+		if requestedIP == nil {
+			if *oldFIP.Spec.IPAddr == allocatedIP {
+				return nil
+			}
+		} else if oldIP != nil && oldIP.Equal(requestedIP) {
+			return nil
+		}
+	}
+
+	if expiry, ok := ipReservations.Load(reservationKey); ok {
+		if time.Now().Before(expiry.(time.Time)) {
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("requested IP %s is pending allocation in floatingippool %s", allocatedIP, fip.Spec.FloatingIPPool),
+				},
+			}
+		}
+		// Expired entries are never overwritten while the holder is being
+		// denied; sweep them here so the map does not grow unboundedly.
+		ipReservations.Delete(reservationKey)
+	}
+
+	fipListGVR := schema.GroupVersionResource{
+		Group:    "rancher.k8s.binbash.org",
+		Version:  "v1beta2",
+		Resource: "floatingips",
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, ipClaimListTimeout)
+	defer cancel()
+
+	fips, err := dynamic.Resource(fipListGVR).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{})
+	if err != nil {
+		log.Errorf("failed to list floatingips while validating IP %s: %s", allocatedIP, err)
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("failed to verify that requested IP %s is free in floatingippool %s", allocatedIP, fip.Spec.FloatingIPPool),
+			},
+		}
+	}
+
+	for _, item := range fips.Items {
+		var existing rfmv2.FloatingIP
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, &existing); err != nil {
+			continue
+		}
+		if isUpdate && oldFIP != nil && existing.Name == oldFIP.Name && existing.Namespace == oldFIP.Namespace {
+			// The object under update itself.
+			continue
+		}
+		if existing.Spec.IPAddr == nil || existing.Spec.FloatingIPPool != fip.Spec.FloatingIPPool {
+			continue
+		}
+		existingIP := net.ParseIP(*existing.Spec.IPAddr)
+		if requestedIP == nil || existingIP == nil {
+			// Unparseable forms cannot be compared canonically; fall back
+			// to exact string match so nothing is silently allowed.
+			if *existing.Spec.IPAddr != allocatedIP {
+				continue
+			}
+		} else if !existingIP.Equal(requestedIP) {
+			continue
+		}
+		if existing.DeletionTimestamp != nil {
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("requested IP %s is still held by terminating floatingip %s/%s", allocatedIP, existing.Namespace, existing.Name),
+				},
+			}
+		}
+		if existing.Status.State == "Error" && existing.Status.IPAddr == "" {
+			// Failed allocation: the grant path fails before any IPAM
+			// claim is made (pkg/controller/floatingip/controller.go
+			// updateFipStatusWithError), so this CR holds nothing and
+			// must not block the retry path.
+			continue
+		}
+
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("requested IP %s is already claimed by floatingip %s/%s", allocatedIP, existing.Namespace, existing.Name),
+			},
+		}
+	}
+
+	// All checks passed: reserve the address until the CR is expected to
+	// have persisted.
+	ipReservations.Store(reservationKey, time.Now().Add(ipReservationTTL))
+
+	return nil
+}
+
 func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admissionv1.AdmissionReview, fip *rfmv2.FloatingIP, oldFIP *rfmv2.FloatingIP, h *Handler) *admissionv1.AdmissionResponse {
 	// Determine if this is an UPDATE operation
 	isUpdate := oldFIP != nil
@@ -263,14 +450,8 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		allocatedIP := *fip.Spec.IPAddr
 		if isUpdate && oldFIP != nil && oldFIP.Status.IPAddr == allocatedIP {
 			// The IP hasn't changed, skip the allocated check
-		} else if _, ok := fipPool.Status.Allocated[allocatedIP]; ok {
-			return &admissionv1.AdmissionResponse{
-				UID:     ar.Request.UID,
-				Allowed: false,
-				Result: &metav1.Status{
-					Message: fmt.Sprintf("requested IP %s is already allocated", *fip.Spec.IPAddr),
-				},
-			}
+		} else if resp := checkIPNotInUse(ctx, dynamic, ar, fip, allocatedIP, &fipPool, isUpdate, oldFIP); resp != nil {
+			return resp
 		}
 	} else {
 		// if no ip is requested, check if there are available ips in the pool
@@ -299,7 +480,7 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		// 3. Project Quota Enforcement
 
 		// This sleep prevents Quota usage race conditions when creating multiple FloatingIPs in a short period of time
-		time.Sleep(2 * time.Second)
+		time.Sleep(quotaGuardSleep)
 
 		projectID := fip.ObjectMeta.Labels["rancher.k8s.binbash.org/project-name"]
 

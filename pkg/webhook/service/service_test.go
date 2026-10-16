@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
 )
 
@@ -283,7 +284,9 @@ func TestValidateFloatingIP(t *testing.T) {
 
 			allObjects := append(unstructuredPools, unstructuredPLBCs...)
 			allObjects = append(allObjects, unstructuredFIPs...)
-			dynamicClient := fake.NewSimpleDynamicClient(runtime.NewScheme(), allObjects...)
+			dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+				{Group: "rancher.k8s.binbash.org", Version: "v1beta2", Resource: "floatingips"}: "FloatingIPList",
+			}, allObjects...)
 
 			response := validateFloatingIP(context.Background(), dynamicClient, ar, tc.fip, nil, nil)
 
@@ -293,6 +296,330 @@ func TestValidateFloatingIP(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateFloatingIPDuplicateIPRace pins the REPORT.md M6 fix: the
+// duplicate-IP admission check must consult the live FloatingIP list, not
+// only pool.status.Allocated, which the manager controller writes
+// asynchronously after the CR persists — two concurrent CREATEs of the same
+// spec.ipAddr used to both pass while both statuses were still empty. The
+// decision is additionally serialized per pool via lockPoolForAdmission.
+func TestValidateFloatingIPDuplicateIPRace(t *testing.T) {
+	oldSleep := quotaGuardSleep
+	quotaGuardSleep = 0
+	t.Cleanup(func() { quotaGuardSleep = oldSleep })
+
+	ipAddr := "192.168.1.100"
+
+	fipPool := &rfmv2.FloatingIPPool{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rancher.k8s.binbash.org/v1beta2",
+			Kind:       "FloatingIPPool",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pool",
+		},
+		Spec: rfmv2.FloatingIPPoolSpec{
+			IPConfig: &rfmv2.IPConfig{
+				Subnet: "192.168.1.0/24",
+				Pool: rfmv2.Pool{
+					Start: "192.168.1.10",
+					End:   "192.168.1.200",
+				},
+			},
+		},
+		Status: rfmv2.FloatingIPPoolStatus{
+			// Deliberately empty: the manager controller has not yet
+			// written the concurrent allocation into pool status.
+			Allocated: map[string]string{},
+			Available: 1,
+		},
+	}
+	plbc := &rfmv2.FloatingIPProjectQuota{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rancher.k8s.binbash.org/v1beta2",
+			Kind:       "FloatingIPProjectQuota",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-project",
+		},
+		Spec: rfmv2.FloatingIPProjectQuotaSpec{
+			FloatingIPQuota: map[string]int{
+				"test-pool": 1,
+			},
+		},
+		Status: rfmv2.FloatingIPProjectQuotaStatus{
+			FloatingIPs: map[string]*rfmv2.FipInfo{
+				"test-pool": {Used: 0},
+			},
+		},
+	}
+
+	newFIPCR := func(name string, pool string, ip string, deleting bool) *rfmv2.FloatingIP {
+		fip := &rfmv2.FloatingIP{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "rancher.k8s.binbash.org/v1beta2",
+				Kind:       "FloatingIP",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels: map[string]string{
+					"rancher.k8s.binbash.org/project-name": "test-project",
+				},
+			},
+			Spec: rfmv2.FloatingIPSpec{
+				FloatingIPPool: pool,
+				IPAddr:         &ip,
+			},
+		}
+		if deleting {
+			// A real timestamp: the zero value marshals as null through
+			// the unstructured round-trip and would be dropped.
+			fip.DeletionTimestamp = &metav1.Time{Time: metav1.Now().Time}
+			fip.Finalizers = []string{"floatingip-cleanup"}
+		}
+
+		return fip
+	}
+
+	newFailedFIPCR := func(name string, pool string, ip string, withStatusIP bool) *rfmv2.FloatingIP {
+		fip := newFIPCR(name, pool, ip, false)
+		fip.Status = rfmv2.FloatingIPStatus{State: "Error"}
+		if withStatusIP {
+			fip.Status.IPAddr = ip
+		}
+
+		return fip
+	}
+
+	ipv6Pool := &rfmv2.FloatingIPPool{
+		TypeMeta:   fipPool.TypeMeta,
+		ObjectMeta: fipPool.ObjectMeta,
+		Spec: rfmv2.FloatingIPPoolSpec{
+			IPConfig: &rfmv2.IPConfig{
+				Subnet: "2001:db8::/64",
+				Pool: rfmv2.Pool{
+					Start: "2001:db8::10",
+					End:   "2001:db8::200",
+				},
+			},
+		},
+		Status: rfmv2.FloatingIPPoolStatus{
+			Allocated: map[string]string{},
+			Available: 1,
+		},
+	}
+
+	newRequest := func(ip string) *rfmv2.FloatingIP {
+		return &rfmv2.FloatingIP{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-fip",
+				Namespace: "default",
+				Labels: map[string]string{
+					"rancher.k8s.binbash.org/project-name": "test-project",
+				},
+			},
+			Spec: rfmv2.FloatingIPSpec{
+				FloatingIPPool: "test-pool",
+				IPAddr:         &ip,
+			},
+		}
+	}
+
+	testCases := []struct {
+		name            string
+		fip             *rfmv2.FloatingIP
+		oldFIP          *rfmv2.FloatingIP
+		pool            *rfmv2.FloatingIPPool
+		existingFIPs    []runtime.Object
+		expectedAllowed bool
+		expectedMessage string
+	}{
+		{
+			name: "live FIP CR claims the requested IP while pool status is empty",
+			fip:  newRequest(ipAddr),
+			existingFIPs: []runtime.Object{
+				newFIPCR("existing-fip", "test-pool", ipAddr, false),
+			},
+			expectedAllowed: false,
+			expectedMessage: "requested IP 192.168.1.100 is already claimed by floatingip default/existing-fip",
+		},
+		{
+			name: "same IP claimed in another pool is not a conflict",
+			fip:  newRequest(ipAddr),
+			existingFIPs: []runtime.Object{
+				newFIPCR("existing-fip", "other-pool", ipAddr, false),
+			},
+			expectedAllowed: true,
+		},
+		{
+			name: "terminating FIP CR still holds the IP until its finalizer is removed",
+			fip:  newRequest(ipAddr),
+			existingFIPs: []runtime.Object{
+				newFIPCR("existing-fip", "test-pool", ipAddr, true),
+			},
+			expectedAllowed: false,
+			expectedMessage: "requested IP 192.168.1.100 is still held by terminating floatingip default/existing-fip",
+		},
+		{
+			name: "failed-allocation CR without a status IP does not block the retry",
+			fip:  newRequest(ipAddr),
+			existingFIPs: []runtime.Object{
+				newFailedFIPCR("existing-fip", "test-pool", ipAddr, false),
+			},
+			expectedAllowed: true,
+		},
+		{
+			name: "failed-allocation CR that still holds a status IP blocks the IP",
+			fip:  newRequest(ipAddr),
+			existingFIPs: []runtime.Object{
+				newFailedFIPCR("existing-fip", "test-pool", ipAddr, true),
+			},
+			expectedAllowed: false,
+			expectedMessage: "requested IP 192.168.1.100 is already claimed by floatingip default/existing-fip",
+		},
+		{
+			name: "IPv6 textual forms of the same address conflict",
+			fip: func() *rfmv2.FloatingIP {
+				fip := newRequest("2001:db8::15")
+				fip.Spec.FloatingIPPool = "test-pool"
+
+				return fip
+			}(),
+			pool: ipv6Pool,
+			existingFIPs: []runtime.Object{
+				newFIPCR("existing-fip", "test-pool", "2001:db8:0:0:0:0:0:15", false),
+			},
+			expectedAllowed: false,
+			expectedMessage: "requested IP 2001:db8::15 is already claimed by floatingip default/existing-fip",
+		},
+		{
+			name:   "update re-submitting the same IP skips the object itself",
+			fip:    newRequest(ipAddr),
+			oldFIP: newFIPCR("test-fip", "test-pool", ipAddr, false),
+			existingFIPs: []runtime.Object{
+				// Status.IPAddr not yet written, so the outer
+				// oldFIP.Status.IPAddr skip does not fire; the live list
+				// contains the object under update itself.
+				newFIPCR("test-fip", "test-pool", ipAddr, false),
+			},
+			expectedAllowed: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reservations taken by an earlier subtest must not leak in.
+			ipReservations.Range(func(key, _ any) bool {
+				ipReservations.Delete(key)
+
+				return true
+			})
+
+			pool := tc.pool
+			if pool == nil {
+				pool = fipPool
+			}
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					UID: "test-uid",
+				},
+			}
+			unstructuredPools, err := getUnstructuredList([]runtime.Object{pool})
+			require.NoError(t, err)
+			unstructuredPLBCs, err := getUnstructuredList([]runtime.Object{plbc})
+			require.NoError(t, err)
+			unstructuredFIPs, err := getUnstructuredList(tc.existingFIPs)
+			require.NoError(t, err)
+
+			allObjects := append(unstructuredPools, unstructuredPLBCs...)
+			allObjects = append(allObjects, unstructuredFIPs...)
+			dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+				{Group: "rancher.k8s.binbash.org", Version: "v1beta2", Resource: "floatingips"}: "FloatingIPList",
+			}, allObjects...)
+
+			response := validateFloatingIP(context.Background(), dynamicClient, ar, tc.fip, tc.oldFIP, nil)
+
+			assert.Equal(t, tc.expectedAllowed, response.Allowed)
+			if !tc.expectedAllowed {
+				assert.Equal(t, tc.expectedMessage, response.Result.Message)
+			}
+		})
+	}
+
+	// A near-simultaneous second CREATE of the same IP must be denied by
+	// the reservation even before either CR is visible in the live list:
+	// the first admission reserved the address, and the per-pool mutex
+	// alone cannot cover the window between its response and the CR
+	// persisting (the exact REPORT.md M6 trigger).
+	t.Run("reservation denies a second near-simultaneous create", func(t *testing.T) {
+		ipReservations.Range(func(key, _ any) bool {
+			ipReservations.Delete(key)
+
+			return true
+		})
+
+		ar := &admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
+				UID: "test-uid",
+			},
+		}
+		unstructuredPools, err := getUnstructuredList([]runtime.Object{fipPool})
+		require.NoError(t, err)
+		unstructuredPLBCs, err := getUnstructuredList([]runtime.Object{plbc})
+		require.NoError(t, err)
+
+		dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			{Group: "rancher.k8s.binbash.org", Version: "v1beta2", Resource: "floatingips"}: "FloatingIPList",
+		}, append(unstructuredPools, unstructuredPLBCs...)...)
+
+		first := validateFloatingIP(context.Background(), dynamicClient, ar, newRequest(ipAddr), nil, nil)
+		require.True(t, first.Allowed, "first admission must be allowed: %+v", first.Result)
+
+		secondFIP := newRequest(ipAddr)
+		secondFIP.Name = "test-fip-2"
+		second := validateFloatingIP(context.Background(), dynamicClient, ar, secondFIP, nil, nil)
+		assert.False(t, second.Allowed)
+		assert.Equal(t, "requested IP 192.168.1.100 is pending allocation in floatingippool test-pool", second.Result.Message)
+	})
+
+	// The controller's spec rewrite right after a pinned-IP create arrives
+	// as an UPDATE of the same object while status.ipAddr is still empty,
+	// i.e. while the create's reservation is still live. That write owns
+	// the address already and must not be self-denied by the reservation
+	// probe.
+	t.Run("controller spec update of a just-created pinned IP is not self-denied", func(t *testing.T) {
+		ipReservations.Range(func(key, _ any) bool {
+			ipReservations.Delete(key)
+
+			return true
+		})
+
+		ar := &admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
+				UID: "test-uid",
+			},
+		}
+		unstructuredPools, err := getUnstructuredList([]runtime.Object{fipPool})
+		require.NoError(t, err)
+		unstructuredPLBCs, err := getUnstructuredList([]runtime.Object{plbc})
+		require.NoError(t, err)
+
+		dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			{Group: "rancher.k8s.binbash.org", Version: "v1beta2", Resource: "floatingips"}: "FloatingIPList",
+		}, append(unstructuredPools, unstructuredPLBCs...)...)
+
+		created := newRequest(ipAddr)
+		first := validateFloatingIP(context.Background(), dynamicClient, ar, created, nil, nil)
+		require.True(t, first.Allowed, "create admission must be allowed: %+v", first.Result)
+
+		// The UPDATE carries the old object with the same pinned spec IP
+		// and empty status, as the controller's spec rewrite does.
+		update := validateFloatingIP(context.Background(), dynamicClient, ar, created, created, nil)
+		assert.True(t, update.Allowed, "spec update of the object's own address must be allowed: %+v", update.Result)
+	})
 }
 
 func TestValidateFloatingIPPool(t *testing.T) {
