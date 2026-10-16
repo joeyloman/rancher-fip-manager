@@ -30,6 +30,14 @@ const quotaFinalizerName = "rancher.k8s.binbash.org/floatingipprojectquota-clean
 
 const projectNameLabel = "rancher.k8s.binbash.org/project-name"
 
+// Cascade requeue pacing: exponential from baseDelay, capped, so a stalled
+// FloatingIP deletion converges on a bounded poll instead of hammering at a
+// fixed 2 s forever.
+const (
+	cascadeRetryBaseDelay = 2 * time.Second
+	cascadeRetryMaxDelay  = 30 * time.Second
+)
+
 // Controller is the controller implementation for FloatingIPProjectQuota resources.
 // It keeps the FloatingIPProjectQuota status in sync with its attached FloatingIPs and cascades
 // FloatingIPProjectQuota deletion: a FloatingIPProjectQuota being deleted first deletes all FloatingIPs labeled
@@ -45,6 +53,15 @@ type Controller struct {
 	fipPoolSynced                cache.InformerSynced
 	workqueue                    workqueue.RateLimitingInterface
 	initSyncDone                 chan struct{}
+
+	// cascadeRetries tracks, per quota key, how many cascade passes have
+	// already run while FloatingIPs are still attached. Deleted once the
+	// cascade completes so a future deletion starts at the base delay again.
+	cascadeRetries sync.Map
+
+	// cascadeEnqueueAfter requeues a cascade pass after a backoff delay.
+	// Bound to workqueue.AddAfter in New; a seam for tests.
+	cascadeEnqueueAfter func(key string, delay time.Duration)
 }
 
 // New creates a new Controller for managing FloatingIPProjectQuota resources.
@@ -66,6 +83,9 @@ func New(
 		fipPoolSynced:                fipPoolInformer.Informer().HasSynced,
 		workqueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "FloatingIPProjectQuotas"),
 		initSyncDone:                 make(chan struct{}),
+	}
+	controller.cascadeEnqueueAfter = func(key string, delay time.Duration) {
+		controller.workqueue.AddAfter(key, delay)
 	}
 
 	logrus.Info("Setting up event handlers for FloatingIPProjectQuota controller")
@@ -209,6 +229,11 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	floatingIPProjectQuota, err := c.floatingIPProjectQuotaLister.Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			// The quota is gone from the cache, so handleFloatingIPProjectQuotaDelete
+			// will never run its reset path for this key; drop any leftover cascade
+			// backoff state or a recreated quota with the same name would resume at
+			// the stale (capped) delay.
+			c.cascadeRetries.Delete(key)
 			runtime.HandleError(fmt.Errorf("floatingipprojectquota '%s' in work queue no longer exists", key))
 			return nil
 		}
@@ -328,9 +353,18 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 
 		// FloatingIPs are gone from the API but the informer cache may still
 		// list them; requeue until the list is empty and their finalizers ran.
-		c.workqueue.AddAfter(key, 2*time.Second)
+		// Passes back off exponentially (2 s doubling, capped at 30 s) so a
+		// stalled FloatingIP deletion converges on a bounded retry rate
+		// instead of an unbounded fixed 2 s poll.
+		attempt := 1
+		if prev, ok := c.cascadeRetries.Load(key); ok {
+			attempt = prev.(int) + 1
+		}
+		c.cascadeRetries.Store(key, attempt)
+		c.cascadeEnqueueAfter(key, cascadeRetryDelay(attempt))
 		return nil
 	}
+	c.cascadeRetries.Delete(key)
 
 	quota, err := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
@@ -359,6 +393,20 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 		return fmt.Errorf("failed to remove finalizer from FloatingIPProjectQuota %s: %w", name, err)
 	}
 	return nil
+}
+
+// cascadeRetryDelay returns the requeue delay for the attempt-th (1-based)
+// cascade pass of a Terminating FloatingIPProjectQuota: 2 s, 4 s, 8 s, …
+// capped at cascadeRetryMaxDelay.
+func cascadeRetryDelay(attempt int) time.Duration {
+	delay := cascadeRetryBaseDelay
+	for i := 1; i < attempt && delay < cascadeRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > cascadeRetryMaxDelay {
+		delay = cascadeRetryMaxDelay
+	}
+	return delay
 }
 
 func (c *Controller) handleFloatingIPProjectQuotaCreate(obj interface{}) {
