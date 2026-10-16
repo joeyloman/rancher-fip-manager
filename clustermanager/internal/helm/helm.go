@@ -1,9 +1,14 @@
 package helm
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -71,6 +76,12 @@ type Client struct {
 	// too corrupt for Helm's own Get/Uninstall to read: an unreadable
 	// release must still be purgeable so provisioning can converge.
 	purgeReleaseRecords func(ctx context.Context, config *rest.Config, namespace, releaseName string) error
+	// purgeUndecodableRecords deletes only the storage records of a release
+	// that Helm cannot decode, keeping the readable ones. Helm silently
+	// skips undecodable rows on every History/Get/Uninstall read (logging
+	// "query: failed to decode release"), so they are dead weight that
+	// nothing else ever removes.
+	purgeUndecodableRecords func(ctx context.Context, config *rest.Config, namespace, releaseName string) error
 	// repoLock serialises access to the process-wide on-disk repository
 	// file and index cache: repo.File.WriteFile is not atomic and the
 	// reconcile workers install the same charts for many clusters at once.
@@ -83,6 +94,7 @@ func NewClient() *Client {
 	c.newActionConfig = c.defaultActionConfig
 	c.loadChart = c.defaultLoadChart
 	c.purgeReleaseRecords = defaultPurgeReleaseRecords
+	c.purgeUndecodableRecords = defaultPurgeUndecodableRecords
 	return c
 }
 
@@ -239,6 +251,16 @@ func (c *Client) InstallOrUpgrade(ctx context.Context, config *rest.Config, spec
 		return errors.Wrapf(err, "failed to parse values for release %q", spec.ReleaseName)
 	}
 
+	// Helm's storage driver silently skips records it cannot decode, and
+	// Uninstall cannot remove them either, so an undecodable record would
+	// sit in the release history forever (and a corrupt latest revision
+	// wedges Get, forcing the full purge-and-reinstall below). Drop them up
+	// front: an undecodable record is invisible to every Helm operation,
+	// so deleting it cannot lose state.
+	if err := c.purgeUndecodableRecords(ctx, config, spec.Namespace, spec.ReleaseName); err != nil {
+		return errors.Wrapf(err, "failed to sanitize storage records of release %q", spec.ReleaseName)
+	}
+
 	historyClient := action.NewHistory(actionConfig)
 	historyClient.Max = 1
 	if _, err := historyClient.Run(spec.ReleaseName); stderrors.Is(err, driver.ErrReleaseNotFound) {
@@ -251,12 +273,15 @@ func (c *Client) InstallOrUpgrade(ctx context.Context, config *rest.Config, spec
 	getClient := action.NewGet(actionConfig)
 	existingRelease, err := getClient.Run(spec.ReleaseName)
 	if err != nil {
-		// History saw the storage rows but the release itself cannot be
-		// read — the usual cause is a corrupt (undecodable) release
-		// secret. There is no status to plan from, and Helm's own purge
-		// cannot run either because Uninstall reads the same broken
-		// record. Drop the storage rows by label and reinstall: an
-		// unreadable release is indistinguishable from an absent one.
+		// The sanitizer above removes undecodable records before Helm reads
+		// them, so this is now the residual fallback for a record that
+		// became unreadable in the window between that scan and this Get
+		// (or a storage driver the scan does not cover). History saw the
+		// storage rows but the release itself cannot be read; there is no
+		// status to plan from, and Helm's own purge cannot run either
+		// because Uninstall reads the same broken record. Drop the storage
+		// rows by label and reinstall: an unreadable release is
+		// indistinguishable from an absent one.
 		log.Printf("Release %q is stored but unreadable (%s); purging its storage records and reinstalling.", spec.ReleaseName, err)
 		if perr := c.purgeReleaseRecords(ctx, config, spec.Namespace, spec.ReleaseName); perr != nil {
 			return errors.Wrapf(perr, "failed to purge unreadable release %q", spec.ReleaseName)
@@ -487,6 +512,65 @@ func (c *restClientGetter) ToRawKubeConfigLoader() clientcmd.ClientConfig {
 		overrides.AuthInfo.ClientKeyData = c.restConfig.KeyData
 	}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
+}
+
+// decodeReleaseRecord mirrors the secret driver's unexported decodeRelease
+// (base64, optional gzip, JSON) so a record rejected here is exactly a record
+// Helm's own reads would skip.
+var magicGzip = []byte{0x1f, 0x8b, 0x08}
+
+func decodeReleaseRecord(data string) error {
+	b, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return err
+	}
+	// Releases stored before compression was introduced skip decompression
+	// when the gzip magic header is absent.
+	if len(b) > 3 && bytes.Equal(b[0:3], magicGzip) {
+		zr, err := gzip.NewReader(bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		if b, err = io.ReadAll(zr); err != nil {
+			return err
+		}
+	}
+	var rel release.Release
+	return json.Unmarshal(b, &rel)
+}
+
+// defaultPurgeUndecodableRecords deletes every storage record of releaseName
+// that Helm's own decoder rejects, keeping the readable ones. Decoding here
+// is exactly what the secret driver does on every History/Get/Uninstall, so
+// a record rejected here can never be read by any Helm operation and deleting
+// it only stops the recurring "query: failed to decode release" noise and
+// frees its revision slot.
+func defaultPurgeUndecodableRecords(ctx context.Context, config *rest.Config, namespace, releaseName string) error {
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return errors.Wrapf(err, "failed to build kube client to sanitize release %q", releaseName)
+	}
+	return purgeUndecodableRecordsWithClient(ctx, client, namespace, releaseName)
+}
+
+func purgeUndecodableRecordsWithClient(ctx context.Context, client kubernetes.Interface, namespace, releaseName string) error {
+	records, err := client.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("name=%s,owner=helm", releaseName),
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to list storage records of release %q", releaseName)
+	}
+	for i := range records.Items {
+		if err := decodeReleaseRecord(string(records.Items[i].Data["release"])); err == nil {
+			continue
+		}
+		log.Printf("Release %q has an undecodable storage record %s; deleting it.", releaseName, records.Items[i].Name)
+		if err := client.CoreV1().Secrets(namespace).Delete(ctx, records.Items[i].Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "failed to delete undecodable storage record %s of release %q", records.Items[i].Name, releaseName)
+		}
+	}
+	return nil
 }
 
 // defaultPurgeReleaseRecords deletes all Helm release-storage secrets for

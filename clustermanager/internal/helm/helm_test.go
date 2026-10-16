@@ -1,7 +1,11 @@
 package helm
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -19,6 +23,9 @@ import (
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage"
 	"helm.sh/helm/v3/pkg/storage/driver"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientgofake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 )
 
@@ -119,6 +126,12 @@ func newHarnessWithKube(t *testing.T, kubeClient kube.Interface, seeded ...*rele
 	}
 	h.client.loadChart = func(*action.Configuration, ChartSpec) (*chart.Chart, error) {
 		return testChart(testVersion), nil
+	}
+	// The sanitize pass hits the kube API for storage secrets; these tests
+	// drive Helm's actions through the in-memory store, so stub it out. Its
+	// decode-and-delete behavior is pinned by TestDefaultPurgeUndecodableRecords.
+	h.client.purgeUndecodableRecords = func(context.Context, *rest.Config, string, string) error {
+		return nil
 	}
 	return h
 }
@@ -344,6 +357,9 @@ func TestInstallOrUpgradePurgesUnreadableRelease(t *testing.T) {
 	var purged []string
 
 	client := NewClient()
+	client.purgeUndecodableRecords = func(context.Context, *rest.Config, string, string) error {
+		return nil
+	}
 	client.purgeReleaseRecords = func(_ context.Context, _ *rest.Config, namespace, name string) error {
 		purged = append(purged, namespace+"/"+name)
 		d.purgeByName(name)
@@ -371,4 +387,75 @@ func TestInstallOrUpgradePurgesUnreadableRelease(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rels, 1, "the corrupt record must be replaced by exactly the fresh install")
 	assert.Equal(t, release.StatusDeployed, rels[0].Info.Status)
+}
+
+// encodedRelease builds a storage payload exactly the way Helm's secret
+// driver stores one: base64(gzip(json(release))).
+func encodedRelease(r *release.Release) (string, error) {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(b); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+// TestDefaultPurgeUndecodableRecords pins the live failure from the aio2
+// cluster: a corrupt release-storage secret (raw binary where base64 text
+// belongs) is silently skipped by every Helm read and can never be removed
+// by Uninstall, so the sanitizer must delete exactly the undecodable records
+// and keep the readable ones Helm plans from.
+func TestDefaultPurgeUndecodableRecords(t *testing.T) {
+	valid, err := encodedRelease(seededRelease(release.StatusDeployed, testVersion))
+	require.NoError(t, err)
+
+	// Legacy record from before the storage driver compressed releases:
+	// plain base64(json(release)) with no gzip magic header.
+	legacyJSON, err := json.Marshal(seededRelease(release.StatusDeployed, testVersion))
+	require.NoError(t, err)
+	legacy := base64.StdEncoding.EncodeToString(legacyJSON)
+
+	releaseLabels := func(version string) map[string]string {
+		return map[string]string{"name": testRelease, "owner": "helm", "status": "deployed", "version": version}
+	}
+	client := clientgofake.NewSimpleClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1." + testRelease + ".v1", Namespace: testNamespace, Labels: releaseLabels("1")},
+			Data:       map[string][]byte{"release": []byte(valid)},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1." + testRelease + ".v2", Namespace: testNamespace, Labels: releaseLabels("2")},
+			Data:       map[string][]byte{"release": []byte(legacy)},
+		},
+		// The observed corruption: the payload is not base64 at all.
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1." + testRelease + ".v3", Namespace: testNamespace, Labels: releaseLabels("3")},
+			Data:       map[string][]byte{"release": {0x8f, 0x00, 0x1f, 0x8b, 0x00}},
+		},
+		// Decodable base64, but neither gzip nor JSON once decoded.
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1." + testRelease + ".v4", Namespace: testNamespace, Labels: releaseLabels("4")},
+			Data:       map[string][]byte{"release": []byte(base64.StdEncoding.EncodeToString([]byte("not a release"))), "extra": []byte("ignored")},
+		},
+	)
+
+	require.NoError(t, purgeUndecodableRecordsWithClient(context.Background(), client, testNamespace, testRelease),
+		"the sanitizer must tolerate undecodable records, not fail on them")
+
+	secrets, err := client.CoreV1().Secrets(testNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "name=" + testRelease + ",owner=helm"})
+	require.NoError(t, err)
+	require.Len(t, secrets.Items, 2, "only the decodable records (compressed + legacy uncompressed) must survive the sanitize pass")
+	survivors := map[string]bool{}
+	for _, s := range secrets.Items {
+		survivors[s.Name] = true
+	}
+	assert.True(t, survivors["sh.helm.release.v1."+testRelease+".v1"], "compressed decodable record must survive")
+	assert.True(t, survivors["sh.helm.release.v1."+testRelease+".v2"], "legacy uncompressed decodable record must survive")
 }
