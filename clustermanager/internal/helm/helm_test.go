@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -622,4 +623,201 @@ func TestAddOrUpdateChartRepoIndexDownloadIsBounded(t *testing.T) {
 	assert.Less(t, elapsed, 1500*time.Millisecond,
 		"the download must fail promptly, not after helm's 120s getter default")
 	assert.Contains(t, err.Error(), "cannot be reached")
+}
+
+// inodeOf reports the file's inode; a rename-based replacement always
+// produces a new inode, while an in-place os.WriteFile keeps it.
+func inodeOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+// TestUpdateRepoFileReplacesFileAtomically pins the repositories.yaml half of
+// the M11 fix: updateRepoFile must replace the repository file atomically
+// (sibling temp file + rename), because chart resolution reads it on every
+// InstallOrUpgrade without any locking. An in-place os.WriteFile keeps the
+// inode; an atomic replacement does not. It also asserts the entry landed and
+// no temp residue is left behind.
+func TestUpdateRepoFileReplacesFileAtomically(t *testing.T) {
+	isolatedHelmSettings(t)
+
+	repoFile := os.Getenv("HELM_REPOSITORY_CONFIG")
+	require.NoError(t, os.MkdirAll(filepath.Dir(repoFile), 0755))
+
+	seed := repo.NewFile()
+	seed.Add(&repo.Entry{Name: "repo-a", URL: "https://example.invalid/repo-a"})
+	require.NoError(t, seed.WriteFile(repoFile, 0644))
+	inodeBefore := inodeOf(t, repoFile)
+
+	client := NewClient()
+	require.NoError(t, client.updateRepoFile(repoFile, repo.Entry{Name: "repo-b", URL: "https://example.invalid/repo-b"}))
+
+	r, err := repo.LoadFile(repoFile)
+	require.NoError(t, err, "the replaced file must parse")
+	assert.True(t, r.Has("repo-a"), "the pre-existing entry must survive")
+	assert.True(t, r.Has("repo-b"), "the new entry must be present")
+	fi, err := os.Stat(repoFile)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0644), fi.Mode().Perm(),
+		"the atomic replacement must keep helm's 0644 mode, not os.CreateTemp's 0600")
+	assert.NotEqual(t, inodeBefore, inodeOf(t, repoFile),
+		"the file must be replaced atomically (new inode), not written in place")
+
+	entries, err := os.ReadDir(filepath.Dir(repoFile))
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp-",
+			"updateRepoFile must not leave temp files behind")
+	}
+}
+
+// TestAddOrUpdateChartRepoIndexReplacedAtomically pins the index-cache half
+// of the M11 fix: the downloaded index must be renamed into
+// settings.RepositoryCache as a unit, not written in place, because chart
+// resolution reads that file without any locking. A stale index seeded at the
+// final path must be replaced atomically (new inode, new content) and the
+// temp download directory must be gone.
+func TestAddOrUpdateChartRepoIndexReplacedAtomically(t *testing.T) {
+	isolatedHelmSettings(t)
+
+	cacheDir := os.Getenv("HELM_REPOSITORY_CACHE")
+	require.NoError(t, os.MkdirAll(cacheDir, 0755))
+	staleIndex := filepath.Join(cacheDir, helmpath.CacheIndexFile("repo-a"))
+	require.NoError(t, os.WriteFile(staleIndex,
+		[]byte("apiVersion: v1\nentries: {}\ngenerated: \"2020-01-01T00:00:00Z\"\n"), 0644))
+	inodeBefore := inodeOf(t, staleIndex)
+
+	srv := indexServer(t, writeIndex)
+
+	client := NewClient()
+	require.NoError(t, client.AddOrUpdateChartRepo(repo.Entry{Name: "repo-a", URL: srv.URL}))
+
+	idx, err := repo.LoadIndexFile(staleIndex)
+	require.NoError(t, err, "the replaced index must parse")
+	assert.Equal(t, "2026-01-01T00:00:00Z", idx.Generated.Format(time.RFC3339),
+		"the seeded stale index must have been replaced by the downloaded one")
+	assert.NotEqual(t, inodeBefore, inodeOf(t, staleIndex),
+		"the index must be swapped in atomically (new inode), not written in place")
+
+	entries, err := os.ReadDir(cacheDir)
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.Equal(t, []string{helmpath.CacheIndexFile("repo-a")}, names,
+		"the cache must contain only the final index — no temp download residue")
+}
+
+// fatIndexYAML is a chart-repository index large enough that writing it in
+// place takes many syscalls, widening the window a reader racing an in-place
+// writer can catch. The atomic swap makes the window irrelevant.
+func fatIndexYAML() []byte {
+	var b strings.Builder
+	b.WriteString("apiVersion: v1\ngenerated: \"2026-01-01T00:00:00Z\"\nentries:\n  app:\n")
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&b, "    - name: app\n      version: 1.0.%d\n      description: filler entry %d\n      urls:\n        - https://example.invalid/app-1.0.%d.tgz\n", i, i, i)
+	}
+	return []byte(b.String())
+}
+
+// TestRepoCacheReadersNeverSeeTornFiles pins the M11 behaviour end to end
+// through the production path: while AddOrUpdateChartRepo repeatedly swaps
+// the cached index (repo-0) and adds new repositories (repo-1..repo-4), which
+// rewrites repositories.yaml, unlocked readers using the same repo.LoadFile /
+// repo.LoadIndexFile calls chart resolution makes must never observe a parse
+// error (a truncated file). With in-place writes a reader racing the writer
+// can catch a partial file.
+func TestRepoCacheReadersNeverSeeTornFiles(t *testing.T) {
+	isolatedHelmSettings(t)
+
+	repoFile := os.Getenv("HELM_REPOSITORY_CONFIG")
+	require.NoError(t, os.MkdirAll(filepath.Dir(repoFile), 0755))
+	seed := repo.NewFile()
+	seed.Add(&repo.Entry{Name: "repo-0", URL: "https://example.invalid/0"})
+	require.NoError(t, seed.WriteFile(repoFile, 0644))
+
+	cacheDir := os.Getenv("HELM_REPOSITORY_CACHE")
+	require.NoError(t, os.MkdirAll(cacheDir, 0755))
+
+	srv := indexServer(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/x-yaml")
+		_, _ = w.Write(fatIndexYAML())
+	})
+
+	client := NewClient()
+	require.NoError(t, client.AddOrUpdateChartRepo(repo.Entry{Name: "repo-0", URL: srv.URL}),
+		"the initial index download must succeed before the readers start")
+	indexFile := filepath.Join(cacheDir, helmpath.CacheIndexFile("repo-0"))
+
+	var writerWG sync.WaitGroup
+	writerErrs := make([]error, 6)
+	// Two writers repeatedly refresh repo-0's index: every call downloads
+	// the fat index and swaps it into the cache.
+	for i := 0; i < 2; i++ {
+		writerWG.Add(1)
+		go func(i int) {
+			defer writerWG.Done()
+			for j := 0; j < 5; j++ {
+				writerErrs[i] = client.AddOrUpdateChartRepo(repo.Entry{Name: "repo-0", URL: srv.URL})
+			}
+		}(i)
+	}
+	// Four writers each add a new repository, rewriting repositories.yaml.
+	for i := 1; i <= 4; i++ {
+		writerWG.Add(1)
+		go func(i int) {
+			defer writerWG.Done()
+			writerErrs[i+1] = client.AddOrUpdateChartRepo(repo.Entry{
+				Name: fmt.Sprintf("repo-%d", i),
+				URL:  srv.URL,
+			})
+		}(i)
+	}
+
+	var readErrs sync.Map
+	var readerWG sync.WaitGroup
+	stop := make(chan struct{})
+	for _, read := range []func() error{
+		func() error { _, err := repo.LoadFile(repoFile); return err },
+		func() error { _, err := repo.LoadIndexFile(indexFile); return err },
+	} {
+		readerWG.Add(1)
+		go func(read func() error) {
+			defer readerWG.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if err := read(); err != nil {
+						readErrs.Store(err.Error(), struct{}{})
+					}
+				}
+			}
+		}(read)
+	}
+
+	writerWG.Wait()
+	close(stop)
+	readerWG.Wait()
+
+	for i, err := range writerErrs {
+		require.NoError(t, err, "writer %d failed", i)
+	}
+	// Post-condition: every repository the writers attempted must be in
+	// the re-loaded file — the read-modify-write cycle is serialised by
+	// the repoLock inside AddOrUpdateChartRepo, so a lost entry would
+	// mean the concurrency guarantee broke, not just a torn read.
+	r, err := repo.LoadFile(repoFile)
+	require.NoError(t, err)
+	for i := 0; i <= 4; i++ {
+		assert.True(t, r.Has(fmt.Sprintf("repo-%d", i)),
+			"repo-%d must have survived the concurrent repo-file updates", i)
+	}
+	torn := map[string]bool{}
+	readErrs.Range(func(k, _ any) bool { torn[k.(string)] = true; return true })
+	assert.Empty(t, torn, "unlocked readers must never see a torn repositories.yaml or index file")
 }

@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/downloader"
 	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/helmpath"
 	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
@@ -85,7 +87,10 @@ type Client struct {
 	// repoLock serialises access to the process-wide on-disk repository
 	// file: repo.File.WriteFile is not atomic and the reconcile workers
 	// add the same repositories for many clusters at once. Held only for
-	// local-disk work, never across the index download.
+	// local-disk work, never across the index download. updateRepoFile
+	// replaces the file atomically (sibling temp file + rename), so the
+	// unlocked chart-resolution readers always see a complete file —
+	// the lock serialises the writers' read-modify-write cycle only.
 	repoLock sync.Mutex
 	// repoIndexLocks serialises index downloads per repository name. Helm
 	// writes the downloaded index to <RepositoryCache>/<name>-index.yaml
@@ -94,7 +99,10 @@ type Client struct {
 	// the same repository concurrently could tear it. Keyed per name —
 	// NOT a global lock — because the download is a network call bounded
 	// only by the Helm getter timeout: one slow or blackholed chart-repo
-	// endpoint must not stall the other reconcile workers.
+	// endpoint must not stall the other reconcile workers. The finished
+	// index is renamed into the cache atomically, so the unlocked readers
+	// never see a partial file; the lock keeps same-name downloads from
+	// reordering and from tearing the temp-to-final swap.
 	repoIndexLocks sync.Mutex
 	repoIndexLock  map[string]*sync.Mutex
 	// repoIndexDownloadTimeout bounds each chart-repository index download.
@@ -426,14 +434,59 @@ func (c *Client) AddOrUpdateChartRepo(entry repo.Entry) error {
 	// (ChartDownloader.ResolveChartVersion) reads the index from
 	// settings.RepositoryCache. Without the override the two paths only
 	// coincide while HELM_REPOSITORY_CACHE is unset.
-	cr.CachePath = settings.RepositoryCache
+	//
+	// DownloadIndexFile writes the index with a plain non-atomic
+	// os.WriteFile (helm v3.20.2 pkg/repo/chartrepo.go:156) and chart
+	// resolution reads that same file without any locking (the per-name
+	// index lock below serialises writers only), so the download lands in
+	// a temporary directory inside the cache and the finished index file
+	// is renamed into its final location. The rename is atomic within the
+	// cache directory's filesystem, so a concurrent chart resolution
+	// always reads either the previous complete index or the new one,
+	// never a truncated one.
+	cacheDir := settings.RepositoryCache
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return err
+	}
 
 	indexLock := c.indexLockFor(entry.Name)
 	indexLock.Lock()
 	defer indexLock.Unlock()
 
-	if _, err := cr.DownloadIndexFile(); err != nil {
+	// A SIGKILL between MkdirTemp and the deferred RemoveAll leaves a
+	// `.index-download-<name>-*` dir behind forever; sweep stale ones for
+	// THIS repo before creating a new one. Safe: the temp prefix carries
+	// the repo name and same-name downloads are serialised by the index
+	// lock held above, so no live same-name download dir can exist here —
+	// a different repo's dir is never matched. ReadDir + prefix instead
+	// of filepath.Glob: repo names come from operator config and glob
+	// metacharacters in a name would be patterns, not literals.
+	tempPrefix := ".index-download-" + strings.NewReplacer("*", "_").Replace(entry.Name) + "-"
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), tempPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(cacheDir, e.Name())); err != nil {
+			return errors.Wrapf(err, "failed to remove stale index download dir %q", e.Name())
+		}
+	}
+	tmpCache, err := os.MkdirTemp(cacheDir, tempPrefix)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpCache)
+	cr.CachePath = tmpCache
+
+	indexFile, err := cr.DownloadIndexFile()
+	if err != nil {
 		return errors.Wrapf(err, "looks like %q is not a valid chart repository or cannot be reached", entry.URL)
+	}
+	if err := os.Rename(indexFile, filepath.Join(cacheDir, helmpath.CacheIndexFile(entry.Name))); err != nil {
+		return errors.Wrapf(err, "failed to move the downloaded index for %q into the repository cache", entry.URL)
 	}
 	log.Printf("Successfully got an update from the %q chart repository", entry.Name)
 
@@ -474,7 +527,33 @@ func (c *Client) updateRepoFile(repoFile string, entry repo.Entry) error {
 	// If the repo doesn't exist, add it.
 	if !r.Has(entry.Name) {
 		r.Add(&entry)
-		if err := r.WriteFile(repoFile, 0644); err != nil {
+		// repo.File.WriteFile writes with a plain os.WriteFile (helm
+		// v3.20.2 pkg/repo/repo.go:124), but chart resolution reads this
+		// file on every InstallOrUpgrade (ChartDownloader.ResolveChartVersion
+		// → loadRepoConfig) without any locking — the repoLock below
+		// serialises writers only. Write to a sibling temp file and rename:
+		// a rename within the same directory is atomic, so a concurrent
+		// reader always sees either the previous complete file or the new
+		// one, never a truncated yaml.
+		tmp, err := os.CreateTemp(filepath.Dir(repoFile), filepath.Base(repoFile)+".tmp-")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName) // no-op once the rename succeeded
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		if err := r.WriteFile(tmpName, 0644); err != nil {
+			return err
+		}
+		// os.CreateTemp creates the temp file 0600 and os.WriteFile
+		// cannot change an existing file's mode, so restore the mode
+		// helm's own WriteFile (and the previous file) used.
+		if err := os.Chmod(tmpName, 0644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmpName, repoFile); err != nil {
 			return err
 		}
 		log.Printf("Repository %s has been added.", entry.Name)
