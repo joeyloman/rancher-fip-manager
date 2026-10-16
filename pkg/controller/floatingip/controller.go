@@ -446,6 +446,24 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta2.FloatingIP) err
 					}
 					fipCopy := currentFip.DeepCopy()
 					services := parseServicesFromLabels(currentFip.Labels)
+					if fipCopy.Status.Assigned == nil {
+						// The branch was selected from the stale informer copy, but
+						// fipCopy comes from a fresh Get: a concurrent reconcile may
+						// have cleared Status.Assigned in between (e.g. the cluster
+						// label was removed and re-added). Rebuild the full assignment
+						// from the live labels instead of dereferencing nil.
+						logrus.Infof("Status.Assigned was cleared concurrently for FIP %s/%s; rebuilding it", currentFip.Namespace, currentFip.Name)
+						var sharedKey string
+						if currentFip.Labels[floatingipGroupLabel] != "" {
+							sharedKey = fmt.Sprintf("%s-%s", currentFip.Labels["rancher.k8s.binbash.org/cluster-name"], util.GenerateRandomString(12))
+						}
+						fipCopy.Status.Assigned = &v1beta2.AssignedInfo{
+							ClusterName:     currentFip.Labels["rancher.k8s.binbash.org/cluster-name"],
+							ProjectName:     currentFip.Labels["rancher.k8s.binbash.org/project-name"],
+							FloatingIPGroup: currentFip.Labels[floatingipGroupLabel],
+							SharedKey:       sharedKey,
+						}
+					}
 					fipCopy.Status.Assigned.Services = services
 					serviceDesc := describeServices(services)
 					condition := metav1.Condition{

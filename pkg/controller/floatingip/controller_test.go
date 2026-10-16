@@ -34,6 +34,10 @@ type fixture struct {
 
 	clientset  *fake.Clientset
 	controller *Controller
+
+	// fipIndexer exposes the FIP cache so tests can plant objects that diverge
+	// from the fake clientset's tracker (simulating stale-cache races).
+	fipIndexer cache.Indexer
 }
 
 func newFixture(t *testing.T, fipObjects []runtime.Object, kubeObjects []runtime.Object) *fixture {
@@ -85,6 +89,7 @@ func newFixture(t *testing.T, fipObjects []runtime.Object, kubeObjects []runtime
 		t:          t,
 		clientset:  clientset,
 		controller: controller,
+		fipIndexer: fipInformerFactory.Rancher().V1beta2().FloatingIPs().Informer().GetIndexer(),
 	}
 }
 
@@ -636,4 +641,50 @@ func TestSyncHandler_PersistedSpecDespiteUpdateErrorKeepsClaim(t *testing.T) {
 	require.NotNil(t, updatedFip.Spec.IPAddr)
 	assert.Equal(t, persistedIP, *updatedFip.Spec.IPAddr, "the retry must converge on the persisted address, not take a new one")
 	assert.Equal(t, 1, f2.controller.ipam.Used(testPoolName), "exactly one address is in use across the ambiguous failure")
+}
+
+// The "Assigned already exists" branch is selected from the stale informer
+// copy, but the RetryOnConflict body builds its write from a fresh live Get.
+// If a preceding sync cleared Status.Assigned (cluster-name label removed) and
+// the cache has not caught up, the live copy has Assigned == nil and the bare
+// `fipCopy.Status.Assigned.Services = services` dereference panicked the whole
+// manager. The reconcile must rebuild the full assignment instead.
+func TestSyncHandler_AssignedClearedConcurrentlyDoesNotPanic(t *testing.T) {
+	clusterName := "cluster-a"
+	staleFip := newFip(testFipName, testNamespace, testPoolName)
+	staleFip.SetLabels(map[string]string{
+		projectNameLabel: testProjectName,
+		"rancher.k8s.binbash.org/cluster-name": clusterName,
+	})
+	staleFip.SetFinalizers([]string{finalizerName})
+	staleFip.Status.IPAddr = "10.0.0.10"
+	staleFip.Status.State = "Allocated"
+	staleFip.Status.Assigned = &v1beta2.AssignedInfo{
+		ClusterName: clusterName,
+		ProjectName: testProjectName,
+		Services:    []v1beta2.AssignedService{{ServiceNamespace: "old-ns", ServiceName: "old-svc"}},
+	}
+
+	pool := newPool(testPoolName, "10.0.0.10", "10.0.0.20")
+	project := newProject(testProjectName)
+
+	// The informer cache holds the stale copy (Assigned != nil); the live
+	// object in the API (tracker) has already had Status.Assigned cleared.
+	liveFip := staleFip.DeepCopy()
+	liveFip.Status.Assigned = nil
+	liveFip.ResourceVersion = "2"
+
+	f := newFixture(t, []runtime.Object{liveFip, pool, project}, nil)
+	// Replace the manually seeded indexer entry with the stale informer copy;
+	// the informer is not running, so the cache and the tracker stay diverged.
+	require.NoError(t, f.fipIndexer.Update(staleFip.DeepCopy()))
+
+	key := getKey(staleFip, t)
+	require.NoError(t, f.run(key), "the stale-copy branch must not panic on the cleared live status")
+
+	updatedFip, err := f.clientset.RancherV1beta2().FloatingIPs(testNamespace).Get(context.Background(), testFipName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, updatedFip.Status.Assigned, "the assignment must be rebuilt, not left nil")
+	assert.Equal(t, clusterName, updatedFip.Status.Assigned.ClusterName)
+	assert.Equal(t, testProjectName, updatedFip.Status.Assigned.ProjectName)
 }
