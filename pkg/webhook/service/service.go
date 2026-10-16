@@ -887,12 +887,38 @@ func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview
 	}
 }
 
+// writeMalformedAdmissionReview answers a request whose body decoded to an
+// AdmissionReview without a `request` field (REPORT.md M8): a structured
+// denial instead of a nil-pointer panic on ar.Request.Object.Raw.
+func writeMalformedAdmissionReview(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(&admissionv1.AdmissionReview{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: admissionv1.SchemeGroupVersion.String(),
+			Kind:       "AdmissionReview",
+		},
+		Response: &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Code:    http.StatusBadRequest,
+				Message: "admission review does not contain a request",
+			},
+		},
+	})
+}
+
 func (h *Handler) validateFloatingIPAdmission(w http.ResponseWriter, r *http.Request) {
 	ar := &admissionv1.AdmissionReview{}
 	if err := json.NewDecoder(r.Body).Decode(&ar); err != nil {
 		log.Errorf("cannot decode AdmissionReview to json: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "cannot decode AdmissionReview to json: %s", err)
+		return
+	}
+	if ar.Request == nil {
+		log.Errorf("admission review does not contain a request")
+		writeMalformedAdmissionReview(w)
 		return
 	}
 
@@ -931,6 +957,11 @@ func (h *Handler) validateFloatingIPPoolAdmission(w http.ResponseWriter, r *http
 		log.Errorf("cannot decode AdmissionReview to json: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "cannot decode AdmissionReview to json: %s", err)
+		return
+	}
+	if ar.Request == nil {
+		log.Errorf("admission review does not contain a request")
+		writeMalformedAdmissionReview(w)
 		return
 	}
 

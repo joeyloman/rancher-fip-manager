@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1477,4 +1479,47 @@ func TestReadyzReportsServingMaterial(t *testing.T) {
 	rec = httptest.NewRecorder()
 	h3.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// REPORT.md M8: a body that decodes into an AdmissionReview without a
+// `request` field (e.g. `{}`) must yield a structured denial, not a
+// nil-pointer panic on ar.Request.Object.Raw followed by a connection reset.
+func TestAdmissionReviewWithoutRequestIsDenied(t *testing.T) {
+	cases := []struct {
+		body     string
+		wantCode int
+	}{
+		{`{}`, http.StatusBadRequest},
+		{`{"kind":"AdmissionReview","apiVersion":"admission.k8s.io/v1"}`, http.StatusBadRequest},
+		{`{"request":null}`, http.StatusBadRequest},
+		// request present but object absent: pins the 500-vs-panic boundary —
+		// the empty ar.Request.Object.Raw must hit the unmarshal-error path.
+		{`{"request":{"uid":"x"}}`, http.StatusInternalServerError},
+	}
+	handlers := map[string]func(w http.ResponseWriter, r *http.Request){
+		"floatingip":     (&Handler{ctx: context.Background()}).validateFloatingIPAdmission,
+		"floatingippool": (&Handler{ctx: context.Background()}).validateFloatingIPPoolAdmission,
+	}
+
+	for endpoint, handler := range handlers {
+		for _, tc := range cases {
+			t.Run(endpoint+"/"+tc.body, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				handler(rec, httptest.NewRequest(http.MethodPost, "/validate-"+endpoint, strings.NewReader(tc.body)))
+
+				assert.Equal(t, tc.wantCode, rec.Code, "body %q", tc.body)
+				if tc.wantCode != http.StatusBadRequest {
+					// pre-existing plain-text error path, no AdmissionReview body
+					return
+				}
+				assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+				var review admissionv1.AdmissionReview
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &review))
+				require.NotNil(t, review.Response)
+				assert.False(t, review.Response.Allowed)
+				assert.Equal(t, int32(tc.wantCode), review.Response.Result.Code)
+			})
+		}
+	}
 }
