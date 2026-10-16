@@ -7,7 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,9 +23,11 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chartutil"
+	"helm.sh/helm/v3/pkg/helmpath"
 	"helm.sh/helm/v3/pkg/kube"
 	kubefake "helm.sh/helm/v3/pkg/kube/fake"
 	"helm.sh/helm/v3/pkg/release"
+	"helm.sh/helm/v3/pkg/repo"
 	"helm.sh/helm/v3/pkg/storage"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	corev1 "k8s.io/api/core/v1"
@@ -458,4 +465,161 @@ func TestDefaultPurgeUndecodableRecords(t *testing.T) {
 	}
 	assert.True(t, survivors["sh.helm.release.v1."+testRelease+".v1"], "compressed decodable record must survive")
 	assert.True(t, survivors["sh.helm.release.v1."+testRelease+".v2"], "legacy uncompressed decodable record must survive")
+}
+
+// minimalIndexYAML is the smallest document helm's repo.LoadIndex accepts.
+const minimalIndexYAML = "apiVersion: v1\nentries: {}\ngenerated: \"2026-01-01T00:00:00Z\"\n"
+
+// isolatedHelmSettings redirects helm's process-wide repository file and
+// index cache into the test's temp tree so tests never touch the real
+// ~/.config/helm state. AddOrUpdateChartRepo aligns the download's CachePath
+// with settings.RepositoryCache, so both the repository file and the cached
+// index land under these directories.
+func isolatedHelmSettings(t *testing.T) {
+	t.Helper()
+	t.Setenv("HELM_CONFIG_HOME", t.TempDir())
+	t.Setenv("HELM_DATA_HOME", t.TempDir())
+	t.Setenv("HELM_REPOSITORY_CONFIG", filepath.Join(t.TempDir(), "repositories.yaml"))
+	t.Setenv("HELM_REPOSITORY_CACHE", filepath.Join(t.TempDir(), "cache"))
+}
+
+// indexServer serves a valid chart-repository index and invokes hook on every
+// index request.
+func indexServer(t *testing.T, hook func(http.ResponseWriter)) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hook(w)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// writeIndex answers with a valid, empty index.
+func writeIndex(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/x-yaml")
+	fmt.Fprint(w, minimalIndexYAML)
+}
+
+// TestAddOrUpdateChartRepoDownloadsInParallelPerRepo pins the M10 fix: the
+// index download is a network call and must NOT run under the global
+// repository-file lock. Two repos with different names download through the
+// same server; the handler only succeeds once both downloads are in flight
+// simultaneously. With the old global lock the second download could not
+// start until the first returned, the barrier times out and the download
+// fails.
+func TestAddOrUpdateChartRepoDownloadsInParallelPerRepo(t *testing.T) {
+	isolatedHelmSettings(t)
+
+	var mu sync.Mutex
+	inside := 0
+	bothInFlight := make(chan struct{})
+	var once sync.Once
+
+	srv := indexServer(t, func(w http.ResponseWriter) {
+		mu.Lock()
+		inside++
+		if inside == 2 {
+			once.Do(func() { close(bothInFlight) })
+		}
+		mu.Unlock()
+
+		select {
+		case <-bothInFlight:
+		case <-time.After(10 * time.Second):
+			// The other download never started: the global lock is being
+			// held across the network call.
+			http.Error(w, "second index download never started (global lock held across network call)", http.StatusGatewayTimeout)
+			return
+		}
+		writeIndex(w)
+	})
+
+	client := NewClient()
+	names := []string{"repo-a", "repo-b"}
+	errs := make([]error, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			errs[i] = client.AddOrUpdateChartRepo(repo.Entry{Name: name, URL: srv.URL})
+		}(i, name)
+	}
+	wg.Wait()
+
+	for i, name := range names {
+		require.NoError(t, errs[i], "repo %q download failed", name)
+		_, err := os.Stat(filepath.Join(os.Getenv("HELM_REPOSITORY_CACHE"), helmpath.CacheIndexFile(name)))
+		require.NoError(t, err, "index for %q must be cached in settings.RepositoryCache", name)
+	}
+}
+
+// TestAddOrUpdateChartRepoSerializesSameRepoIndexDownload pins the companion
+// guarantee of the M10 fix: concurrent downloads of the SAME repository are
+// serialised per repo name, because helm writes the index cache with a
+// non-atomic os.WriteFile and chart resolution reads that same file.
+func TestAddOrUpdateChartRepoSerializesSameRepoIndexDownload(t *testing.T) {
+	isolatedHelmSettings(t)
+
+	var mu sync.Mutex
+	active := 0
+	overlap := false
+
+	srv := indexServer(t, func(w http.ResponseWriter) {
+		mu.Lock()
+		active++
+		if active > 1 {
+			overlap = true
+		}
+		mu.Unlock()
+
+		time.Sleep(150 * time.Millisecond) // widen the window so overlap is detectable
+
+		mu.Lock()
+		active--
+		mu.Unlock()
+		writeIndex(w)
+	})
+
+	client := NewClient()
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = client.AddOrUpdateChartRepo(repo.Entry{Name: "repo-a", URL: srv.URL})
+		}(i)
+	}
+	wg.Wait()
+
+	require.NoError(t, errs[0])
+	require.NoError(t, errs[1])
+	assert.False(t, overlap, "same-repo index downloads must not run concurrently (torn cache write risk)")
+}
+
+// TestAddOrUpdateChartRepoIndexDownloadIsBounded pins the second half of the
+// M10 fix: the index download must be bounded by repoIndexDownloadTimeout,
+// not helm's getter default of 120s (getter.DefaultHTTPTimeout). The server
+// never answers within the shrunken timeout, so the call must fail fast
+// instead of hanging for the default budget.
+func TestAddOrUpdateChartRepoIndexDownloadIsBounded(t *testing.T) {
+	isolatedHelmSettings(t)
+
+	srv := indexServer(t, func(w http.ResponseWriter) {
+		time.Sleep(2 * time.Second) // longer than the shrunken timeout
+		writeIndex(w)
+	})
+
+	client := NewClient()
+	client.repoIndexDownloadTimeout = 200 * time.Millisecond
+
+	start := time.Now()
+	err := client.AddOrUpdateChartRepo(repo.Entry{Name: "repo-a", URL: srv.URL})
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "a download past the timeout must fail, not hang")
+	assert.Less(t, elapsed, 1500*time.Millisecond,
+		"the download must fail promptly, not after helm's 120s getter default")
+	assert.Contains(t, err.Error(), "cannot be reached")
 }

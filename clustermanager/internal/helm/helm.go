@@ -83,9 +83,24 @@ type Client struct {
 	// nothing else ever removes.
 	purgeUndecodableRecords func(ctx context.Context, config *rest.Config, namespace, releaseName string) error
 	// repoLock serialises access to the process-wide on-disk repository
-	// file and index cache: repo.File.WriteFile is not atomic and the
-	// reconcile workers install the same charts for many clusters at once.
+	// file: repo.File.WriteFile is not atomic and the reconcile workers
+	// add the same repositories for many clusters at once. Held only for
+	// local-disk work, never across the index download.
 	repoLock sync.Mutex
+	// repoIndexLocks serialises index downloads per repository name. Helm
+	// writes the downloaded index to <RepositoryCache>/<name>-index.yaml
+	// with a non-atomic os.WriteFile (helm v3.20.2, pkg/repo/chartrepo.go)
+	// and chart resolution reads that same file, so two workers refreshing
+	// the same repository concurrently could tear it. Keyed per name —
+	// NOT a global lock — because the download is a network call bounded
+	// only by the Helm getter timeout: one slow or blackholed chart-repo
+	// endpoint must not stall the other reconcile workers.
+	repoIndexLocks sync.Mutex
+	repoIndexLock  map[string]*sync.Mutex
+	// repoIndexDownloadTimeout bounds each chart-repository index download.
+	// A field rather than a bare const at the call site so tests can shrink
+	// it and pin the bound; defaulted to repoIndexDownloadTimeout.
+	repoIndexDownloadTimeout time.Duration
 }
 
 // NewClient creates a new Helm client.
@@ -95,6 +110,8 @@ func NewClient() *Client {
 	c.loadChart = c.defaultLoadChart
 	c.purgeReleaseRecords = defaultPurgeReleaseRecords
 	c.purgeUndecodableRecords = defaultPurgeUndecodableRecords
+	c.repoIndexLock = map[string]*sync.Mutex{}
+	c.repoIndexDownloadTimeout = repoIndexDownloadTimeout
 	return c
 }
 
@@ -165,6 +182,12 @@ func (c *Client) defaultLoadChart(actionConfig *action.Configuration, spec Chart
 const (
 	helmOperationTimeout = 10 * time.Minute
 	helmUninstallTimeout = 2 * time.Minute
+	// repoIndexDownloadTimeout bounds each chart-repository index download
+	// in AddOrUpdateChartRepo. Helm's getter default is 120s
+	// (getter.DefaultHTTPTimeout, pkg/getter/getter.go), which lets one
+	// blackholed chart-repo endpoint stall a reconcile worker for two
+	// minutes; the index download needs no such budget.
+	repoIndexDownloadTimeout = 30 * time.Second
 )
 
 // releaseAction is the operation InstallOrUpgrade derives from the *stored*
@@ -372,15 +395,67 @@ func (c *Client) repairRelease(ctx context.Context, actionConfig *action.Configu
 }
 
 func (c *Client) AddOrUpdateChartRepo(entry repo.Entry) error {
-	// The repository file and index cache are process-wide state shared by
-	// every reconcile worker.
-	c.repoLock.Lock()
-	defer c.repoLock.Unlock()
-
 	settings := cli.New()
 
 	repoFile := settings.RepositoryConfig
 
+	// Phase 1: mutate the process-wide repository file under the global
+	// lock. Only local-disk work happens here, so the critical section
+	// stays short.
+	c.repoLock.Lock()
+	if err := c.updateRepoFile(repoFile, entry); err != nil {
+		c.repoLock.Unlock()
+		return err
+	}
+	c.repoLock.Unlock()
+
+	// Phase 2: refresh the index. This is a network call, so it runs
+	// OUTSIDE the global repository lock, serialised per repository name
+	// instead: one slow or blackholed chart-repo endpoint must not block
+	// the other reconcile workers. The download itself is bounded by
+	// repoIndexDownloadTimeout — helm's getter default of 120s would let
+	// one blackholed endpoint eat two minutes of worker time per attempt.
+	cr, err := repo.NewChartRepository(&entry, getter.All(settings, getter.WithTimeout(c.repoIndexDownloadTimeout)))
+	if err != nil {
+		return err
+	}
+	// NewChartRepository hardcodes CachePath to helmpath.CachePath
+	// ("repository") and ignores settings.RepositoryCache
+	// (HELM_REPOSITORY_CACHE); every helm caller overrides it
+	// (pkg/downloader/manager.go), because chart resolution
+	// (ChartDownloader.ResolveChartVersion) reads the index from
+	// settings.RepositoryCache. Without the override the two paths only
+	// coincide while HELM_REPOSITORY_CACHE is unset.
+	cr.CachePath = settings.RepositoryCache
+
+	indexLock := c.indexLockFor(entry.Name)
+	indexLock.Lock()
+	defer indexLock.Unlock()
+
+	if _, err := cr.DownloadIndexFile(); err != nil {
+		return errors.Wrapf(err, "looks like %q is not a valid chart repository or cannot be reached", entry.URL)
+	}
+	log.Printf("Successfully got an update from the %q chart repository", entry.Name)
+
+	return nil
+}
+
+// indexLockFor returns the download lock for one repository name.
+func (c *Client) indexLockFor(name string) *sync.Mutex {
+	c.repoIndexLocks.Lock()
+	defer c.repoIndexLocks.Unlock()
+
+	l, ok := c.repoIndexLock[name]
+	if !ok {
+		l = &sync.Mutex{}
+		c.repoIndexLock[name] = l
+	}
+	return l
+}
+
+// updateRepoFile adds the repository entry to the on-disk repository file if
+// it is not present yet. Callers must hold c.repoLock.
+func (c *Client) updateRepoFile(repoFile string, entry repo.Entry) error {
 	// Ensure the directory for the repository file exists.
 	if err := os.MkdirAll(filepath.Dir(repoFile), 0755); err != nil {
 		return err
@@ -406,17 +481,6 @@ func (c *Client) AddOrUpdateChartRepo(entry repo.Entry) error {
 	} else {
 		log.Printf("Repository %s already exists.", entry.Name)
 	}
-
-	// Update the repo
-	cr, err := repo.NewChartRepository(&entry, getter.All(settings))
-	if err != nil {
-		return err
-	}
-	if _, err := cr.DownloadIndexFile(); err != nil {
-		return errors.Wrapf(err, "looks like %q is not a valid chart repository or cannot be reached", entry.URL)
-	}
-	log.Printf("Successfully got an update from the %q chart repository", entry.Name)
-
 	return nil
 }
 
