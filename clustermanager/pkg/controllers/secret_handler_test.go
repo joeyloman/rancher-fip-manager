@@ -310,3 +310,282 @@ func TestHandleFloatingIPProjectQuotaDelete_graceExpiredReleasesFinalizerOnDowns
 		assert.True(t, apierrors.IsNotFound(err), "unexpected error: %v", err)
 	}
 }
+
+func downstreamConfigSecretData(apiURL, clientSecret, cluster, project, pool, lbType string) map[string][]byte {
+	return map[string][]byte{
+		"apiUrl":           []byte(apiURL),
+		"cluster":          []byte(cluster),
+		"clientSecret":     []byte(clientSecret),
+		"project":          []byte(project),
+		"floatingIPPool":   []byte(pool),
+		"loadBalancerType": []byte(lbType),
+	}
+}
+
+// TestHandleConfigSecrets_reconcilesDriftedDownstreamSecret pins the M12 fix:
+// the downstream config secret must follow the local clientSecret (lost and
+// regenerated local secret) and the current apiUrl/pool/LB-type instead of
+// being skipped forever with its stale values.
+func TestHandleConfigSecrets_reconcilesDriftedDownstreamSecret(t *testing.T) {
+	scheme := newTestScheme(t)
+	cfg := newTestConfig()
+	project := &managementv3.Project{ObjectMeta: metav1.ObjectMeta{Name: "p-drift", Namespace: "c-test1"}}
+
+	local := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-drift", Namespace: "c-test1"},
+			Data: map[string][]byte{
+				"clientSecret": []byte("new-secret"),
+				"project":      []byte("p-drift"),
+			},
+		},
+	).Build()
+	// Downstream copy still carries the pre-regeneration clientSecret and an
+	// old api-server URL.
+	downstream := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-drift", Namespace: "rancher-fip-manager"},
+			Data:       downstreamConfigSecretData("https://old.example/v1", "old-secret", "c-test1", "p-drift", "net", "purelb"),
+		},
+	).Build()
+
+	res, err := HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "metallb", nil, "",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	var updated corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "rancher-fip-config-p-drift", Namespace: cfg.RancherFipLBControllerNamespace}, &updated))
+	assert.Equal(t, []byte("new-secret"), updated.Data["clientSecret"], "stale downstream clientSecret must be reconciled to the local value")
+	assert.Equal(t, []byte(cfg.RancherFipApiServerURL), updated.Data["apiUrl"], "stale apiUrl must be reconciled")
+	assert.Equal(t, []byte("metallb"), updated.Data["loadBalancerType"], "stale loadBalancerType must be reconciled")
+	assert.Equal(t, []byte("net"), updated.Data["floatingIPPool"])
+
+	// The local secret keeps its clientSecret.
+	var localSecret corev1.Secret
+	require.NoError(t, local.Get(context.Background(), types.NamespacedName{Name: "rancher-fip-config-p-drift", Namespace: "c-test1"}, &localSecret))
+	assert.Equal(t, []byte("new-secret"), localSecret.Data["clientSecret"])
+}
+
+// TestHandleConfigSecrets_leavesUpToDateDownstreamSecretUntouched ensures the
+// reconciliation is read-compare-write: an in-sync downstream secret is not
+// rewritten on every reconcile pass.
+func TestHandleConfigSecrets_leavesUpToDateDownstreamSecretUntouched(t *testing.T) {
+	scheme := newTestScheme(t)
+	cfg := newTestConfig()
+	project := &managementv3.Project{ObjectMeta: metav1.ObjectMeta{Name: "p-sync", Namespace: "c-test1"}}
+
+	local := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-sync", Namespace: "c-test1"},
+			Data: map[string][]byte{
+				"clientSecret": []byte("same-secret"),
+				"project":      []byte("p-sync"),
+			},
+		},
+	).Build()
+	downstream := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-sync", Namespace: cfg.RancherFipLBControllerNamespace},
+			Data:       downstreamConfigSecretData(cfg.RancherFipApiServerURL, "same-secret", "c-test1", "p-sync", "net", "purelb"),
+		},
+	).Build()
+
+	var before corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "rancher-fip-config-p-sync", Namespace: cfg.RancherFipLBControllerNamespace}, &before))
+
+	res, err := HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", nil, "",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	var after corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "rancher-fip-config-p-sync", Namespace: cfg.RancherFipLBControllerNamespace}, &after))
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "an in-sync downstream secret must not be rewritten")
+}
+
+// TestHandleConfigSecrets_reconcilesRotatedCACerts pins the second half of M12:
+// a rotated CA must propagate into an existing downstream cacerts secret.
+func TestHandleConfigSecrets_reconcilesRotatedCACerts(t *testing.T) {
+	scheme := newTestScheme(t)
+	cfg := newTestConfig()
+	project := &managementv3.Project{ObjectMeta: metav1.ObjectMeta{Name: "p-ca", Namespace: "c-test1"}}
+
+	local := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-ca", Namespace: "c-test1"},
+			Data: map[string][]byte{
+				"clientSecret": []byte("secret"),
+				"project":      []byte("p-ca"),
+			},
+		},
+	).Build()
+	downstream := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-ca", Namespace: cfg.RancherFipLBControllerNamespace},
+			Data:       downstreamConfigSecretData(cfg.RancherFipApiServerURL, "secret", "c-test1", "p-ca", "net", "purelb"),
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace},
+			Data:       map[string][]byte{"ca.crt": []byte("old-ca")},
+		},
+	).Build()
+
+	res, err := HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", []byte("new-ca"), "",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	var cacerts corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace}, &cacerts))
+	assert.Equal(t, []byte("new-ca"), cacerts.Data["ca.crt"], "rotated CA must propagate downstream")
+
+	// Same CA again: no rewrite.
+	var before corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace}, &before))
+	_, err = HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", []byte("new-ca"), "",
+	)
+	require.NoError(t, err)
+	var after corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace}, &after))
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "an in-sync cacerts secret must not be rewritten")
+}
+
+// TestHandleConfigSecrets_regeneratesEmptyLocalClientSecret covers the corrupt
+// local secret: without the guard the reconcile would overwrite a working
+// downstream clientSecret with an empty one.
+func TestHandleConfigSecrets_regeneratesEmptyLocalClientSecret(t *testing.T) {
+	scheme := newTestScheme(t)
+	cfg := newTestConfig()
+	project := &managementv3.Project{ObjectMeta: metav1.ObjectMeta{Name: "p-empty", Namespace: "c-test1"}}
+
+	local := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-empty", Namespace: "c-test1"},
+			Data:       map[string][]byte{"project": []byte("p-empty")},
+		},
+	).Build()
+	downstream := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-empty", Namespace: cfg.RancherFipLBControllerNamespace},
+			Data:       downstreamConfigSecretData(cfg.RancherFipApiServerURL, "old-secret", "c-test1", "p-empty", "net", "purelb"),
+		},
+	).Build()
+
+	res, err := HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", nil, "",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	var localSecret corev1.Secret
+	require.NoError(t, local.Get(context.Background(), types.NamespacedName{Name: "rancher-fip-config-p-empty", Namespace: "c-test1"}, &localSecret))
+	regenerated := string(localSecret.Data["clientSecret"])
+	assert.NotEmpty(t, regenerated, "corrupt local secret must be regenerated, not propagated as empty")
+
+	var downstreamSecret corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "rancher-fip-config-p-empty", Namespace: cfg.RancherFipLBControllerNamespace}, &downstreamSecret))
+	assert.Equal(t, regenerated, string(downstreamSecret.Data["clientSecret"]), "downstream secret must follow the regenerated clientSecret")
+}
+
+// TestHandleConfigSecrets_rotatedLocalCAIsObservedOnNextPass pins the CA
+// source fix: the local cacerts secret is re-read (uncached) on every pass,
+// so a CA rotated after the clustermanager started propagates downstream on
+// the next reconcile instead of requiring a pod restart.
+func TestHandleConfigSecrets_rotatedLocalCAIsObservedOnNextPass(t *testing.T) {
+	scheme := newTestScheme(t)
+	cfg := newTestConfig()
+	appNamespace := "rancher-fip-manager"
+	project := &managementv3.Project{ObjectMeta: metav1.ObjectMeta{Name: "p-rot", Namespace: "c-test1"}}
+
+	local := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-rot", Namespace: "c-test1"},
+			Data: map[string][]byte{
+				"clientSecret": []byte("secret"),
+				"project":      []byte("p-rot"),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "cacerts", Namespace: appNamespace},
+			Data:       map[string][]byte{"ca.crt": []byte("ca-v1")},
+		},
+	).Build()
+	downstream := fake.NewClientBuilder().WithScheme(scheme).WithObjects().Build()
+
+	// Pass 1: no startup snapshot needed, the local secret is the source.
+	res, err := HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", nil, appNamespace,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	var cacerts corev1.Secret
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace}, &cacerts))
+	assert.Equal(t, []byte("ca-v1"), cacerts.Data["ca.crt"], "first pass must propagate the local CA")
+
+	// Rotate the local CA between passes.
+	var localCacerts corev1.Secret
+	require.NoError(t, local.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: appNamespace}, &localCacerts))
+	localCacerts.Data = map[string][]byte{"ca.crt": []byte("ca-v2")}
+	require.NoError(t, local.Update(context.Background(), &localCacerts))
+
+	res, err = HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", []byte("stale-startup-snapshot"), appNamespace,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	require.NoError(t, downstream.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace}, &cacerts))
+	assert.Equal(t, []byte("ca-v2"), cacerts.Data["ca.crt"], "a rotated local CA must propagate; the stale startup snapshot must be ignored")
+}
+
+// TestHandleConfigSecrets_deletedLocalCAStopsPropagation pins the fallback
+// semantics: a locally deleted cacerts secret stops the CA propagation
+// instead of resurrecting the startup snapshot downstream.
+func TestHandleConfigSecrets_deletedLocalCAStopsPropagation(t *testing.T) {
+	scheme := newTestScheme(t)
+	cfg := newTestConfig()
+	appNamespace := "rancher-fip-manager"
+	project := &managementv3.Project{ObjectMeta: metav1.ObjectMeta{Name: "p-del", Namespace: "c-test1"}}
+
+	local := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-del", Namespace: "c-test1"},
+			Data: map[string][]byte{
+				"clientSecret": []byte("secret"),
+				"project":      []byte("p-del"),
+			},
+		},
+	).Build()
+	downstream := fake.NewClientBuilder().WithScheme(scheme).WithObjects().Build()
+
+	res, err := HandleConfigSecrets(
+		context.Background(), local, local, downstream,
+		cfg.RancherFipLBControllerNamespace, project, "c-test1", "net",
+		cfg.RancherFipApiServerURL, "c-test1", "purelb", []byte("stale-startup-snapshot"), appNamespace,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+
+	err = downstream.Get(context.Background(), types.NamespacedName{Name: "cacerts", Namespace: cfg.RancherFipLBControllerNamespace}, &corev1.Secret{})
+	assert.True(t, apierrors.IsNotFound(err), "a deleted local cacerts secret must not propagate the startup snapshot")
+}

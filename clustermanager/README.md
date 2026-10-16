@@ -145,7 +145,9 @@ data:
 
 ### Optional CA certificates propagation
 
-If a `Secret` named `cacerts` exists in the application namespace with key `ca.crt`, the controller will propagate this secret to each downstream cluster in the target namespace (matching `RancherFipLBControllerNamespace`). This allows components to trust a private CA used by the FIP API.
+If a `Secret` named `cacerts` exists in the application namespace with key `ca.crt`, the controller propagates this secret to each downstream cluster in the target namespace (matching `RancherFipLBControllerNamespace`). This allows components to trust a private CA used by the FIP API.
+
+The downstream copy is reconciled on every provisioning pass: a drifted or hand-deleted `cacerts` secret is repaired, and the local `cacerts` secret is re-read (uncached, directly from the API server) on each pass, so a rotated CA propagates downstream on the next reconcile without a clustermanager restart. Deleting the local `cacerts` secret stops further propagation; existing downstream copies are not deleted.
 
 ### Network interface mappings
 

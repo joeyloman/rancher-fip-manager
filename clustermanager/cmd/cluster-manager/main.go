@@ -245,6 +245,7 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 
 	if err = (&controllers.ClusterProvisioningReconciler{
 		Client:       mgr.GetClient(),
+		APIReader:    mgr.GetAPIReader(),
 		Scheme:       mgr.GetScheme(),
 		HelmClient:   helm.NewClient(),
 		Config:       appConfig,
@@ -258,6 +259,7 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 
 	if err = (&controllers.FloatingIPProjectQuotaReconciler{
 		Client:       mgr.GetClient(),
+		APIReader:    mgr.GetAPIReader(),
 		Scheme:       mgr.GetScheme(),
 		Config:       appConfig,
 		AppNamespace: appNamespace,

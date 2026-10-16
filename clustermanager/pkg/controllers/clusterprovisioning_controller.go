@@ -32,6 +32,10 @@ import (
 // ClusterProvisioningReconciler reconciles a managementv3.Cluster object.
 type ClusterProvisioningReconciler struct {
 	client.Client
+	// APIReader reads directly from the API server, bypassing the informer
+	// cache. Used for credential material (config secret, CA bundle) that
+	// must not be reconciled from a stale snapshot.
+	APIReader client.Reader
 	// Scheme is the scheme for the controller.
 	Scheme *runtime.Scheme
 	// HelmClient is the Helm client for installing and upgrading charts.
@@ -552,7 +556,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	if result, err := HandleConfigSecrets(
-		ctx, r.Client,
+		ctx, r.APIReader, r.Client,
 		downstreamClient,
 		r.Config.RancherFipLBControllerNamespace,
 		&project,
@@ -562,6 +566,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		cluster.Name,
 		loadBalancerType,
 		r.Config.CaCrt,
+		r.AppNamespace,
 	); err != nil {
 		return result, err
 	}
