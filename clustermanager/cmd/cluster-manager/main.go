@@ -132,6 +132,15 @@ func main() {
 		},
 	}
 
+	// runStart carries the cancel func of the running controller once it is
+	// up; runDone closes when run() returned (mgr.Start finished its
+	// graceful shutdown). OnStoppedLeading uses them to stop the manager
+	// cleanly instead of killing it mid-reconcile. client-go releases the
+	// lease (ReleaseOnCancel) before OnStoppedLeading runs, so the drain
+	// does not delay failover.
+	runStart := make(chan context.CancelFunc, 1)
+	runDone := make(chan struct{})
+
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
@@ -140,11 +149,19 @@ func main() {
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				run(ctx, cfg, appNamespace)
+				// client-go cancels this context itself when the lease is
+				// lost or the parent context is done (Run's deferred cancel
+				// runs before OnStoppedLeading); the cancel handed over via
+				// runStart is belt-and-braces so the drain works regardless
+				// of client-go's internal ordering.
+				runCtx, cancel := context.WithCancel(ctx)
+				runStart <- cancel
+				defer close(runDone)
+				run(runCtx, cfg, appNamespace)
 			},
 			OnStoppedLeading: func() {
 				logrus.Infof("leader lost: %s", id)
-				os.Exit(0)
+				drainAndExit(runStart, runDone)
 			},
 			OnNewLeader: func(identity string) {
 				if identity == id {
@@ -169,6 +186,14 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 	// Get the configmap
 	configMap, err := clientset.CoreV1().ConfigMaps(appNamespace).Get(ctx, "rancher-fip-config", metav1.GetOptions{})
 	if err != nil {
+		// A cancelled context means shutdown raced startup (e.g. leader
+		// loss before the manager came up): return instead of Fatal so the
+		// process exits through the leader-loss drain with the lease
+		// released, instead of os.Exit(1) while still holding the lease.
+		if ctx.Err() != nil {
+			logrus.Infof("(main) shutdown during startup, aborting: %v", ctx.Err())
+			return
+		}
 		logrus.Fatalf("error getting configmap: %s", err.Error())
 	}
 
@@ -196,6 +221,10 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 	caCerts, err := clientset.CoreV1().Secrets(appNamespace).Get(ctx, "cacerts", metav1.GetOptions{})
 	if err != nil {
 		if !errors.IsNotFound(err) {
+			if ctx.Err() != nil {
+				logrus.Infof("(main) shutdown during startup, aborting: %v", ctx.Err())
+				return
+			}
 			logrus.Fatalf("Failed to get cacerts secret: %v", err)
 		}
 		logrus.Infof("cacerts secret not found, continuing without custom CA")
@@ -239,6 +268,43 @@ func run(ctx context.Context, cfg *rest.Config, appNamespace string) {
 	logrus.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
 		logrus.Fatalf("problem running manager: %s", err.Error())
+	}
+}
+
+// gracefulDrainTimeout bounds how long OnStoppedLeading waits for the
+// controller drain. It must stay below the pod terminationGracePeriod (30s
+// kubelet default), or the SIGTERM path ends in SIGKILL anyway.
+const gracefulDrainTimeout = 20 * time.Second
+
+// drainAndExit cancels the running manager's context and waits a bounded
+// grace period for mgr.Start's graceful shutdown (in-flight reconciles are
+// aborted via their cancelled context; the helm status plan repairs any
+// leftover pending-* release records on the next leader), then exits. If
+// leadership was never acquired, there is nothing to drain and it exits
+// immediately.
+func drainAndExit(runStart <-chan context.CancelFunc, runDone <-chan struct{}) {
+	drainRun(runStart, runDone, gracefulDrainTimeout)
+	os.Exit(0)
+}
+
+// drainRun cancels the manager via the cancel func received on runStart and
+// waits up to grace for runDone. It reports whether the drain completed
+// (also true when leadership was never acquired, i.e. nothing to drain).
+func drainRun(runStart <-chan context.CancelFunc, runDone <-chan struct{}, grace time.Duration) bool {
+	select {
+	case cancel := <-runStart:
+		cancel()
+		select {
+		case <-runDone:
+			logrus.Info("graceful drain complete")
+			return true
+		case <-time.After(grace):
+			logrus.Errorf("graceful drain timed out after %s, exiting anyway", grace)
+			return false
+		}
+	default:
+		// Never started leading; nothing to drain.
+		return true
 	}
 }
 

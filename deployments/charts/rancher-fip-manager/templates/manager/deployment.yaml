@@ -41,6 +41,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       dnsPolicy: ClusterFirst
+      # Must stay above the 20s gracefulDrainTimeout in cmd/manager/main.go,
+      # or the SIGTERM drain path ends in SIGKILL.
+      terminationGracePeriodSeconds: 30
       {{- with .Values.manager.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
