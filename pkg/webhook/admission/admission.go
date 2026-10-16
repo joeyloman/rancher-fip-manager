@@ -17,7 +17,8 @@ import (
 // invisibly. Pin the intent in the object: Fail is deliberate — an
 // unreachable webhook must not wave through FloatingIP/Pool writes that
 // would double-allocate — and the 10s timeout is the bound the webhook's
-// own request path (including its quota-sleep) must fit inside.
+// own request path (pool/quota Gets plus the bounded live FloatingIP
+// list) must fit inside.
 const (
 	admissionTimeoutSeconds int32 = 10
 )

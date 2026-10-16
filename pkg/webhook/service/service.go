@@ -102,16 +102,46 @@ func Register(ctx context.Context) *Handler {
 	}
 }
 
-// quotaGuardSleep is the per-admission quota-race guard sleep (its
-// effectiveness is tracked separately in REPORT.md M7); a var so tests can
-// disable it.
-var quotaGuardSleep = 2 * time.Second
-
 // poolAdmissionLocks serializes the duplicate-IP decision per
 // FloatingIPPool (REPORT.md M6): two concurrent CREATEs of the same
 // spec.ipAddr must not interleave their duplicate checks. The lock covers
-// the check only — never the quota sleep or the response write.
+// the check only — never the response write.
 var poolAdmissionLocks sync.Map // pool name -> *sync.Mutex
+
+// quotaAdmissionLocks serializes the quota decision per project/pool
+// (REPORT.md M7): N concurrent creates for one project must not all read
+// the same usage and all fit under the quota. All quotaReservations
+// access happens while the matching lock is held.
+var quotaAdmissionLocks sync.Map // "project/pool" -> *sync.Mutex
+
+// quotaReservations closes the concurrent-create window on the quota
+// side: the live FloatingIP list only counts CRs after they persist, but
+// an admitted CREATE occupies a quota slot from the moment the response
+// is written. Each allowed admission appends an expiry; liveQuotaUsage
+// pairs persisted not-yet-allocated CRs off against reservations, so the
+// TTL only bounds admissions whose CR never persisted (allowed response
+// lost to an apiserver failure) — the normal path is counted exactly
+// once. Per-process: a second webhook replica's in-flight creates are
+// covered by the live pending count once they persist.
+var quotaReservations sync.Map // "project/pool" -> *[]time.Time (expiries)
+
+const (
+	ipReservationTTL = 5 * time.Second
+	// Bounds the live FloatingIP list while the per-pool mutex is held:
+	// an unbounded list call would head-of-line-block every other
+	// admission for the pool (REPORT.md M6 review).
+	ipClaimListTimeout = 3 * time.Second
+	// How long an allowed admission counts toward quota usage if its CR
+	// never becomes visible in the live list. The normal path is paired
+	// off against the persisted pending CR (see liveQuotaUsage), so this
+	// only bounds the false count of an admission whose create failed
+	// after the webhook allowed it; it must comfortably cover apiserver
+	// persistence latency.
+	quotaReservationTTL = 5 * time.Second
+	// Matches the label the manager's quota controller keys projects on
+	// (pkg/controller/floatingipprojectquota/controller.go).
+	projectNameLabel = "rancher.k8s.binbash.org/project-name"
+)
 
 // ipReservations closes the residual concurrent-CREATE window: the per-pool
 // mutex is released before the admitted CR is persisted, so two
@@ -122,23 +152,55 @@ var poolAdmissionLocks sync.Map // pool name -> *sync.Mutex
 // quota check or the create fails, since there is no hook to clear it.
 var ipReservations sync.Map // "pool/canonicalIP" -> time.Time (expiry)
 
-const (
-	ipReservationTTL = 5 * time.Second
-	// Bounds the live FloatingIP list while the per-pool mutex is held:
-	// an unbounded list call would head-of-line-block every other
-	// admission for the pool (REPORT.md M6 review).
-	ipClaimListTimeout = 3 * time.Second
-)
-
-func lockPoolForAdmission(pool string) func() {
-	if pool == "" {
+func lockAdmission(m *sync.Map, key string) func() {
+	if key == "" {
 		return func() {}
 	}
-	v, _ := poolAdmissionLocks.LoadOrStore(pool, &sync.Mutex{})
+	v, _ := m.LoadOrStore(key, &sync.Mutex{})
 	mu := v.(*sync.Mutex)
 	mu.Lock()
 
 	return mu.Unlock
+}
+
+func lockPoolForAdmission(pool string) func() {
+	return lockAdmission(&poolAdmissionLocks, pool)
+}
+
+func lockQuotaForAdmission(key string) func() {
+	return lockAdmission(&quotaAdmissionLocks, key)
+}
+
+// activeQuotaReservations returns the number of unexpired admissions
+// counted against the key, pruning expired entries. Callers must hold the
+// per-key quota lock.
+func activeQuotaReservations(key string) int {
+	v, ok := quotaReservations.Load(key)
+	if !ok {
+		return 0
+	}
+	expiries := v.(*[]time.Time)
+	now := time.Now()
+	active := make([]time.Time, 0, len(*expiries))
+	count := 0
+	for _, expiry := range *expiries {
+		if now.Before(expiry) {
+			active = append(active, expiry)
+			count++
+		}
+	}
+	*expiries = active
+
+	return count
+}
+
+// takeQuotaReservation records an allowed admission as a pending quota
+// consumer for quotaReservationTTL. Callers must hold the per-key quota
+// lock.
+func takeQuotaReservation(key string) {
+	v, _ := quotaReservations.LoadOrStore(key, &[]time.Time{})
+	expiries := v.(*[]time.Time)
+	*expiries = append(*expiries, time.Now().Add(quotaReservationTTL))
 }
 
 // checkIPNotInUse returns a denial when the requested IP is already claimed,
@@ -287,6 +349,89 @@ func checkIPNotInUse(ctx context.Context, dynamic dynamic.Interface, ar *admissi
 	ipReservations.Store(reservationKey, time.Now().Add(ipReservationTTL))
 
 	return nil
+}
+
+// liveQuotaUsage computes a project/pool's quota usage from live cluster
+// state instead of the asynchronously updated quota.status (REPORT.md M7).
+// A CR occupies a slot when it carries the project label and targets the
+// pool, and either holds a status.ipAddr (allocated — including
+// terminating CRs, whose release happens in reconcileDelete just before
+// finalizer removal, and Error-state CRs that still hold their IP) or is
+// persisted and still waiting for the manager controller to grant one
+// (pending — a failed allocation, Error state without status.ipAddr,
+// holds nothing and must not block retries). This mirrors — and under
+// cache lag improves on — the manager's Used computation
+// (pkg/controller/floatingipprojectquota/controller.go).
+//
+// Reservations close the pre-persist window: an admitted CREATE occupies
+// a slot from the moment the webhook responds, before the CR is visible
+// in the list. Reservations are paired off against the occupying CRs
+// (allocated or pending) that appeared within the reservation TTL — on
+// one replica every such CR still has its live reservation — so an
+// in-flight create is counted exactly once: never twice once its CR
+// persists and is granted, never zero between the response and the
+// persist. Aged occupying CRs (manager backlog) never had a live
+// reservation and do not mask one. Reservations whose CR never became
+// visible (response lost after allowing) count alone until they expire.
+// The object under update is excluded: same-pool updates never reach the
+// quota check unless the CR holds no slot (errored, never granted), and
+// a pool-change update's current slot sits under the old pool.
+func liveQuotaUsage(ctx context.Context, dynamic dynamic.Interface, projectID string, poolName string, fip *rfmv2.FloatingIP) (int, error) {
+	fipListGVR := schema.GroupVersionResource{
+		Group:    "rancher.k8s.binbash.org",
+		Version:  "v1beta2",
+		Resource: "floatingips",
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, ipClaimListTimeout)
+	defer cancel()
+
+	fips, err := dynamic.Resource(fipListGVR).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+
+	recentCutoff := time.Now().Add(-quotaReservationTTL)
+	allocated, pending, recent := 0, 0, 0
+	for _, item := range fips.Items {
+		var existing rfmv2.FloatingIP
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, &existing); err != nil {
+			continue
+		}
+		if existing.Name == fip.Name && existing.Namespace == fip.Namespace {
+			continue
+		}
+		if existing.Spec.FloatingIPPool != poolName || existing.Labels[projectNameLabel] != projectID {
+			continue
+		}
+		occupies := false
+		if existing.Status.IPAddr != "" {
+			allocated++
+			occupies = true
+		} else if existing.Status.State != "Error" {
+			// Persisted and still waiting for the manager controller to
+			// grant an IP: it is about to hold a slot, so it counts now.
+			// (A genuinely stuck pending CR requires a wedged controller,
+			// which fails every allocation anyway.)
+			pending++
+			occupies = true
+		}
+		// A reservation can only have turned into a visible CR that
+		// appeared within the reservation's lifetime; an aged occupying
+		// CR (manager backlog) never had a live reservation to consume
+		// and must not mask one.
+		if occupies && existing.CreationTimestamp.Time.After(recentCutoff) {
+			recent++
+		}
+	}
+
+	reservations := activeQuotaReservations(projectID + "/" + poolName)
+	unpaired := reservations - recent
+	if unpaired < 0 {
+		unpaired = 0
+	}
+
+	return allocated + pending + unpaired, nil
 }
 
 func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admissionv1.AdmissionReview, fip *rfmv2.FloatingIP, oldFIP *rfmv2.FloatingIP, h *Handler) *admissionv1.AdmissionResponse {
@@ -466,23 +611,39 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		}
 	}
 
-	// Skip quota check if the IP address hasn't changed during an update
-	// For auto-assignment (IPAddr is nil), we still need to check quota
+	// Skip the quota check when the admission cannot change the project's
+	// occupancy for the pool: a same-pool update keeps the CR's existing
+	// slot (one CR holds one slot regardless of which IP it carries), and
+	// the IP-unchanged update is its special case. The slot was
+	// quota-checked when it was acquired; re-checking here would
+	// self-deny the controller's spec rewrite of a just-created pinned IP
+	// against its own create's reservation at a full quota. An errored CR
+	// with empty status.ipAddr holds NO slot (the grant path failed
+	// before any claim), so re-reconciling it can occupy one and must be
+	// quota-checked.
 	shouldCheckQuota := true
-	if isUpdate && oldFIP != nil && fip.Spec.IPAddr != nil {
-		allocatedIP := *fip.Spec.IPAddr
-		if oldFIP.Status.IPAddr == allocatedIP {
+	if isUpdate && oldFIP != nil {
+		erroredWithoutSlot := oldFIP.Status.IPAddr == "" && oldFIP.Status.State == "Error"
+		if fip.Spec.IPAddr != nil && oldFIP.Status.IPAddr == *fip.Spec.IPAddr {
+			shouldCheckQuota = false
+		} else if oldFIP.Spec.FloatingIPPool == fip.Spec.FloatingIPPool && !erroredWithoutSlot {
 			shouldCheckQuota = false
 		}
 	}
 
 	if shouldCheckQuota {
 		// 3. Project Quota Enforcement
+		//
+		// The decision is serialized per project/pool and computed from
+		// the live FloatingIP list, not from quota.status (REPORT.md M7):
+		// the manager controller updates Used asynchronously, so the
+		// former fixed 2s sleep burned admission budget on every
+		// quota-checked request while N concurrent creates still all read
+		// the same stale count and all fit under the quota.
+		projectID := fip.ObjectMeta.Labels[projectNameLabel]
 
-		// This sleep prevents Quota usage race conditions when creating multiple FloatingIPs in a short period of time
-		time.Sleep(quotaGuardSleep)
-
-		projectID := fip.ObjectMeta.Labels["rancher.k8s.binbash.org/project-name"]
+		unlockQuota := lockQuotaForAdmission(projectID + "/" + fip.Spec.FloatingIPPool)
+		defer unlockQuota()
 
 		plbcGVR := schema.GroupVersionResource{
 			Group:    "rancher.k8s.binbash.org",
@@ -527,10 +688,18 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 			}
 		}
 
-		// Check the current usage for that pool
-		usage := 0
-		if fipInfo, ok := plbc.Status.FloatingIPs[fip.Spec.FloatingIPPool]; ok {
-			usage = fipInfo.Used
+		// Check the current usage for that pool from live state; the
+		// asynchronously written quota.status Used is not consulted.
+		usage, err := liveQuotaUsage(ctx, dynamic, projectID, fip.Spec.FloatingIPPool, fip)
+		if err != nil {
+			log.Errorf("failed to compute live quota usage for project %s: %s", projectID, err)
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("failed to verify quota usage for floatingippool %s in project %s", fip.Spec.FloatingIPPool, projectID),
+				},
+			}
 		}
 
 		if usage >= quota {
@@ -541,6 +710,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 					Message: fmt.Sprintf("quota exceeded for floatingippool %s in project %s. Quota: %d, Used: %d", fip.Spec.FloatingIPPool, projectID, quota, usage),
 				},
 			}
+		}
+
+		// Reserve a quota slot for this admission unless occupancy cannot
+		// change: a same-pool update keeps the CR's existing slot, and
+		// that slot was quota-checked when it was acquired (create or
+		// pool change). Covers the window before the CR persists, so a
+		// burst of creates sees each other instead of all reading the
+		// same count (REPORT.md M7).
+		if !isUpdate || oldFIP == nil || oldFIP.Spec.FloatingIPPool != fip.Spec.FloatingIPPool {
+			takeQuotaReservation(projectID + "/" + fip.Spec.FloatingIPPool)
 		}
 	}
 

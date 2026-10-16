@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,8 +27,26 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
 )
+
+// clearAdmissionState wipes the package-global in-process admission
+// reservations between tests and subtests: an allow in one test otherwise
+// leaks a quota/IP reservation into the next test's decision for the TTL.
+func clearAdmissionState() {
+	ipReservations.Range(func(key, _ any) bool {
+		ipReservations.Delete(key)
+
+		return true
+	})
+	quotaReservations.Range(func(key, _ any) bool {
+		quotaReservations.Delete(key)
+
+		return true
+	})
+}
 
 func TestValidateFloatingIP(t *testing.T) {
 	ipAddr := "192.168.1.100"
@@ -225,9 +244,30 @@ func TestValidateFloatingIP(t *testing.T) {
 					Status: rfmv2.FloatingIPProjectQuotaStatus{
 						FloatingIPs: map[string]*rfmv2.FipInfo{
 							"test-pool": {
-								Used: 1, // quota is 1
+								Used: 1, // ignored: usage comes from the live CR below
 							},
 						},
+					},
+				},
+			},
+			// The pool's only slot is held by a live CR: usage is computed
+			// from live state, not quota.status (REPORT.md M7).
+			existingFIPs: []runtime.Object{
+				&rfmv2.FloatingIP{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "rancher.k8s.binbash.org/v1beta2",
+						Kind:       "FloatingIP",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "other-fip",
+						Namespace: "default",
+						Labels:    fip.Labels,
+					},
+					Spec: rfmv2.FloatingIPSpec{
+						FloatingIPPool: "test-pool",
+					},
+					Status: rfmv2.FloatingIPStatus{
+						IPAddr: "192.168.1.50",
 					},
 				},
 			},
@@ -273,6 +313,8 @@ func TestValidateFloatingIP(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			clearAdmissionState()
+
 			ar := &admissionv1.AdmissionReview{
 				Request: &admissionv1.AdmissionRequest{
 					UID: "test-uid",
@@ -305,10 +347,6 @@ func TestValidateFloatingIP(t *testing.T) {
 // spec.ipAddr used to both pass while both statuses were still empty. The
 // decision is additionally serialized per pool via lockPoolForAdmission.
 func TestValidateFloatingIPDuplicateIPRace(t *testing.T) {
-	oldSleep := quotaGuardSleep
-	quotaGuardSleep = 0
-	t.Cleanup(func() { quotaGuardSleep = oldSleep })
-
 	ipAddr := "192.168.1.100"
 
 	fipPool := &rfmv2.FloatingIPPool{
@@ -511,11 +549,7 @@ func TestValidateFloatingIPDuplicateIPRace(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Reservations taken by an earlier subtest must not leak in.
-			ipReservations.Range(func(key, _ any) bool {
-				ipReservations.Delete(key)
-
-				return true
-			})
+			clearAdmissionState()
 
 			pool := tc.pool
 			if pool == nil {
@@ -555,11 +589,7 @@ func TestValidateFloatingIPDuplicateIPRace(t *testing.T) {
 	// alone cannot cover the window between its response and the CR
 	// persisting (the exact REPORT.md M6 trigger).
 	t.Run("reservation denies a second near-simultaneous create", func(t *testing.T) {
-		ipReservations.Range(func(key, _ any) bool {
-			ipReservations.Delete(key)
-
-			return true
-		})
+		clearAdmissionState()
 
 		ar := &admissionv1.AdmissionReview{
 			Request: &admissionv1.AdmissionRequest{
@@ -591,11 +621,7 @@ func TestValidateFloatingIPDuplicateIPRace(t *testing.T) {
 	// the address already and must not be self-denied by the reservation
 	// probe.
 	t.Run("controller spec update of a just-created pinned IP is not self-denied", func(t *testing.T) {
-		ipReservations.Range(func(key, _ any) bool {
-			ipReservations.Delete(key)
-
-			return true
-		})
+		clearAdmissionState()
 
 		ar := &admissionv1.AdmissionReview{
 			Request: &admissionv1.AdmissionRequest{
@@ -619,6 +645,327 @@ func TestValidateFloatingIPDuplicateIPRace(t *testing.T) {
 		// and empty status, as the controller's spec rewrite does.
 		update := validateFloatingIP(context.Background(), dynamicClient, ar, created, created, nil)
 		assert.True(t, update.Allowed, "spec update of the object's own address must be allowed: %+v", update.Result)
+	})
+}
+
+// TestValidateFloatingIPQuotaEnforcement pins the REPORT.md M7 fix: the
+// quota decision is serialized per project/pool, computed from live
+// cluster state instead of the asynchronously written quota.status, and
+// counts each in-flight admission exactly once (reservations paired off
+// against the persisted CRs they turned into). The former design slept
+// 2s per quota-checked admission — burning admission budget on every
+// request while N concurrent creates still all read the same stale Used
+// count and all fit under the quota.
+func TestValidateFloatingIPQuotaEnforcement(t *testing.T) {
+	quotaPool := &rfmv2.FloatingIPPool{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rancher.k8s.binbash.org/v1beta2",
+			Kind:       "FloatingIPPool",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pool",
+		},
+		Spec: rfmv2.FloatingIPPoolSpec{
+			IPConfig: &rfmv2.IPConfig{
+				Subnet: "192.168.1.0/24",
+				Pool: rfmv2.Pool{
+					Start: "192.168.1.10",
+					End:   "192.168.1.200",
+				},
+			},
+		},
+		Status: rfmv2.FloatingIPPoolStatus{
+			Available: 5,
+		},
+	}
+
+	newPlbc := func(quota int, statusUsed int) *rfmv2.FloatingIPProjectQuota {
+		return &rfmv2.FloatingIPProjectQuota{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "rancher.k8s.binbash.org/v1beta2",
+				Kind:       "FloatingIPProjectQuota",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-project",
+			},
+			Spec: rfmv2.FloatingIPProjectQuotaSpec{
+				FloatingIPQuota: map[string]int{
+					"test-pool": quota,
+				},
+			},
+			Status: rfmv2.FloatingIPProjectQuotaStatus{
+				// Deliberately inconsistent with the seeded CRs: status
+				// must not be consulted for the decision.
+				FloatingIPs: map[string]*rfmv2.FipInfo{
+					"test-pool": {Used: statusUsed},
+				},
+			},
+		}
+	}
+
+	newRequest := func(name string) *rfmv2.FloatingIP {
+		return &rfmv2.FloatingIP{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "rancher.k8s.binbash.org/v1beta2",
+				Kind:       "FloatingIP",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels: map[string]string{
+					"rancher.k8s.binbash.org/project-name": "test-project",
+				},
+			},
+			Spec: rfmv2.FloatingIPSpec{
+				FloatingIPPool: "test-pool",
+			},
+		}
+	}
+
+	// newCR seeds a persisted CR as the manager controller would leave it
+	// after granting (ipAddr set) or while still allocating (pending).
+	newCR := func(name string, ip string, state string, recent bool) *rfmv2.FloatingIP {
+		fip := &rfmv2.FloatingIP{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "rancher.k8s.binbash.org/v1beta2",
+				Kind:       "FloatingIP",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels: map[string]string{
+					"rancher.k8s.binbash.org/project-name": "test-project",
+				},
+			},
+			Spec: rfmv2.FloatingIPSpec{
+				FloatingIPPool: "test-pool",
+			},
+		}
+		if ip != "" {
+			fip.Status.IPAddr = ip
+		}
+		if state != "" {
+			fip.Status.State = state
+		}
+		if recent {
+			fip.CreationTimestamp = metav1.Now()
+		}
+
+		return fip
+	}
+
+	newClient := func(plbc *rfmv2.FloatingIPProjectQuota, fips ...*rfmv2.FloatingIP) dynamic.Interface {
+		objects := []runtime.Object{}
+		unstructuredPools, err := getUnstructuredList([]runtime.Object{quotaPool})
+		require.NoError(t, err)
+		unstructuredPLBCs, err := getUnstructuredList([]runtime.Object{plbc})
+		require.NoError(t, err)
+		objects = append(objects, unstructuredPools...)
+		objects = append(objects, unstructuredPLBCs...)
+		for _, fip := range fips {
+			unstructuredFIPs, err := getUnstructuredList([]runtime.Object{fip})
+			require.NoError(t, err)
+			objects = append(objects, unstructuredFIPs...)
+		}
+
+		return fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			{Group: "rancher.k8s.binbash.org", Version: "v1beta2", Resource: "floatingips"}: "FloatingIPList",
+		}, objects...)
+	}
+
+	validate := func(t *testing.T, client dynamic.Interface, fip *rfmv2.FloatingIP, oldFIP *rfmv2.FloatingIP) *admissionv1.AdmissionResponse {
+		t.Helper()
+
+		ar := &admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
+				UID: "test-uid",
+			},
+		}
+
+		return validateFloatingIP(context.Background(), client, ar, fip, oldFIP, nil)
+	}
+
+	denyMessage := func(quota, used int) string {
+		return fmt.Sprintf("quota exceeded for floatingippool test-pool in project test-project. Quota: %d, Used: %d", quota, used)
+	}
+
+	t.Run("burst of creates is capped at the quota without any sleep", func(t *testing.T) {
+		clearAdmissionState()
+
+		client := newClient(newPlbc(2, 0))
+
+		first := validate(t, client, newRequest("fip-1"), nil)
+		require.True(t, first.Allowed, "first create must be allowed: %+v", first.Result)
+
+		second := validate(t, client, newRequest("fip-2"), nil)
+		require.True(t, second.Allowed, "second create must be allowed: %+v", second.Result)
+
+		third := validate(t, client, newRequest("fip-3"), nil)
+		assert.False(t, third.Allowed)
+		assert.Equal(t, denyMessage(2, 2), third.Result.Message)
+	})
+
+	t.Run("allocated CRs pair off their reservations so sequential creates are not double-counted", func(t *testing.T) {
+		clearAdmissionState()
+
+		// Two admissions allowed against an empty cluster; the manager
+		// controller grants both within the reservation TTL.
+		emptyClient := newClient(newPlbc(2, 0))
+		require.True(t, validate(t, emptyClient, newRequest("fip-1"), nil).Allowed)
+		require.True(t, validate(t, emptyClient, newRequest("fip-2"), nil).Allowed)
+
+		// Both CRs now exist and hold IPs. Each must be counted exactly
+		// once: allocated CRs pair off their still-live reservations.
+		allocatedClient := newClient(newPlbc(3, 0), newCR("fip-1", "192.168.1.10", "", true), newCR("fip-2", "192.168.1.11", "", true))
+
+		third := validate(t, allocatedClient, newRequest("fip-3"), nil)
+		assert.True(t, third.Allowed, "third create must be allowed with 2 of 3 slots used: %+v", third.Result)
+
+		fourth := validate(t, allocatedClient, newRequest("fip-4"), nil)
+		assert.False(t, fourth.Allowed)
+		assert.Equal(t, denyMessage(3, 3), fourth.Result.Message)
+	})
+
+	t.Run("persisted pending CRs count without double-counting their reservations", func(t *testing.T) {
+		clearAdmissionState()
+
+		emptyClient := newClient(newPlbc(2, 0))
+		require.True(t, validate(t, emptyClient, newRequest("fip-1"), nil).Allowed)
+
+		// fip-1 persisted but the manager controller has not granted an
+		// IP yet: it occupies a slot, and it pairs off its reservation.
+		pendingClient := newClient(newPlbc(2, 0), newCR("fip-1", "", "", true))
+
+		second := validate(t, pendingClient, newRequest("fip-2"), nil)
+		assert.True(t, second.Allowed, "second create must be allowed with 1 of 2 slots used: %+v", second.Result)
+
+		third := validate(t, pendingClient, newRequest("fip-3"), nil)
+		assert.False(t, third.Allowed)
+		assert.Equal(t, denyMessage(2, 2), third.Result.Message)
+	})
+
+	t.Run("failed-allocation CR and stale quota status do not consume a slot", func(t *testing.T) {
+		clearAdmissionState()
+
+		client := newClient(newPlbc(1, 1), newCR("failed-fip", "", "Error", true))
+
+		response := validate(t, client, newRequest("fip-1"), nil)
+		assert.True(t, response.Allowed, "failed allocation must not block the retry: %+v", response.Result)
+	})
+
+	t.Run("terminating CR still consumes a slot", func(t *testing.T) {
+		clearAdmissionState()
+
+		terminating := newCR("fip-1", "192.168.1.10", "", true)
+		terminating.DeletionTimestamp = &metav1.Time{Time: metav1.Now().Time}
+		terminating.Finalizers = []string{"floatingip-cleanup"}
+
+		response := validate(t, newClient(newPlbc(1, 0), terminating), newRequest("fip-2"), nil)
+		assert.False(t, response.Allowed)
+		assert.Equal(t, denyMessage(1, 1), response.Result.Message)
+	})
+
+	t.Run("other project's CRs do not consume a slot", func(t *testing.T) {
+		clearAdmissionState()
+
+		other := newCR("fip-1", "192.168.1.10", "", true)
+		other.Labels = map[string]string{"rancher.k8s.binbash.org/project-name": "other-project"}
+
+		response := validate(t, newClient(newPlbc(1, 0), other), newRequest("fip-2"), nil)
+		assert.True(t, response.Allowed, "another project's allocation must not count here: %+v", response.Result)
+	})
+
+	t.Run("same-pool update is not quota-checked", func(t *testing.T) {
+		clearAdmissionState()
+
+		self := newRequest("test-fip")
+		self.Status.IPAddr = "192.168.1.10"
+		oldFIP := self.DeepCopy()
+		client := newClient(newPlbc(1, 0), self)
+
+		// Quota is 1 and the pool is full, but an update of the object
+		// that owns the slot cannot change occupancy.
+		response := validate(t, client, self, oldFIP)
+		assert.True(t, response.Allowed, "same-pool update must not be self-denied: %+v", response.Result)
+
+		// No reservation may have been taken: the slot was already live.
+		other := newRequest("fip-2")
+		denial := validate(t, client, other, nil)
+		assert.False(t, denial.Allowed)
+		assert.Equal(t, denyMessage(1, 1), denial.Result.Message)
+	})
+
+	t.Run("aged pending CRs count directly but do not mask live reservations", func(t *testing.T) {
+		clearAdmissionState()
+
+		// Zero CreationTimestamp: older than the reservation TTL, so this
+		// CR never had a live reservation to consume (manager backlog).
+		aged := newCR("aged-fip", "", "", false)
+
+		// Coverage continuity: the aged pending CR occupies a slot on its
+		// own.
+		client := newClient(newPlbc(2, 0), aged)
+		first := validate(t, client, newRequest("fip-1"), nil)
+		require.True(t, first.Allowed, "aged pending CR occupies one of two slots: %+v", first.Result)
+
+		// The reservation the first admission just took must not be
+		// paired off against the aged CR.
+		second := validate(t, client, newRequest("fip-2"), nil)
+		assert.False(t, second.Allowed)
+		assert.Equal(t, denyMessage(2, 2), second.Result.Message)
+	})
+
+	t.Run("update of an errored CR that holds no slot is quota-checked", func(t *testing.T) {
+		clearAdmissionState()
+
+		errored := newCR("test-fip", "", "Error", true)
+		allocatedOther := newCR("other-fip", "192.168.1.10", "", true)
+		client := newClient(newPlbc(1, 0), errored, allocatedOther)
+
+		// The errored CR holds no slot, so re-reconciling it can occupy
+		// one; with the pool's only slot taken it must be denied.
+		response := validate(t, client, errored, errored.DeepCopy())
+		assert.False(t, response.Allowed)
+		assert.Equal(t, denyMessage(1, 1), response.Result.Message)
+	})
+
+	// M7(b) is about concurrency: N simultaneous creates for one
+	// project/pool must serialize on the per-key lock so exactly quota
+	// many pass. Without lockQuotaForAdmission every goroutine reads the
+	// same empty list and all 8 would be allowed.
+	t.Run("concurrent creates are serialized per project/pool", func(t *testing.T) {
+		clearAdmissionState()
+
+		client := newClient(newPlbc(3, 0))
+
+		const goroutines = 8
+		results := make([]*admissionv1.AdmissionResponse, goroutines)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				ar := &admissionv1.AdmissionReview{
+					Request: &admissionv1.AdmissionRequest{
+						UID: types.UID(fmt.Sprintf("uid-%d", i)),
+					},
+				}
+				results[i] = validateFloatingIP(context.Background(), client, ar, newRequest(fmt.Sprintf("fip-%d", i)), nil, nil)
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		allowed := 0
+		for _, r := range results {
+			require.NotNil(t, r)
+			if r.Allowed {
+				allowed++
+			}
+		}
+		assert.Equal(t, 3, allowed, "exactly quota-many concurrent creates may pass")
 	})
 }
 
