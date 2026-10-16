@@ -163,6 +163,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		}
 
 		// Check if the IP is within the subnet
+		if fipPool.Spec.IPConfig == nil {
+			log.Errorf("floatingippool %s has no ipConfig", fip.Spec.FloatingIPPool)
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("floatingippool %s has no ipConfig", fip.Spec.FloatingIPPool),
+				},
+			}
+		}
 		_, subnet, err := net.ParseCIDR(fipPool.Spec.IPConfig.Subnet)
 		if err != nil {
 			log.Errorf("failed to parse subnet %s: %s", fipPool.Spec.IPConfig.Subnet, err)
@@ -360,6 +370,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 }
 
 func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview, fipPool *rfmv2.FloatingIPPool) *admissionv1.AdmissionResponse {
+	if fipPool.Spec.IPConfig == nil {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: "ipConfig is required in floatingippool spec",
+			},
+		}
+	}
+
 	// Check if the subnet is valid
 	_, subnet, err := net.ParseCIDR(fipPool.Spec.IPConfig.Subnet)
 	if err != nil {

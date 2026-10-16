@@ -75,6 +75,10 @@ func (c *Collector) collectPools(ch chan<- prometheus.Metric) {
 		return
 	}
 	for _, pool := range pools {
+		if pool.Spec.IPConfig == nil {
+			logrus.Warnf("floating ip pool %s has no ipConfig, skipping metrics", pool.Name)
+			continue
+		}
 		ch <- prometheus.MustNewConstMetric(c.poolCapacity, prometheus.GaugeValue, float64(pool.Status.Available+pool.Status.Used),
 			pool.Name,
 			pool.Spec.IPConfig.Subnet,

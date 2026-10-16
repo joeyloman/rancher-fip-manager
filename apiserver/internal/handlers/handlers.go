@@ -461,6 +461,13 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 			sharedKey = finalFip.Status.Assigned.SharedKey
 		}
 
+		subnet := ""
+		if fipPool.Spec.IPConfig != nil {
+			subnet = fipPool.Spec.IPConfig.Subnet
+		} else {
+			app.Log.Warnf("floatingippool %s has no ipConfig, returning empty subnet", fipRequest.FloatingIPPool)
+		}
+
 		fipResponse := types.FIPResponse{
 			Status:           "approved",
 			ClientSecret:     fipRequest.ClientSecret,
@@ -470,7 +477,7 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 			ServiceNamespace: fipRequest.ServiceNamespace,
 			ServiceName:      fipRequest.ServiceName,
 			IPAddress:        finalFip.Status.IPAddr,
-			Subnet:           fipPool.Spec.IPConfig.Subnet,
+			Subnet:           subnet,
 			FloatingIPGroup:  fipGroup,
 			SharedKey:        sharedKey,
 		}

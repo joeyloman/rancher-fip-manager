@@ -4383,3 +4383,91 @@ func TestFIPReleaseHandlerWithServiceNamespaceMismatch(t *testing.T) {
 	assert.Equal(t, "test-service", updatedFIP.Labels["rancher.k8s.binbash.org/service-0-name"])
 	assert.Equal(t, "other-namespace", updatedFIP.Labels["rancher.k8s.binbash.org/service-0-namespace"])
 }
+
+// TestFIPRequestWithPoolWithoutIPConfig ensures the allocation response does not
+// panic when the FloatingIPPool has no spec.ipConfig (the subnet is returned as ""
+// instead of dereferencing a nil pointer after the allocation already succeeded).
+func TestFIPRequestWithPoolWithoutIPConfig(t *testing.T) {
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "test-noipconfig-"},
+	}
+	require.NoError(t, app.FipRestClient.Create(ctx, ns))
+	defer app.FipRestClient.Delete(ctx, ns)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "management.cattle.io",
+		Version:  "v3",
+		Resource: "projects",
+	}
+	projectName := "test-project-noipconfig"
+	project := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "management.cattle.io/v3",
+			"kind":       "Project",
+			"metadata": map[string]interface{}{
+				"name":      projectName,
+				"namespace": ns.GetName(),
+			},
+		},
+	}
+	_, err := app.DynamicClient.Resource(gvr).Namespace(ns.GetName()).Create(ctx, project, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// FloatingIPPool without spec.ipConfig.
+	fipPoolGVR := schema.GroupVersionResource{
+		Group:    "rancher.k8s.binbash.org",
+		Version:  "v1beta2",
+		Resource: "floatingippools",
+	}
+	fipPool := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rancher.k8s.binbash.org/v1beta2",
+			"kind":       "FloatingIPPool",
+			"metadata": map[string]interface{}{
+				"name": "test-network-noipconfig",
+			},
+		},
+	}
+	_, err = app.DynamicClient.Resource(fipPoolGVR).Create(ctx, fipPool, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	fipRequest := &types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "test-network-noipconfig",
+		ServiceName:      "test-service",
+		ServiceNamespace: "default",
+		Cluster:          "test-cluster",
+		IPAddress:        "10.0.0.1",
+	}
+	body, err := json.Marshal(fipRequest)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("POST", "/v1/fip/request", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	// Simulate the FIP controller allocating an IP.
+	go func() {
+		fipList := &fipv1beta2.FloatingIPList{}
+		for {
+			err := app.FipRestClient.List(ctx, fipList, &client.ListOptions{Namespace: ns.GetName()})
+			if err == nil && len(fipList.Items) > 0 {
+				fip := fipList.Items[0]
+				fip.Status.IPAddr = fipRequest.IPAddress
+				if err := app.FipRestClient.Status().Update(ctx, &fip); err == nil {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	FIPRequestHandler(app)(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var fipResponse types.FIPResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fipResponse))
+	assert.Equal(t, fipRequest.IPAddress, fipResponse.IPAddress)
+	assert.Equal(t, "", fipResponse.Subnet)
+}

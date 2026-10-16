@@ -99,6 +99,20 @@ func TestValidateFloatingIP(t *testing.T) {
 		expectedMessage string
 	}{
 		{
+			name: "pool without ipConfig",
+			fip: &rfmv2.FloatingIP{
+				ObjectMeta: fip.ObjectMeta,
+				Spec: rfmv2.FloatingIPSpec{
+					FloatingIPPool: "test-pool",
+					IPAddr:         &ipAddr,
+				},
+			},
+			existingPools:   []runtime.Object{&rfmv2.FloatingIPPool{TypeMeta: fipPool.TypeMeta, ObjectMeta: fipPool.ObjectMeta}},
+			existingPLBCs:   []runtime.Object{plbc},
+			expectedAllowed: false,
+			expectedMessage: "floatingippool test-pool has no ipConfig",
+		},
+		{
 			name:            "pool does not exist",
 			fip:             fip,
 			existingPools:   []runtime.Object{},
@@ -308,6 +322,16 @@ func TestValidateFloatingIPPool(t *testing.T) {
 		expectedAllowed bool
 		expectedMessage string
 	}{
+		{
+			name: "missing ipConfig",
+			fipPool: &rfmv2.FloatingIPPool{
+				TypeMeta:   validFipPool.TypeMeta,
+				ObjectMeta: validFipPool.ObjectMeta,
+				Spec:       rfmv2.FloatingIPPoolSpec{},
+			},
+			expectedAllowed: false,
+			expectedMessage: "ipConfig is required in floatingippool spec",
+		},
 		{
 			name: "invalid subnet format",
 			fipPool: &rfmv2.FloatingIPPool{
