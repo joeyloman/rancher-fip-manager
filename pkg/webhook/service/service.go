@@ -14,6 +14,7 @@ import (
 	"time"
 
 	rfmv2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
+	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
 	log "github.com/sirupsen/logrus"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -435,6 +436,21 @@ func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview
 					Message: fmt.Sprintf("start IP address %s must be less than or equal to end IP address %s", fipPool.Spec.IPConfig.Pool.Start, fipPool.Spec.IPConfig.Pool.End),
 				},
 			}
+		}
+	}
+
+	// Bound the pool range before it reaches the IPAM: buildSubnet
+	// materializes every address in [start,end], so an oversized range must
+	// be denied here with a clear message instead of leaving a pool whose
+	// reconcile fails (or OOMs) forever. Runs after the ordering check, per
+	// ValidateRangeSize's contract.
+	if err := ipam.ValidateRangeSize(fipPool.Spec.IPConfig.Pool.Start, fipPool.Spec.IPConfig.Pool.End); err != nil {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: err.Error(),
+			},
 		}
 	}
 

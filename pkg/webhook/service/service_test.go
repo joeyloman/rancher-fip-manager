@@ -18,6 +18,7 @@ import (
 	"time"
 
 	rfmv2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
+	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -416,6 +417,43 @@ func TestValidateFloatingIPPool(t *testing.T) {
 			},
 			expectedAllowed: false,
 			expectedMessage: "start IP address 192.168.1.20 must be less than or equal to end IP address 192.168.1.10",
+		},
+		{
+			name: "pool range exceeds maximum size",
+			fipPool: &rfmv2.FloatingIPPool{
+				TypeMeta:   validFipPool.TypeMeta,
+				ObjectMeta: validFipPool.ObjectMeta,
+				Spec: rfmv2.FloatingIPPoolSpec{
+					IPConfig: &rfmv2.IPConfig{
+						Subnet: "10.0.0.0/8",
+						Pool: rfmv2.Pool{
+							Start:   "10.0.0.1",
+							End:     "10.1.0.1",
+							Exclude: []string{},
+						},
+					},
+				},
+			},
+			expectedAllowed: false,
+			expectedMessage: fmt.Sprintf("pool range 10.0.0.1-10.1.0.1 spans 65537 addresses, exceeding the maximum of %d", ipam.MaxSubnetRangeSize),
+		},
+		{
+			name: "pool range at maximum size",
+			fipPool: &rfmv2.FloatingIPPool{
+				TypeMeta:   validFipPool.TypeMeta,
+				ObjectMeta: validFipPool.ObjectMeta,
+				Spec: rfmv2.FloatingIPPoolSpec{
+					IPConfig: &rfmv2.IPConfig{
+						Subnet: "10.0.0.0/8",
+						Pool: rfmv2.Pool{
+							Start:   "10.0.0.1",
+							End:     "10.0.255.254",
+							Exclude: []string{},
+						},
+					},
+				},
+			},
+			expectedAllowed: true,
 		},
 		{
 			name: "invalid excluded IP address format",
