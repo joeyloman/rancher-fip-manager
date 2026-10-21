@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"net"
 	"net/http"
@@ -53,7 +54,26 @@ var (
 	// have silently dropped. /healthz stays unconditional so liveness
 	// works from process start.
 	apiListenerReady atomic.Bool
+
+	// shutdownGraceMargin is headroom on top of the worst-case handler
+	// duration so Shutdown is not racing the last request's final write.
+	shutdownGraceMargin = 5 * time.Second
+
+	// shutdownGracePeriod is how long run() lets in-flight requests finish
+	// after SIGTERM. It must cover handlers.MaxRequestDuration() — a request
+	// already in flight can burn the full 30s allocation wait and then its
+	// 10s cleanup — otherwise server.Shutdown hits the deadline and the
+	// process exits while a handler is still writing. The
+	// chart's terminationGracePeriodSeconds must exceed this, or the kubelet
+	// SIGKILLs first.
+	shutdownGracePeriod = handlers.MaxRequestDuration() + shutdownGraceMargin
 )
+
+// globalRateLimitFactor scales the per-client budget into the aggregate
+// ceiling. 10x is far above any realistic fleet's aggregate
+// load, so the ceiling only trips under churn/abuse, and it tracks the
+// per-client flags instead of being a second thing to tune.
+const globalRateLimitFactor = 10
 
 func main() {
 	// Initialize logger
@@ -68,12 +88,12 @@ func main() {
 	// No leader election: the API server is stateless (all state lives in
 	// FloatingIP CRs; reconciliation is done by the manager controller), so
 	// every replica serves. Leader-only binding previously made readiness
-	// probes wedge rollouts (REPORT.md 4.5).
+	// probes wedge rollouts.
 	flag.BoolVar(&jwtGenerateKey, "jwt-generate-key", true, "Generate a new JWT private key.")
 	flag.StringVar(&jwtSecretName, "jwt-secret-name", "jwt-private-key", "The name of the secret containing the JWT private key.")
 	flag.StringVar(&jwtSecretNamespace, "jwt-secret-namespace", "rancher-fip-manager", "The namespace of the secret containing the JWT private key.")
-	flag.Float64Var(&rateLimitPerSecond, "rate-limit-per-second", 10, "The number of requests allowed per second.")
-	flag.IntVar(&rateLimitBurst, "rate-limit-burst", 20, "The burst number of requests allowed.")
+	flag.Float64Var(&rateLimitPerSecond, "rate-limit-per-second", 10, "Requests allowed per second per client (authenticated client ID on /v1/fip, source address on /v1/auth/token).")
+	flag.IntVar(&rateLimitBurst, "rate-limit-burst", 20, "Burst of requests allowed per client.")
 	flag.StringVar(&listenAddress, "listen-address", ":8080", "The address to listen on for HTTP requests.")
 	flag.BoolVar(&tlsEnabled, "tls-enabled", false, "Enable TLS for HTTPS.")
 	flag.StringVar(&tlsCertFile, "tls-cert-file", "", "Path to the TLS certificate file.")
@@ -212,13 +232,32 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 
 	// Set up HTTP server
 	r := mux.NewRouter()
-	r.Use(middleware.RateLimitMiddleware(rateLimitPerSecond, rateLimitBurst))
+	// Aggregate ceiling across every key. The per-client limits below are the
+	// fairness mechanism, but the client ID is caller-chosen at token issuance
+	// (any clientID is minted without authentication), so a caller can mint
+	// fresh IDs to get fresh per-client buckets. The ceiling caps that churn
+	// while sitting far above normal aggregate traffic, so tenants do not
+	// contend on it.
+	r.Use(middleware.RateLimitMiddleware(
+		rateLimitPerSecond*globalRateLimitFactor,
+		rateLimitBurst*globalRateLimitFactor,
+		middleware.GlobalRateLimitKey,
+	))
 	r.Use(middleware.BodyLimitMiddleware(maxBodySize))
-	r.HandleFunc("/v1/auth/token", handlers.TokenHandler(app)).Methods("POST")
+
+	// Per-client limiting: one noisy tenant must not exhaust another tenant's
+	// budget. The token endpoint is unauthenticated, so it is bucketed by
+	// source address; the protected routes are bucketed by the client ID
+	// AuthMiddleware put in the context, which is why that limiter is installed
+	// after it (and before the body-reading AuthorizeMiddleware, so denied
+	// requests cost nothing).
+	tokenLimiter := middleware.RateLimitMiddleware(rateLimitPerSecond, rateLimitBurst, middleware.RemoteIPRateLimitKey)
+	r.Handle("/v1/auth/token", tokenLimiter(http.HandlerFunc(handlers.TokenHandler(app)))).Methods("POST")
 
 	// Protected routes
 	s := r.PathPrefix("/v1/fip").Subrouter()
 	s.Use(middleware.AuthMiddleware(app))
+	s.Use(middleware.RateLimitMiddleware(rateLimitPerSecond, rateLimitBurst, middleware.ClientIDRateLimitKey))
 	s.Use(middleware.AuthorizeMiddleware(app))
 	s.HandleFunc("/request", handlers.FIPRequestHandler(app)).Methods("POST")
 	s.HandleFunc("/release", handlers.FIPReleaseHandler(app)).Methods("POST")
@@ -238,6 +277,20 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 		IdleTimeout:       120 * time.Second,
 	}
 
+	if tlsEnabled {
+		// Serve the certificate through a GetCertificate hook instead of
+		// the certFile/keyFile arguments of ServeTLS, which are read once
+		// at startup: cert-manager renews the Secret ~30 days before
+		// expiry, and a running pod would keep serving the old leaf until
+		// it was rolled. The hook reloads when the files
+		// change.
+		reloader, err := newCertReloader(log, tlsCertFile, tlsKeyFile)
+		if err != nil {
+			log.Fatalf("Failed to load TLS certificate: %v", err)
+		}
+		server.TLSConfig = &tls.Config{GetCertificate: reloader.GetCertificate}
+	}
+
 	go func() {
 		// Bind explicitly so apiListenerReady flips exactly when the
 		// socket accepts: storing before ListenAndServe would leave a
@@ -249,7 +302,11 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 		if tlsEnabled {
 			log.Infof("Starting server on %s with TLS", listenAddress)
 			apiListenerReady.Store(true)
-			if err := server.ServeTLS(ln, tlsCertFile, tlsKeyFile); err != nil && err != http.ErrServerClosed {
+			// Empty file arguments: the key pair comes from
+			// server.TLSConfig.GetCertificate (the reloading source
+			// above), while ServeTLS still installs HTTP/2 and the
+			// http/1.1 ALPN entry on a clone of that config.
+			if err := server.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("Could not serve on %s: %v\n", listenAddress, err)
 			}
 		} else {
@@ -265,15 +322,27 @@ func run(ctx context.Context, log *logrus.Logger, config *rest.Config, clientset
 	<-ctx.Done()
 
 	// Shutdown the server gracefully
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
 	// Flip readiness before draining: kubelet must stop sending traffic
 	// (remove the pod from Service endpoints) at the start of the SIGTERM
 	// window, not after in-flight requests have drained.
 	apiListenerReady.Store(false)
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Server shutdown failed: %v", err)
-	}
+	shutdownAPI(server, log, shutdownGracePeriod)
 
 	log.Info("Server gracefully stopped")
+}
+
+// shutdownAPI drains server within grace and force-closes whatever is left
+// when the deadline expires. It never terminates the process itself: an
+// allocation handler already in flight may legitimately hold its connection
+// for the full allocation wait plus cleanup, and exiting there resets the
+// client mid-write instead of returning a clean response.
+func shutdownAPI(server *http.Server, log *logrus.Logger, grace time.Duration) {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), grace)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("Server shutdown did not complete within %s, force-closing remaining connections: %v", grace, err)
+		if closeErr := server.Close(); closeErr != nil && closeErr != http.ErrServerClosed {
+			log.Errorf("Server close failed: %v", closeErr)
+		}
+	}
 }

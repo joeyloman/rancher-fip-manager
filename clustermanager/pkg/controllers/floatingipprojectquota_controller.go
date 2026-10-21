@@ -48,6 +48,10 @@ const (
 // FloatingIPProjectQuotaReconciler reconciles a FloatingIPProjectQuota object.
 type FloatingIPProjectQuotaReconciler struct {
 	client.Client
+	// APIReader reads directly from the API server, bypassing the informer
+	// cache. Used for credential material (config secret, CA bundle) that
+	// must not be reconciled from a stale snapshot.
+	APIReader client.Reader
 	// Scheme is the scheme for the controller.
 	Scheme *runtime.Scheme
 	// Config is the configuration for the controller.
@@ -162,6 +166,7 @@ func (r *FloatingIPProjectQuotaReconciler) Reconcile(ctx context.Context, req ct
 	if cluster.Labels["provider.cattle.io"] == "harvester" {
 		return HandleConfigSecrets(
 			ctx,
+			r.APIReader,
 			r.Client,
 			nil,
 			r.Config.RancherFipLBControllerNamespace,
@@ -172,6 +177,7 @@ func (r *FloatingIPProjectQuotaReconciler) Reconcile(ctx context.Context, req ct
 			cluster.Name,
 			loadBalancerType,
 			r.Config.CaCrt,
+			r.AppNamespace,
 		)
 	}
 
@@ -243,6 +249,7 @@ func (r *FloatingIPProjectQuotaReconciler) Reconcile(ctx context.Context, req ct
 
 	return HandleConfigSecrets(
 		ctx,
+		r.APIReader,
 		r.Client,
 		downstreamClient,
 		r.Config.RancherFipLBControllerNamespace,
@@ -253,6 +260,7 @@ func (r *FloatingIPProjectQuotaReconciler) Reconcile(ctx context.Context, req ct
 		cluster.Name,
 		loadBalancerType,
 		r.Config.CaCrt,
+		r.AppNamespace,
 	)
 }
 

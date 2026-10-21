@@ -3,6 +3,7 @@ package admission
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/joeyloman/rancher-fip-manager/pkg/webhook/util"
 	log "github.com/sirupsen/logrus"
@@ -12,14 +13,24 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// Explicit admission control knobs (REPORT.md 2.5/5.1): failurePolicy and
+// Explicit admission control knobs: failurePolicy and
 // timeoutSeconds were never set, so the API defaults (Fail / 10s) applied
 // invisibly. Pin the intent in the object: Fail is deliberate — an
 // unreachable webhook must not wave through FloatingIP/Pool writes that
 // would double-allocate — and the 10s timeout is the bound the webhook's
-// own request path (including its quota-sleep) must fit inside.
+// own request path (pool/quota Gets plus the bounded live FloatingIP
+// list) must fit inside.
 const (
 	admissionTimeoutSeconds int32 = 10
+
+	// A kube-root-ca.crt Get failure during startup used to
+	// panic immediately, crashlooping the webhook on a pure API blip even
+	// though it could serve fine. Retry the admission setup with backoff
+	// and panic only on sustained failure (kubeconfig/clientset errors are
+	// deterministic local configuration problems and stay fatal).
+	addWebhookConfigMaxRetries     = 5
+	addWebhookConfigRetryBaseDelay = 1 * time.Second
+	addWebhookConfigRetryMaxDelay  = 16 * time.Second
 )
 
 func setAdmissionPolicy(webhook *admregv1.ValidatingWebhook) {
@@ -60,8 +71,36 @@ func (h *Handler) Init() {
 	}
 	h.clientset = clientset
 
-	if err := h.AddValidatingWebhookConfiguration(); err != nil {
+	if err := retryWithBackoff(h.ctx, addWebhookConfigMaxRetries, addWebhookConfigRetryBaseDelay, addWebhookConfigRetryMaxDelay, h.AddValidatingWebhookConfiguration); err != nil {
 		log.Panicf("%s", err.Error())
+	}
+}
+
+// retryWithBackoff runs fn with exponential backoff (baseDelay doubling up
+// to maxDelay) until it succeeds or maxRetries attempts are exhausted. A
+// cancelled context aborts immediately instead of burning the budget, so a
+// SIGTERM during startup is not stalled by the retry loop.
+func retryWithBackoff(ctx context.Context, maxRetries int, baseDelay time.Duration, maxDelay time.Duration, fn func() error) error {
+	delay := baseDelay
+	for attempt := 1; ; attempt++ {
+		if err := fn(); err == nil {
+			return nil
+		} else if attempt >= maxRetries {
+			return fmt.Errorf("giving up after %d attempts: %s", attempt, err.Error())
+		} else {
+			log.Errorf("attempt %d/%d failed, retrying in %s: %s", attempt, maxRetries, delay, err.Error())
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < maxDelay {
+			delay *= 2
+		}
 	}
 }
 
@@ -158,7 +197,7 @@ func (h *Handler) getRancherFloatingIPPoolWebhook() (webhook admregv1.Validating
 }
 
 func (h *Handler) AddValidatingWebhookConfiguration() (err error) {
-	existing, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), h.validatingWebhookConfigName, metav1.GetOptions{})
+	existing, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(h.ctx, h.validatingWebhookConfigName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return h.createValidatingWebhookConfiguration()
 	}
@@ -187,17 +226,37 @@ func (h *Handler) createValidatingWebhookConfiguration() (err error) {
 	}
 	vwc.Webhooks = append(vwc.Webhooks, rancherFloatingIPPoolWebhook)
 
-	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(context.TODO(), &vwc, metav1.CreateOptions{})
+	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(h.ctx, &vwc, metav1.CreateOptions{})
 
 	return
 }
 
 // syncAdmissionPolicy pins failurePolicy/TimeoutSeconds on a pre-existing
-// ValidatingWebhookConfiguration. Only those two fields are reconciled;
-// rules and the caBundle remain operator-owned (caBundle rotation is
-// REPORT.md 2.8, deliberately out of scope here).
+// ValidatingWebhookConfiguration and fills an EMPTY caBundle from the
+// kube-root-ca.crt configmap. A non-empty bundle is never replaced: it is
+// operator-owned, and kube-root-ca.crt is the apiserver CA while the
+// serving cert may be signed by a different cluster CA — swapping a
+// working bundle under failurePolicy=Fail would deny all FloatingIP/Pool
+// writes. A failed CA read is likewise non-fatal here (the existing bundle
+// already validates the serving cert; failing startup would relocate the
+// startup crashloop to this path). The create path keeps the read mandatory: a
+// fresh VWC without a caBundle can never validate. True rotation support
+// remains out of scope.
 func (h *Handler) syncAdmissionPolicy(existing *admregv1.ValidatingWebhookConfiguration) error {
 	changed := false
+
+	cert, err := h.getCaBundleFromCABundleConfigMap()
+	if err != nil {
+		log.Warnf("skipping caBundle sync on validating webhook configuration %s, keeping existing bundle: %s", h.validatingWebhookConfigName, err.Error())
+	} else {
+		for i := range existing.Webhooks {
+			webhook := &existing.Webhooks[i]
+			if len(webhook.ClientConfig.CABundle) == 0 {
+				webhook.ClientConfig.CABundle = []byte(cert)
+				changed = true
+			}
+		}
+	}
 
 	for i := range existing.Webhooks {
 		webhook := &existing.Webhooks[i]
@@ -215,10 +274,10 @@ func (h *Handler) syncAdmissionPolicy(existing *admregv1.ValidatingWebhookConfig
 		return nil
 	}
 
-	if _, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.TODO(), existing, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("error pinning validating webhook configuration policy: %s", err.Error())
+	if _, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(h.ctx, existing, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("error syncing validating webhook configuration: %s", err.Error())
 	}
-	log.Infof("pinned failurePolicy=Fail timeoutSeconds=%d on validating webhook configuration %s", admissionTimeoutSeconds, h.validatingWebhookConfigName)
+	log.Infof("synced failurePolicy=Fail timeoutSeconds=%d caBundle on validating webhook configuration %s", admissionTimeoutSeconds, h.validatingWebhookConfigName)
 
 	return nil
 }

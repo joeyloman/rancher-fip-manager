@@ -3,6 +3,7 @@ package floatingip
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -111,14 +112,26 @@ func (c *Controller) Run(ctx context.Context, workers int) {
 	// Wait for the caches to be synced before starting workers
 	logrus.Info("Waiting for informer caches to sync for FloatingIP controller")
 	if ok := cache.WaitForCacheSync(ctx.Done(), c.fipSynced, c.fipPoolSynced, c.floatingIPProjectQuotaSynced); !ok {
+		// A cancelled context means shutdown raced startup (e.g. leader
+		// loss during the rollout window): return instead of Fatal so the
+		// process exits through the leader-loss drain with the lease
+		// released, instead of os.Exit(1) while still holding the lease.
+		if ctx.Err() != nil {
+			logrus.Errorf("FloatingIP controller startup aborted: %v", ctx.Err())
+			return
+		}
 		logrus.Fatal("failed to wait for caches to sync")
 	}
 
 	logrus.Info("Starting initial sync for FloatingIP controller")
 	queueLen := c.workqueue.Len()
 	logrus.Infof("FloatingIP controller initial sync: processing %d items", queueLen)
-	for i := 0; i < queueLen; i++ {
+	for range queueLen {
 		if !c.processNextWorkItem(ctx) {
+			if ctx.Err() != nil {
+				logrus.Errorf("FloatingIP controller initial sync aborted: %v", ctx.Err())
+				return
+			}
 			logrus.Fatal("worker shutdown during initial sync")
 		}
 	}
@@ -126,14 +139,27 @@ func (c *Controller) Run(ctx context.Context, workers int) {
 	close(c.initSyncDone)
 
 	logrus.Info("Starting workers for FloatingIP controller")
-	// Launch workers to process FloatingIP resources
-	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+	// Launch workers to process FloatingIP resources. The workers are
+	// tracked so Run only returns after the workqueue was shut down and
+	// every worker goroutine exited - the leader-loss drain in cmd/manager
+	// relies on that for an ordered teardown. In-flight items are not
+	// killed mid-sequence by the exit itself, but their remaining API
+	// writes fail fast on the cancelled context and are re-delivered after
+	// restart (idempotent per-object updates).
+	var workersWG sync.WaitGroup
+	for range workers {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		}()
 	}
 
 	logrus.Info("Started workers for FloatingIP controller")
 	<-ctx.Done()
 	logrus.Info("Shutting down workers for FloatingIP controller")
+	c.workqueue.ShutDown()
+	workersWG.Wait()
 }
 
 // runWorker is a long-running function that will continually call the
@@ -420,6 +446,24 @@ func (c *Controller) reconcile(ctx context.Context, fip *v1beta2.FloatingIP) err
 					}
 					fipCopy := currentFip.DeepCopy()
 					services := parseServicesFromLabels(currentFip.Labels)
+					if fipCopy.Status.Assigned == nil {
+						// The branch was selected from the stale informer copy, but
+						// fipCopy comes from a fresh Get: a concurrent reconcile may
+						// have cleared Status.Assigned in between (e.g. the cluster
+						// label was removed and re-added). Rebuild the full assignment
+						// from the live labels instead of dereferencing nil.
+						logrus.Infof("Status.Assigned was cleared concurrently for FIP %s/%s; rebuilding it", currentFip.Namespace, currentFip.Name)
+						var sharedKey string
+						if currentFip.Labels[floatingipGroupLabel] != "" {
+							sharedKey = fmt.Sprintf("%s-%s", currentFip.Labels["rancher.k8s.binbash.org/cluster-name"], util.GenerateRandomString(12))
+						}
+						fipCopy.Status.Assigned = &v1beta2.AssignedInfo{
+							ClusterName:     currentFip.Labels["rancher.k8s.binbash.org/cluster-name"],
+							ProjectName:     currentFip.Labels["rancher.k8s.binbash.org/project-name"],
+							FloatingIPGroup: currentFip.Labels[floatingipGroupLabel],
+							SharedKey:       sharedKey,
+						}
+					}
 					fipCopy.Status.Assigned.Services = services
 					serviceDesc := describeServices(services)
 					condition := metav1.Condition{

@@ -5,7 +5,9 @@ import (
 
 	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
@@ -98,4 +100,70 @@ func TestClusterProvisioningPredicate(t *testing.T) {
 	assert.True(t, p.Update(event.UpdateEvent{ObjectOld: enabled, ObjectNew: relabeled}), "a load balancer type change must re-run provisioning")
 	assert.False(t, p.Update(event.UpdateEvent{ObjectOld: enabled, ObjectNew: enabled}), "a resync of an unchanged cluster must not re-run provisioning")
 	assert.False(t, p.Update(event.UpdateEvent{ObjectOld: enabled, ObjectNew: sameLabels}), "an update that does not change the trigger labels must not re-run provisioning")
+}
+
+// TestHarvesterNetworkName pins the two encodings the Harvester node driver
+// accepts. An empty networkInfo is the legacy format, not a malformed value:
+// failing to unmarshal it aborted the reconcile for every HarvesterConfig
+// that predates multi-NIC support.
+func TestHarvesterNetworkName(t *testing.T) {
+	config := func(fields map[string]interface{}) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: fields}
+	}
+
+	tests := []struct {
+		name    string
+		config  *unstructured.Unstructured
+		want    string
+		wantErr string
+	}{
+		{
+			name:   "networkInfo",
+			config: config(map[string]interface{}{"networkInfo": `{"interfaces":[{"networkName":"default/mgmt","macAddress":"52:54:00:00:00:01"}]}`}),
+			want:   "default/mgmt",
+		},
+		{
+			name:   "legacy networkName when networkInfo is empty",
+			config: config(map[string]interface{}{"networkInfo": "", "networkName": "default/mgmt"}),
+			want:   "default/mgmt",
+		},
+		{
+			name:   "legacy networkName when networkInfo is absent",
+			config: config(map[string]interface{}{"networkName": "default/mgmt"}),
+			want:   "default/mgmt",
+		},
+		{
+			name:    "malformed networkInfo",
+			config:  config(map[string]interface{}{"networkInfo": "{"}),
+			wantErr: "unable to unmarshal networkInfo",
+		},
+		{
+			name:    "networkInfo without interfaces",
+			config:  config(map[string]interface{}{"networkInfo": `{"interfaces":[]}`}),
+			wantErr: "networkName not found in networkInfo",
+		},
+		{
+			name:    "networkInfo with empty networkName",
+			config:  config(map[string]interface{}{"networkInfo": `{"interfaces":[{"networkName":""}]}`}),
+			wantErr: "networkName not found in networkInfo",
+		},
+		{
+			name:   "no network configured",
+			config: config(map[string]interface{}{}),
+			want:   "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := harvesterNetworkName(tc.config)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

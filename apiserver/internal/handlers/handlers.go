@@ -3,8 +3,12 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	stderrors "errors"
+	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -91,6 +95,17 @@ var (
 	}
 )
 
+// MaxRequestDuration is the worst-case wall-clock time a single request can
+// hold its connection: FIPRequestHandler waits up to allocationWaitTimeout for
+// the manager to populate Status.IPAddr, then runs its cleanup deletes on a
+// fresh context bounded by cleanupTimeout. The HTTP server's graceful-shutdown
+// grace must exceed this, otherwise a rolling restart kills the process while
+// an allocation handler is still mid-write and resets the client instead of
+// answering it.
+func MaxRequestDuration() time.Duration {
+	return allocationWaitTimeout + cleanupTimeout
+}
+
 // updateFloatingIP applies mutate to a freshly fetched copy of desired and
 // retries on resourceVersion conflicts. Without the re-fetch, a concurrent
 // writer (the manager controller or another request claiming the same FIP)
@@ -98,10 +113,24 @@ var (
 // resourceVersion would surface as an opaque 500.
 // On success desired reflects the persisted object.
 func updateFloatingIP(ctx context.Context, cl client.Client, desired *fipv1beta2.FloatingIP, mutate func(*fipv1beta2.FloatingIP)) error {
+	return updateFloatingIPIf(ctx, cl, desired, nil, mutate)
+}
+
+// updateFloatingIPIf is updateFloatingIP with a precondition: claimable runs
+// against the freshly fetched object inside every retry attempt, and a false
+// result aborts with errFIPClaimed instead of writing. Because the check sees
+// the live object, a claim that landed between the caller's List and its
+// Update is detected either by the fresh read or by the resourceVersion
+// conflict the competing write caused. RetryOnConflict only retries Conflicts,
+// so a claim refusal surfaces to the caller immediately.
+func updateFloatingIPIf(ctx context.Context, cl client.Client, desired *fipv1beta2.FloatingIP, claimable func(*fipv1beta2.FloatingIP) bool, mutate func(*fipv1beta2.FloatingIP)) error {
 	return retry.RetryOnConflict(fipUpdateBackoff, func() error {
 		fresh := &fipv1beta2.FloatingIP{}
 		if err := cl.Get(ctx, client.ObjectKey{Namespace: desired.Namespace, Name: desired.Name}, fresh); err != nil {
 			return err
+		}
+		if claimable != nil && !claimable(fresh) {
+			return errFIPClaimed
 		}
 		mutate(fresh)
 		if err := cl.Update(ctx, fresh); err != nil {
@@ -110,6 +139,35 @@ func updateFloatingIP(ctx context.Context, cl client.Client, desired *fipv1beta2
 		*desired = *fresh
 		return nil
 	})
+}
+
+// errFIPClaimed marks a FloatingIP a concurrent request claimed first. It is
+// deliberately not a Conflict: retrying the same object cannot help, the
+// caller has to pick another candidate or create a new FloatingIP.
+var errFIPClaimed = stderrors.New("floating ip already claimed by another request")
+
+// fipClaimableByCluster reports whether a request pinned to cluster may write
+// its service labels onto fip. A FIP without a cluster-name label is
+// unclaimed; one claimed by another cluster is unavailable. The cluster-name
+// label is written in the same update as the service labels, so it is visible
+// immediately, whereas Status.Assigned only appears once the manager
+// reconciles the claim.
+func fipClaimableByCluster(fip *fipv1beta2.FloatingIP, cluster string) bool {
+	claimedBy := fip.Labels["rancher.k8s.binbash.org/cluster-name"]
+	return claimedBy == "" || claimedBy == cluster
+}
+
+// fipClaimableByRequest reports whether a request that did not pin an address
+// may claim fip. An unclaimed FIP is always available; once claimed, the
+// address is shared only with the same cluster through an explicit
+// FloatingIPGroup, mirroring the group-reuse branch and the manager's group
+// semantics.
+func fipClaimableByRequest(fip *fipv1beta2.FloatingIP, cluster, group string) bool {
+	claimedBy := fip.Labels["rancher.k8s.binbash.org/cluster-name"]
+	if claimedBy == "" {
+		return true
+	}
+	return group != "" && claimedBy == cluster && fip.Labels["rancher.k8s.binbash.org/floatingip-group"] == group
 }
 
 // applyFIPRequestLabels writes the project, cluster, service and group labels
@@ -186,6 +244,244 @@ func TokenHandler(app *types.App) http.HandlerFunc {
 	}
 }
 
+// errHTTP is a handler failure that carries the HTTP status the client
+// should see, so helpers can return a failure and the response layer stays in
+// one place.
+type errHTTP struct {
+	status  int
+	message string
+}
+
+func (e *errHTTP) Error() string { return e.message }
+
+func newErrHTTP(status int, format string, args ...interface{}) *errHTTP {
+	return &errHTTP{status: status, message: fmt.Sprintf(format, args...)}
+}
+
+// writeHandlerError answers w with err's status when it carries one and a
+// generic 500 otherwise, so API internals never reach the client.
+func writeHandlerError(w http.ResponseWriter, err error) {
+	var he *errHTTP
+	if stderrors.As(err, &he) {
+		errors.WriteJSONError(w, he.status, he.message)
+		return
+	}
+	errors.WriteJSONError(w, http.StatusInternalServerError, "failed to process floating IP request")
+}
+
+// createErrorToHTTP maps a FloatingIP create failure to a client-facing error:
+// a 4xx StatusError keeps its code (a validating-webhook denial arrives as a
+// 400 — k8s.io/apiserver's ToStatusErr clamps denial codes to >= 400 — and
+// the webhook's message is client-facing), anything else becomes a sanitized
+// 500 in writeHandlerError. The raw API error text used to be written into the
+// body.
+func createErrorToHTTP(err error) error {
+	if k8serrors.IsAlreadyExists(err) {
+		return newErrHTTP(http.StatusConflict, "floating IP request is already in progress, retry the request")
+	}
+	var status k8serrors.APIStatus
+	if stderrors.As(err, &status) {
+		s := status.Status()
+		if s.Code >= http.StatusBadRequest && s.Code < http.StatusInternalServerError {
+			message := s.Message
+			if message == "" {
+				message = "floating IP request rejected by the API server"
+			}
+			return newErrHTTP(int(s.Code), "%s", message)
+		}
+	}
+	return err
+}
+
+// specificFIPName derives the deterministic object name of a pinned-address
+// FloatingIP. The name is a pure function of the uniqueness domain the
+// validating webhook enforces (pool + canonical address), so concurrent
+// creates for one address collide on the API server's name uniqueness instead
+// of persisting two FloatingIPs that claim it. Being server-side, it holds
+// across apiserver replicas and restarts, unlike a per-process lock.
+func specificFIPName(pool, ipAddr string) string {
+	canonical := ipAddr
+	if parsed := net.ParseIP(ipAddr); parsed != nil {
+		canonical = parsed.String()
+	}
+	sum := sha256.Sum256([]byte(pool + "/" + canonical))
+	return "fip-" + hex.EncodeToString(sum[:16])
+}
+
+// checkSpecificIPClaimable validates a pinned-address request against an
+// existing FloatingIP before this request writes its labels onto it.
+func checkSpecificIPClaimable(fip *fipv1beta2.FloatingIP, req types.FIPRequest) error {
+	if fip.DeletionTimestamp != nil {
+		// The address is released just before the finalizer is removed; a
+		// retry lands on a fresh object instead of a disappearing one.
+		return newErrHTTP(http.StatusConflict, "FloatingIP is being released, retry the request")
+	}
+	if fip.Labels["rancher.k8s.binbash.org/project-name"] != req.Project {
+		// Only reachable through the create collision: the same pool and
+		// address already belong to another project in this namespace.
+		return newErrHTTP(http.StatusConflict, "IP address is already in use by another project")
+	}
+	if fip.Status.Assigned != nil {
+		// Check if FloatingIPGroup is set in Status.Assigned
+		if fip.Status.Assigned.FloatingIPGroup == "" {
+			// IP is already assigned, which is an error condition
+			return newErrHTTP(http.StatusConflict, "IP address is already assigned")
+		}
+		// FloatingIPGroup exists in Status.Assigned, check if request specifies a FloatingIPGroup
+		if req.FloatingIPGroup != "" && req.FloatingIPGroup != fip.Status.Assigned.FloatingIPGroup {
+			return newErrHTTP(http.StatusConflict, "FloatingIPGroup does not match the assigned FloatingIPGroup")
+		}
+		// Check if the existingFIP is already assigned to a different cluster-name
+		if fip.Status.Assigned.ClusterName != req.Cluster {
+			return newErrHTTP(http.StatusConflict, "FloatingIP is already in use by another cluster")
+		}
+	}
+	return nil
+}
+
+// findPinnedFIP looks up the project's FloatingIP for a pinned address. The
+// client is uncached, so the result reflects the API server's current state;
+// callers re-run it after a failed create to pick up an object a concurrent
+// request persisted.
+func findPinnedFIP(ctx context.Context, app *types.App, project managementv3.Project, req types.FIPRequest) (*fipv1beta2.FloatingIP, bool, error) {
+	fipList := &fipv1beta2.FloatingIPList{}
+	if err := app.FipRestClient.List(ctx, fipList, client.InNamespace(project.Namespace)); err != nil {
+		return nil, false, err
+	}
+	for i := range fipList.Items {
+		// Check of the FloatingIP belongs to the project and equals the requested IP
+		if fipList.Items[i].Labels["rancher.k8s.binbash.org/project-name"] == req.Project && fipList.Items[i].Spec.IPAddr != nil && *fipList.Items[i].Spec.IPAddr == req.IPAddress {
+			return &fipList.Items[i], true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// createSpecificIP persists the FloatingIP for a pinned address under its
+// deterministic name. When a concurrent request got there first, the winner's
+// object is adopted and returned with createdNew false, so the caller runs the
+// normal claim checks against it and the allocation-timeout cleanup never
+// deletes an object this request did not create.
+func createSpecificIP(ctx context.Context, app *types.App, project managementv3.Project, req types.FIPRequest) (*fipv1beta2.FloatingIP, bool, error) {
+	// Note: we allow to have FloatingIPGroups with the same name in different FloatingIPs
+
+	fipLabels := make(map[string]string)
+	fipLabels["rancher.k8s.binbash.org/project-name"] = project.Name
+	fipLabels["rancher.k8s.binbash.org/cluster-name"] = req.Cluster
+	fipLabels["rancher.k8s.binbash.org/service-0-name"] = req.ServiceName
+	fipLabels["rancher.k8s.binbash.org/service-0-namespace"] = req.ServiceNamespace
+	if req.FloatingIPGroup != "" {
+		fipLabels["rancher.k8s.binbash.org/floatingip-group"] = req.FloatingIPGroup
+	}
+
+	fip := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      specificFIPName(req.FloatingIPPool, req.IPAddress),
+			Namespace: project.Namespace,
+			Labels:    fipLabels,
+		},
+		Spec: fipv1beta2.FloatingIPSpec{
+			IPAddr:         &req.IPAddress,
+			FloatingIPPool: req.FloatingIPPool,
+		},
+	}
+	err := app.FipRestClient.Create(ctx, fip)
+	if err == nil {
+		app.Log.Infof("Created FloatingIP %s/%s", fip.Namespace, fip.Name)
+		return fip, true, nil
+	}
+
+	if k8serrors.IsAlreadyExists(err) {
+		// The deterministic name is taken: a concurrent request persisted this
+		// address. Adopt that object instead of failing.
+		existing := &fipv1beta2.FloatingIP{}
+		if getErr := app.FipRestClient.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: fip.Name}, existing); getErr == nil {
+			if existing.Spec.IPAddr == nil || *existing.Spec.IPAddr != req.IPAddress || existing.Spec.FloatingIPPool != req.FloatingIPPool {
+				// Defensive: the name is a hash, so a mismatch means the name
+				// is taken by something this request must not touch.
+				return nil, false, newErrHTTP(http.StatusConflict, "floating IP request conflicts with an existing object, retry the request")
+			}
+			return existing, false, nil
+		} else if !k8serrors.IsNotFound(getErr) {
+			app.Log.Errorf("failed to get floatingip %s/%s: %s", fip.Namespace, fip.Name, getErr.Error())
+			return nil, false, newErrHTTP(http.StatusInternalServerError, "failed to read the existing floating IP")
+		}
+		// Released between the create and the get: fall through to the re-list.
+	}
+
+	// The create can also fail with the webhook's denial instead of
+	// AlreadyExists: admission runs before persistence, so the loser of a
+	// concurrent race is denied by the duplicate-IP reservation while the
+	// winner's object is already persisted. Adopt it; only when the address is
+	// genuinely still absent does the create error reach the client.
+	if existing, found, listErr := findPinnedFIP(ctx, app, project, req); listErr != nil {
+		app.Log.Errorf("failed to list floatingips after a create failure: %s", listErr.Error())
+	} else if found {
+		app.Log.Infof("Adopting FloatingIP %s/%s persisted by a concurrent request", existing.Namespace, existing.Name)
+		return existing, false, nil
+	}
+
+	app.Log.Errorf("failed to create floatingip: %s", err.Error())
+	return nil, false, createErrorToHTTP(err)
+}
+
+// requestSpecificIP allocates the FloatingIP for a request that pins an
+// address, returning the object this request owns and whether it created it.
+//
+// Two concurrent requests for one address used to both List, both find
+// nothing and both Create, leaving two FloatingIPs claiming the same address.
+// The create now uses a deterministic name, and a failed
+// create re-lists and adopts the winner's object, so the loser goes through
+// the same claim checks instead of persisting a duplicate.
+func requestSpecificIP(ctx context.Context, app *types.App, project managementv3.Project, req types.FIPRequest) (*fipv1beta2.FloatingIP, bool, error) {
+	existing, found, err := findPinnedFIP(ctx, app, project, req)
+	if err != nil {
+		app.Log.Errorf("failed to list floatingips: %s", err.Error())
+		return nil, false, newErrHTTP(http.StatusInternalServerError, "failed to list existing floating IPs")
+	}
+
+	if !found {
+		created, createdNew, err := createSpecificIP(ctx, app, project, req)
+		if err != nil {
+			return nil, false, err
+		}
+		if createdNew {
+			return created, true, nil
+		}
+		existing = created
+	}
+
+	if err := checkSpecificIPClaimable(existing, req); err != nil {
+		return nil, false, err
+	}
+
+	// It exists but is not assigned (or is ours), so we can use it. The claim
+	// is re-checked on the live object: a concurrent request may have claimed
+	// this FIP after our List but before our Update, and its cluster-name
+	// label is already visible even though the manager has not published
+	// Status.Assigned yet.
+	if err := updateFloatingIPIf(ctx, app.FipRestClient, existing, func(f *fipv1beta2.FloatingIP) bool {
+		return fipClaimableByCluster(f, req.Cluster)
+	}, func(f *fipv1beta2.FloatingIP) {
+		if !applyFIPRequestLabels(f, project.Name, req.Cluster, req.ServiceName, req.ServiceNamespace, req.FloatingIPGroup) {
+			app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
+				req.ServiceNamespace, req.ServiceName, existing.Namespace, existing.Name)
+		}
+	}); err != nil {
+		if stderrors.Is(err, errFIPClaimed) {
+			return nil, false, newErrHTTP(http.StatusConflict, "FloatingIP is already in use by another cluster")
+		}
+		if k8serrors.IsConflict(err) {
+			return nil, false, newErrHTTP(http.StatusConflict, "conflict updating floating IP, retry the request")
+		}
+		app.Log.Errorf("failed to update floatingip: %s", err.Error())
+		return nil, false, err
+	}
+	app.Log.Infof("Updated existing FloatingIP %s/%s with new service labels", existing.Namespace, existing.Name)
+
+	return existing, false, nil
+}
+
 // FIPRequestHandler handles requests to allocate a new floating IP.
 // It creates a FloatingIP custom resource and waits for it to be reconciled.
 func FIPRequestHandler(app *types.App) http.HandlerFunc {
@@ -241,96 +537,14 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 
 		var floatingIP *fipv1beta2.FloatingIP
 		if fipRequest.IPAddress != "" {
-			// IP address is given in the request
-
-			fipList := &fipv1beta2.FloatingIPList{}
-			if err := app.FipRestClient.List(r.Context(), fipList, client.InNamespace(project.Namespace)); err != nil {
-				app.Log.Errorf("failed to list floatingips: %s", err.Error())
-				errors.WriteJSONError(w, http.StatusInternalServerError, "failed to list existing floating IPs")
+			// IP address is given in the request: look up, claim or create it.
+			// The helper owns the create-collision handling so two requests
+			// for one address cannot persist two FloatingIPs.
+			floatingIP, createdNew, err = requestSpecificIP(r.Context(), app, project, fipRequest)
+			if err != nil {
+				app.Log.Errorf("failed to request ip %s: %s", fipRequest.IPAddress, err.Error())
+				writeHandlerError(w, err)
 				return
-			}
-
-			var existingFIP *fipv1beta2.FloatingIP
-			for i := range fipList.Items {
-				// Check of the FloatingIP belongs to the project and equals the requested IP
-				if fipList.Items[i].Labels["rancher.k8s.binbash.org/project-name"] == fipRequest.Project && fipList.Items[i].Spec.IPAddr != nil && *fipList.Items[i].Spec.IPAddr == fipRequest.IPAddress {
-					existingFIP = &fipList.Items[i]
-					break
-				}
-			}
-
-			if existingFIP != nil {
-				// FIP with requested IP exists within the project
-				if existingFIP.Status.Assigned != nil {
-					// Check if FloatingIPGroup is set in Status.Assigned
-					if existingFIP.Status.Assigned.FloatingIPGroup == "" {
-						// IP is already assigned, which is an error condition
-						errors.WriteJSONError(w, http.StatusConflict, "IP address is already assigned")
-						app.Log.Errorf("requested ip %s is already assigned", fipRequest.IPAddress)
-						return
-					}
-					// FloatingIPGroup exists in Status.Assigned, check if request specifies a FloatingIPGroup
-					if fipRequest.FloatingIPGroup != "" {
-						// Check if the FloatingIPGroup strings match
-						if fipRequest.FloatingIPGroup != existingFIP.Status.Assigned.FloatingIPGroup {
-							errors.WriteJSONError(w, http.StatusConflict, "FloatingIPGroup does not match the assigned FloatingIPGroup")
-							app.Log.Errorf("requested FloatingIPGroup %s does not match assigned FloatingIPGroup %s", fipRequest.FloatingIPGroup, existingFIP.Status.Assigned.FloatingIPGroup)
-							return
-						}
-					}
-					// Check if the existingFIP is already assigned to a different cluster-name
-					if existingFIP.Status.Assigned.ClusterName != fipRequest.Cluster {
-						errors.WriteJSONError(w, http.StatusConflict, "FloatingIP is already in use by another cluster")
-						app.Log.Errorf("requested ClusterName %s does not match assigned ClusterName %s", fipRequest.Cluster, existingFIP.Status.Assigned.ClusterName)
-						return
-					}
-				}
-
-				// It exists but is not assigned, so we can use it.
-				floatingIP = existingFIP
-				if err := updateFloatingIP(r.Context(), app.FipRestClient, floatingIP, func(f *fipv1beta2.FloatingIP) {
-					if !applyFIPRequestLabels(f, project.Name, fipRequest.Cluster, fipRequest.ServiceName, fipRequest.ServiceNamespace, fipRequest.FloatingIPGroup) {
-						app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
-							fipRequest.ServiceNamespace, fipRequest.ServiceName, floatingIP.Namespace, floatingIP.Name)
-					}
-				}); err != nil {
-					app.Log.Errorf("failed to update floatingip: %s", err.Error())
-					writeUpdateError(w, err)
-					return
-				}
-				app.Log.Infof("Updated existing FloatingIP %s/%s with new service labels", floatingIP.Namespace, floatingIP.Name)
-			} else {
-				// FIP with requested IP does not exist, so create it
-
-				// Note: we allow to have FloatingIPGroups with the same name in different FloatingIPs
-
-				fipLabels := make(map[string]string)
-				fipLabels["rancher.k8s.binbash.org/project-name"] = project.Name
-				fipLabels["rancher.k8s.binbash.org/cluster-name"] = fipRequest.Cluster
-				fipLabels["rancher.k8s.binbash.org/service-0-name"] = fipRequest.ServiceName
-				fipLabels["rancher.k8s.binbash.org/service-0-namespace"] = fipRequest.ServiceNamespace
-				if fipRequest.FloatingIPGroup != "" {
-					fipLabels["rancher.k8s.binbash.org/floatingip-group"] = fipRequest.FloatingIPGroup
-				}
-
-				floatingIP = &fipv1beta2.FloatingIP{
-					ObjectMeta: metav1.ObjectMeta{
-						GenerateName: "fip-",
-						Namespace:    project.Namespace,
-						Labels:       fipLabels,
-					},
-					Spec: fipv1beta2.FloatingIPSpec{
-						IPAddr:         &fipRequest.IPAddress,
-						FloatingIPPool: fipRequest.FloatingIPPool,
-					},
-				}
-				if err := app.FipRestClient.Create(r.Context(), floatingIP); err != nil {
-					app.Log.Errorf("failed to create floatingip: %s", err.Error())
-					errors.WriteJSONError(w, http.StatusInternalServerError, err.Error())
-					return
-				}
-				createdNew = true
-				app.Log.Infof("Created FloatingIP %s/%s", floatingIP.Namespace, floatingIP.Name)
 			}
 		} else {
 			// IP address is NOT given in the request
@@ -354,60 +568,89 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 					}
 				}
 			}
-			// If the existingFIP is not set we can search for an unassigned FloatingIP within the project
-			if existingFIP == nil {
-				for i := range fipList.Items {
-					// Check of the FloatingIP belongs to the project and is not assigned
-					if fipList.Items[i].Labels["rancher.k8s.binbash.org/project-name"] == fipRequest.Project && fipList.Items[i].Status.IPAddr != "" && fipList.Items[i].Status.Assigned == nil {
-						existingFIP = &fipList.Items[i]
-						break
-					}
+
+			claimLabels := func(f *fipv1beta2.FloatingIP) {
+				if !applyFIPRequestLabels(f, project.Name, fipRequest.Cluster, fipRequest.ServiceName, fipRequest.ServiceNamespace, fipRequest.FloatingIPGroup) {
+					app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
+						fipRequest.ServiceNamespace, fipRequest.ServiceName, f.Namespace, f.Name)
 				}
 			}
 
 			if existingFIP != nil {
-				// There is an existing FloatingIP in the project but it's not assigned, so we can use it.
+				// The group match is already assigned to this cluster and group,
+				// so sharing it is the requested behaviour.
 				floatingIP = existingFIP
-				if err := updateFloatingIP(r.Context(), app.FipRestClient, floatingIP, func(f *fipv1beta2.FloatingIP) {
-					if !applyFIPRequestLabels(f, project.Name, fipRequest.Cluster, fipRequest.ServiceName, fipRequest.ServiceNamespace, fipRequest.FloatingIPGroup) {
-						app.Log.Errorf("Service %s/%s already exists in FloatingIP %s/%s, skipping duplicate label addition",
-							fipRequest.ServiceNamespace, fipRequest.ServiceName, floatingIP.Namespace, floatingIP.Name)
-					}
-				}); err != nil {
+				if err := updateFloatingIP(r.Context(), app.FipRestClient, floatingIP, claimLabels); err != nil {
 					app.Log.Errorf("failed to update floatingip: %s", err.Error())
 					writeUpdateError(w, err)
 					return
 				}
 				app.Log.Infof("Updated existing FloatingIP %s/%s with new service labels", floatingIP.Namespace, floatingIP.Name)
 			} else {
-				// No IP address requested, create a new one with the first service
-
-				fipLabels := make(map[string]string)
-				fipLabels["rancher.k8s.binbash.org/project-name"] = project.Name
-				fipLabels["rancher.k8s.binbash.org/cluster-name"] = fipRequest.Cluster
-				fipLabels["rancher.k8s.binbash.org/service-0-name"] = fipRequest.ServiceName
-				fipLabels["rancher.k8s.binbash.org/service-0-namespace"] = fipRequest.ServiceNamespace
-				if fipRequest.FloatingIPGroup != "" {
-					fipLabels["rancher.k8s.binbash.org/floatingip-group"] = fipRequest.FloatingIPGroup
+				// No group match: claim an unassigned FloatingIP in the project.
+				// The List snapshot cannot be trusted for exclusivity (a
+				// concurrent request sees the same candidates), so each
+				// candidate is claimed with the claim re-checked on the live
+				// object. A candidate another request claimed first is skipped;
+				// when none is left a new FloatingIP is created, exactly as if
+				// the project had no unassigned FIP to begin with.
+				for i := range fipList.Items {
+					candidate := &fipList.Items[i]
+					// Check of the FloatingIP belongs to the project and is not assigned
+					if candidate.Labels["rancher.k8s.binbash.org/project-name"] != fipRequest.Project || candidate.Status.IPAddr == "" || candidate.Status.Assigned != nil {
+						continue
+					}
+					err := updateFloatingIPIf(r.Context(), app.FipRestClient, candidate, func(f *fipv1beta2.FloatingIP) bool {
+						return fipClaimableByRequest(f, fipRequest.Cluster, fipRequest.FloatingIPGroup)
+					}, claimLabels)
+					if stderrors.Is(err, errFIPClaimed) || k8serrors.IsNotFound(err) {
+						// Claimed by a concurrent request, or gone since the
+						// List: try the next candidate.
+						app.Log.Infof("Skipping FloatingIP %s/%s: %s", candidate.Namespace, candidate.Name, err.Error())
+						continue
+					}
+					if err != nil {
+						app.Log.Errorf("failed to update floatingip: %s", err.Error())
+						writeUpdateError(w, err)
+						return
+					}
+					existingFIP = candidate
+					break
 				}
 
-				floatingIP = &fipv1beta2.FloatingIP{
-					ObjectMeta: metav1.ObjectMeta{
-						GenerateName: "fip-",
-						Namespace:    project.Namespace,
-						Labels:       fipLabels,
-					},
-					Spec: fipv1beta2.FloatingIPSpec{
-						FloatingIPPool: fipRequest.FloatingIPPool,
-					},
+				if existingFIP != nil {
+					floatingIP = existingFIP
+					app.Log.Infof("Updated existing FloatingIP %s/%s with new service labels", floatingIP.Namespace, floatingIP.Name)
+				} else {
+					// No IP address requested, create a new one with the first service
+
+					fipLabels := make(map[string]string)
+					fipLabels["rancher.k8s.binbash.org/project-name"] = project.Name
+					fipLabels["rancher.k8s.binbash.org/cluster-name"] = fipRequest.Cluster
+					fipLabels["rancher.k8s.binbash.org/service-0-name"] = fipRequest.ServiceName
+					fipLabels["rancher.k8s.binbash.org/service-0-namespace"] = fipRequest.ServiceNamespace
+					if fipRequest.FloatingIPGroup != "" {
+						fipLabels["rancher.k8s.binbash.org/floatingip-group"] = fipRequest.FloatingIPGroup
+					}
+
+					floatingIP = &fipv1beta2.FloatingIP{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "fip-",
+							Namespace:    project.Namespace,
+							Labels:       fipLabels,
+						},
+						Spec: fipv1beta2.FloatingIPSpec{
+							FloatingIPPool: fipRequest.FloatingIPPool,
+						},
+					}
+					if err := app.FipRestClient.Create(r.Context(), floatingIP); err != nil {
+						app.Log.Errorf("failed to create floatingip: %s", err.Error())
+						writeHandlerError(w, createErrorToHTTP(err))
+						return
+					}
+					createdNew = true
+					app.Log.Infof("Created FloatingIP %s/%s", floatingIP.Namespace, floatingIP.Name)
 				}
-				if err := app.FipRestClient.Create(r.Context(), floatingIP); err != nil {
-					app.Log.Errorf("failed to create floatingip: %s", err.Error())
-					errors.WriteJSONError(w, http.StatusInternalServerError, err.Error())
-					return
-				}
-				createdNew = true
-				app.Log.Infof("Created FloatingIP %s/%s", floatingIP.Namespace, floatingIP.Name)
 			}
 		}
 
@@ -461,6 +704,13 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 			sharedKey = finalFip.Status.Assigned.SharedKey
 		}
 
+		subnet := ""
+		if fipPool.Spec.IPConfig != nil {
+			subnet = fipPool.Spec.IPConfig.Subnet
+		} else {
+			app.Log.Warnf("floatingippool %s has no ipConfig, returning empty subnet", fipRequest.FloatingIPPool)
+		}
+
 		fipResponse := types.FIPResponse{
 			Status:           "approved",
 			ClientSecret:     fipRequest.ClientSecret,
@@ -470,7 +720,7 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 			ServiceNamespace: fipRequest.ServiceNamespace,
 			ServiceName:      fipRequest.ServiceName,
 			IPAddress:        finalFip.Status.IPAddr,
-			Subnet:           fipPool.Spec.IPConfig.Subnet,
+			Subnet:           subnet,
 			FloatingIPGroup:  fipGroup,
 			SharedKey:        sharedKey,
 		}

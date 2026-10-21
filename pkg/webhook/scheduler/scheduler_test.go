@@ -37,7 +37,7 @@ func newSchedulerTestConfigHandler() *config.Handler {
 }
 
 // TestStartCertRenewalSchedulerDoesNotPanicWithoutMaterial pins the
-// REPORT.md 2.1/2.2 steady state: previously an empty or absent certificate
+// steady state: previously an empty or absent certificate
 // made the scheduler log.Panicf at startup, permanently CrashLoopBackOff-ing
 // the webhook with only a manual Secret deletion as recovery. Now it must
 // return and keep retrying.
@@ -169,7 +169,7 @@ func TestRenewalCheckIntervalMinutes(t *testing.T) {
 		period      int64
 		want        int64
 	}{
-		// REPORT.md 2.4: the raw schedule (lifetime − period + 1) must be
+		// The raw schedule (lifetime − period + 1) must be
 		// bounded by min(lifetime/3, period).
 		{"year cert with 30d period checks monthly", 365 * day, month, month},
 		{"period bound beats third of lifetime", 365 * day, 1, 1},
@@ -185,7 +185,7 @@ func TestRenewalCheckIntervalMinutes(t *testing.T) {
 	}
 }
 
-// TestRenewCertificateRotatesInPlace pins REPORT.md 2.4/2.5: a successful
+// TestRenewCertificateRotatesInPlace pins the in-place rotation contract: a successful
 // renewal must swap the certificate into the live listener — the admission
 // endpoint is never stopped, so no write-blackout window is created.
 func TestRenewCertificateRotatesInPlace(t *testing.T) {

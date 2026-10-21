@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -88,7 +92,7 @@ func setFIPStatusLater(t *testing.T, delay time.Duration, namespace, name string
 }
 
 // =============================================================================
-// WatchFloatingIP Tests (REPORT.md 4.1)
+// WatchFloatingIP Tests
 // =============================================================================
 
 // TestWatchFloatingIPReturnsAllocation verifies the watch observes a status
@@ -118,8 +122,8 @@ func TestWatchFloatingIPReturnsAllocation(t *testing.T) {
 }
 
 // TestWatchFloatingIPNotFoundIsTerminal verifies a missing FloatingIP aborts
-// immediately with NotFound instead of polling until the deadline (REPORT.md
-// 4.1: ~300 pointless Gets per hopeless request).
+// immediately with NotFound instead of polling until the deadline (~300
+// pointless Gets per hopeless request).
 func TestWatchFloatingIPNotFoundIsTerminal(t *testing.T) {
 	ns := createNamespaceAndProject(t, "test-watch-nf-", "proj-watch-nf")
 
@@ -267,7 +271,7 @@ func TestFIPRequestHandlerClientDisconnectDeletesCreatedFIP(t *testing.T) {
 }
 
 // =============================================================================
-// Lost-update / conflict retry Tests (REPORT.md 4.2)
+// Lost-update / conflict retry Tests
 // =============================================================================
 
 // conflictOnceClient injects a stale resourceVersion into the first Update to
@@ -368,4 +372,672 @@ func TestUpdateFloatingIPSurfacesPersistentConflict(t *testing.T) {
 	final := &fipv1beta2.FloatingIP{}
 	require.NoError(t, app.FipRestClient.Get(ctx, key, final))
 	assert.NotContains(t, final.Labels, "rancher.k8s.binbash.org/service-0-name")
+}
+
+// =============================================================================
+// Atomic claim of an unassigned FloatingIP
+// =============================================================================
+
+// createFloatingIPPool creates the cluster-scoped pool the request handlers
+// read the subnet from.
+func createFloatingIPPool(t *testing.T, name, subnet, start, end string) {
+	t.Helper()
+	fipPoolGVR := schema.GroupVersionResource{
+		Group:    "rancher.k8s.binbash.org",
+		Version:  "v1beta2",
+		Resource: "floatingippools",
+	}
+	fipPool := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "rancher.k8s.binbash.org/v1beta2",
+			"kind":       "FloatingIPPool",
+			"metadata": map[string]interface{}{
+				"name": name,
+			},
+			"spec": map[string]interface{}{
+				"ipConfig": map[string]interface{}{
+					"family": "IPv4",
+					"subnet": subnet,
+					"pool": map[string]interface{}{
+						"start": start,
+						"end":   end,
+					},
+				},
+			},
+		},
+	}
+	_, err := app.DynamicClient.Resource(fipPoolGVR).Create(context.Background(), fipPool, metav1.CreateOptions{})
+	// Cluster-scoped and identical across -count runs; the handler only reads
+	// the subnet.
+	if err != nil && !k8serrors.IsAlreadyExists(err) {
+		require.NoError(t, err)
+	}
+}
+
+// createUnassignedFIP creates a FloatingIP with an allocated address and no
+// assignment, the state the auto-allocation path selects from.
+func createUnassignedFIP(t *testing.T, namespace, name, project, pool, ipAddr string) *fipv1beta2.FloatingIP {
+	t.Helper()
+	ctx := context.Background()
+	addr := ipAddr
+	fip := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{"rancher.k8s.binbash.org/project-name": project},
+		},
+		Spec: fipv1beta2.FloatingIPSpec{IPAddr: &addr, FloatingIPPool: pool},
+	}
+	require.NoError(t, app.FipRestClient.Create(ctx, fip))
+	fip.Status.IPAddr = addr
+	fip.Status.State = "Allocated"
+	require.NoError(t, app.FipRestClient.Status().Update(ctx, fip))
+	return fip
+}
+
+// listBarrierClient blocks every List until want callers have entered it, so
+// concurrent handler invocations all build their candidate snapshots before
+// any of them writes. That turns the List-then-claim window into a
+// deterministic race instead of a probabilistic one.
+type listBarrierClient struct {
+	client.Client
+	want    int
+	mu      sync.Mutex
+	arrived int
+	release chan struct{}
+}
+
+func newListBarrierClient(inner client.Client, want int) *listBarrierClient {
+	return &listBarrierClient{Client: inner, want: want, release: make(chan struct{})}
+}
+
+func (c *listBarrierClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	c.mu.Lock()
+	c.arrived++
+	arrived := c.arrived
+	if c.arrived >= c.want {
+		select {
+		case <-c.release:
+		default:
+			close(c.release)
+		}
+	}
+	c.mu.Unlock()
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(20 * time.Second):
+		return fmt.Errorf("list barrier timed out after %d of %d callers", arrived, c.want)
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+// runConcurrentNoIPRequests fires one auto-allocation request per service at
+// the same time and returns their responses in order.
+func runConcurrentNoIPRequests(t *testing.T, project, pool, cluster string, services ...string) []*httptest.ResponseRecorder {
+	t.Helper()
+	recorders := make([]*httptest.ResponseRecorder, len(services))
+	var wg sync.WaitGroup
+	for i, svc := range services {
+		wg.Add(1)
+		go func(i int, svc string) {
+			defer wg.Done()
+			body, err := json.Marshal(&types.FIPRequest{
+				Project:          project,
+				FloatingIPPool:   pool,
+				Cluster:          cluster,
+				ServiceName:      svc,
+				ServiceNamespace: "default",
+			})
+			if err != nil {
+				t.Errorf("marshal request: %v", err)
+				return
+			}
+			w := httptest.NewRecorder()
+			FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+			recorders[i] = w
+		}(i, svc)
+	}
+	wg.Wait()
+	return recorders
+}
+
+// serviceNamesOnFIP returns the service-<id>-name label values of fip.
+func serviceNamesOnFIP(fip *fipv1beta2.FloatingIP) []string {
+	var names []string
+	for key, val := range fip.Labels {
+		if strings.HasPrefix(key, "rancher.k8s.binbash.org/service-") && strings.HasSuffix(key, "-name") {
+			names = append(names, val)
+		}
+	}
+	return names
+}
+
+// TestFIPRequestHandlerConcurrentNoIPRequestsDoNotShareSingleFIP pins the
+// atomic-claim fix: two simultaneous auto-allocation requests must not claim
+// the same unassigned FloatingIP. Before the fix both handlers wrote their
+// service labels onto the single candidate (their conflict retries re-applied
+// the labels without re-checking the claim) and both clients were handed the
+// same address.
+func TestFIPRequestHandlerConcurrentNoIPRequestsDoNotShareSingleFIP(t *testing.T) {
+	const projectName = "proj-claim-single"
+	ns := createNamespaceAndProject(t, "test-claim-single-", projectName)
+	createFloatingIPPool(t, "pool-claim-single", "10.51.0.0/24", "10.51.0.1", "10.51.0.254")
+	createUnassignedFIP(t, ns.GetName(), "fip-claim-single", projectName, "pool-claim-single", "10.51.0.10")
+
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 10 * time.Second
+	defer func() { allocationWaitTimeout = origTimeout }()
+
+	inner := app.FipRestClient
+
+	// Stand in for the manager: allocate an address for any FIP this request
+	// creates (the pre-existing candidate already carries one).
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			list := &fipv1beta2.FloatingIPList{}
+			if err := inner.List(context.Background(), list, client.InNamespace(ns.GetName())); err != nil {
+				continue
+			}
+			for i := range list.Items {
+				f := list.Items[i]
+				if f.Status.IPAddr != "" {
+					continue
+				}
+				f.Status.IPAddr = "10.51.0.20"
+				f.Status.State = "Allocated"
+				_ = inner.Status().Update(context.Background(), &f)
+			}
+		}
+	}()
+
+	app.FipRestClient = newListBarrierClient(inner, 2)
+	defer func() { app.FipRestClient = inner }()
+
+	responses := runConcurrentNoIPRequests(t, projectName, "pool-claim-single", "cluster-claim", "svc-a", "svc-b")
+
+	ips := make([]string, len(responses))
+	for i, w := range responses {
+		require.Equal(t, http.StatusOK, w.Code, "request %d failed: %s", i, w.Body.String())
+		var resp types.FIPResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		ips[i] = resp.IPAddress
+	}
+	require.NotEqual(t, ips[0], ips[1], "concurrent requests must not be handed the same floating IP")
+
+	fipList := &fipv1beta2.FloatingIPList{}
+	require.NoError(t, inner.List(context.Background(), fipList, client.InNamespace(ns.GetName())))
+	require.Len(t, fipList.Items, 2, "the losing request must create its own FloatingIP")
+	for i := range fipList.Items {
+		assert.Len(t, serviceNamesOnFIP(&fipList.Items[i]), 1,
+			"FloatingIP %s must carry exactly one service, got %v", fipList.Items[i].Name, serviceNamesOnFIP(&fipList.Items[i]))
+	}
+}
+
+// TestFIPRequestHandlerConcurrentNoIPRequestsClaimDistinctFIPs verifies that
+// with two unassigned FloatingIPs available, two simultaneous requests end up
+// on one FIP each instead of both taking the first candidate.
+func TestFIPRequestHandlerConcurrentNoIPRequestsClaimDistinctFIPs(t *testing.T) {
+	const projectName = "proj-claim-two"
+	ns := createNamespaceAndProject(t, "test-claim-two-", projectName)
+	createFloatingIPPool(t, "pool-claim-two", "10.50.0.0/24", "10.50.0.1", "10.50.0.254")
+	createUnassignedFIP(t, ns.GetName(), "fip-claim-two-a", projectName, "pool-claim-two", "10.50.0.10")
+	createUnassignedFIP(t, ns.GetName(), "fip-claim-two-b", projectName, "pool-claim-two", "10.50.0.11")
+
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 10 * time.Second
+	defer func() { allocationWaitTimeout = origTimeout }()
+
+	inner := app.FipRestClient
+	app.FipRestClient = newListBarrierClient(inner, 2)
+	defer func() { app.FipRestClient = inner }()
+
+	responses := runConcurrentNoIPRequests(t, projectName, "pool-claim-two", "cluster-claim", "svc-a", "svc-b")
+
+	ips := map[string]bool{}
+	for i, w := range responses {
+		require.Equal(t, http.StatusOK, w.Code, "request %d failed: %s", i, w.Body.String())
+		var resp types.FIPResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		ips[resp.IPAddress] = true
+	}
+	assert.Equal(t, map[string]bool{"10.50.0.10": true, "10.50.0.11": true}, ips,
+		"each concurrent request must claim a different unassigned FloatingIP")
+
+	fipList := &fipv1beta2.FloatingIPList{}
+	require.NoError(t, inner.List(context.Background(), fipList, client.InNamespace(ns.GetName())))
+	require.Len(t, fipList.Items, 2)
+	for i := range fipList.Items {
+		assert.Len(t, serviceNamesOnFIP(&fipList.Items[i]), 1,
+			"FloatingIP %s must carry exactly one service, got %v", fipList.Items[i].Name, serviceNamesOnFIP(&fipList.Items[i]))
+	}
+}
+
+// TestFIPRequestHandlerPinnedIPDoesNotStealPendingClaim verifies that a
+// specific-IP request from another cluster cannot overwrite a claim whose
+// Status.Assigned has not been published yet. The cluster-name label is
+// written together with the service labels, so it is the authoritative claim.
+func TestFIPRequestHandlerPinnedIPDoesNotStealPendingClaim(t *testing.T) {
+	const projectName = "proj-pinned-claim"
+	ns := createNamespaceAndProject(t, "test-pinned-claim-", projectName)
+	createFloatingIPPool(t, "pool-pinned-claim", "10.52.0.0/24", "10.52.0.1", "10.52.0.254")
+
+	ctx := context.Background()
+	ipAddr := "10.52.0.10"
+	fip := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fip-pinned-claim",
+			Namespace: ns.GetName(),
+			Labels: map[string]string{
+				"rancher.k8s.binbash.org/project-name":        projectName,
+				"rancher.k8s.binbash.org/cluster-name":        "cluster-a",
+				"rancher.k8s.binbash.org/service-0-name":      "svc-a",
+				"rancher.k8s.binbash.org/service-0-namespace": "default",
+			},
+		},
+		Spec: fipv1beta2.FloatingIPSpec{IPAddr: &ipAddr, FloatingIPPool: "pool-pinned-claim"},
+	}
+	require.NoError(t, app.FipRestClient.Create(ctx, fip))
+	fip.Status.IPAddr = ipAddr
+	fip.Status.State = "Allocated"
+	require.NoError(t, app.FipRestClient.Status().Update(ctx, fip))
+
+	body, err := json.Marshal(&types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "pool-pinned-claim",
+		Cluster:          "cluster-b",
+		ServiceName:      "svc-b",
+		ServiceNamespace: "default",
+		IPAddress:        ipAddr,
+	})
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), "already in use by another cluster")
+
+	got := &fipv1beta2.FloatingIP{}
+	require.NoError(t, app.FipRestClient.Get(ctx, client.ObjectKey{Namespace: ns.GetName(), Name: "fip-pinned-claim"}, got))
+	assert.Equal(t, "cluster-a", got.Labels["rancher.k8s.binbash.org/cluster-name"], "the pending claim must not be overwritten")
+	assert.Equal(t, []string{"svc-a"}, serviceNamesOnFIP(got), "the competing service must not be added")
+}
+
+// =============================================================================
+// List-then-Create race on specific-IP requests
+// =============================================================================
+
+// createErrorClient fails every Create with err, standing in for the
+// validating webhook's admission denial.
+type createErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c *createErrorClient) Create(context.Context, client.Object, ...client.CreateOption) error {
+	return c.err
+}
+
+// runPinnedIPRequests fires one pinned-address request per (cluster, service)
+// pair at the same time and returns their responses in order.
+func runPinnedIPRequests(t *testing.T, project, pool, ipAddr string, clusters, services []string) []*httptest.ResponseRecorder {
+	t.Helper()
+	require.Equal(t, len(clusters), len(services))
+	recorders := make([]*httptest.ResponseRecorder, len(services))
+	var wg sync.WaitGroup
+	for i := range services {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body, err := json.Marshal(&types.FIPRequest{
+				Project:          project,
+				FloatingIPPool:   pool,
+				Cluster:          clusters[i],
+				ServiceName:      services[i],
+				ServiceNamespace: "default",
+				IPAddress:        ipAddr,
+			})
+			if err != nil {
+				t.Errorf("marshal request: %v", err)
+				return
+			}
+			w := httptest.NewRecorder()
+			FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+			recorders[i] = w
+		}(i)
+	}
+	wg.Wait()
+	return recorders
+}
+
+// startAllocationStandIn simulates the manager controller granting an address
+// to any FloatingIP created by the test that has no status address yet.
+func startAllocationStandIn(t *testing.T, namespace, ipAddr string) {
+	t.Helper()
+	inner := app.FipRestClient
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			list := &fipv1beta2.FloatingIPList{}
+			if err := inner.List(context.Background(), list, client.InNamespace(namespace)); err != nil {
+				continue
+			}
+			for i := range list.Items {
+				f := list.Items[i]
+				if f.Status.IPAddr != "" {
+					continue
+				}
+				f.Status.IPAddr = ipAddr
+				f.Status.State = "Allocated"
+				_ = inner.Status().Update(context.Background(), &f)
+			}
+		}
+	}()
+}
+
+// TestFIPRequestHandlerConcurrentPinnedIPRequestsCreateOneFIP pins the
+// create-collision fix: two simultaneous requests for the same absent address
+// must end up on one FloatingIP, not two. Before the fix both handlers List-ed
+// nothing and both created a resource (GenerateName), leaving two CRs claiming
+// one address.
+func TestFIPRequestHandlerConcurrentPinnedIPRequestsCreateOneFIP(t *testing.T) {
+	const projectName = "proj-pinned-create"
+	ns := createNamespaceAndProject(t, "test-pinned-create-", projectName)
+	createFloatingIPPool(t, "pool-pinned-create", "10.53.0.0/24", "10.53.0.1", "10.53.0.254")
+
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 10 * time.Second
+	defer func() { allocationWaitTimeout = origTimeout }()
+
+	startAllocationStandIn(t, ns.GetName(), "10.53.0.10")
+
+	inner := app.FipRestClient
+	app.FipRestClient = newListBarrierClient(inner, 2)
+	defer func() { app.FipRestClient = inner }()
+
+	responses := runPinnedIPRequests(t, projectName, "pool-pinned-create", "10.53.0.10",
+		[]string{"cluster-pinned", "cluster-pinned"}, []string{"svc-a", "svc-b"})
+
+	for i, w := range responses {
+		require.Equal(t, http.StatusOK, w.Code, "request %d failed: %s", i, w.Body.String())
+		var resp types.FIPResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "10.53.0.10", resp.IPAddress)
+	}
+
+	fipList := &fipv1beta2.FloatingIPList{}
+	require.NoError(t, inner.List(context.Background(), fipList, client.InNamespace(ns.GetName())))
+	require.Len(t, fipList.Items, 1, "concurrent pinned requests must persist exactly one FloatingIP")
+	assert.ElementsMatch(t, []string{"svc-a", "svc-b"}, serviceNamesOnFIP(&fipList.Items[0]),
+		"both services must land on the single FloatingIP")
+}
+
+// TestFIPRequestHandlerConcurrentPinnedIPRequestsDifferentClustersConflict
+// verifies the create collision is resolved through the claim checks: a second
+// cluster requesting an address another cluster is concurrently claiming gets
+// a 409 and never lands on the winner's FloatingIP.
+func TestFIPRequestHandlerConcurrentPinnedIPRequestsDifferentClustersConflict(t *testing.T) {
+	const projectName = "proj-pinned-clash"
+	ns := createNamespaceAndProject(t, "test-pinned-clash-", projectName)
+	createFloatingIPPool(t, "pool-pinned-clash", "10.54.0.0/24", "10.54.0.1", "10.54.0.254")
+
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 10 * time.Second
+	defer func() { allocationWaitTimeout = origTimeout }()
+
+	startAllocationStandIn(t, ns.GetName(), "10.54.0.10")
+
+	inner := app.FipRestClient
+	app.FipRestClient = newListBarrierClient(inner, 2)
+	defer func() { app.FipRestClient = inner }()
+
+	clusters := []string{"cluster-x", "cluster-y"}
+	services := []string{"svc-x", "svc-y"}
+	responses := runPinnedIPRequests(t, projectName, "pool-pinned-clash", "10.54.0.10", clusters, services)
+
+	codes := map[int]int{}
+	winner := -1
+	for i, w := range responses {
+		codes[w.Code]++
+		if w.Code == http.StatusOK {
+			winner = i
+		}
+	}
+	assert.Equal(t, 1, codes[http.StatusOK], "exactly one cluster may claim the address: %v", codes)
+	assert.Equal(t, 1, codes[http.StatusConflict], "the losing cluster must get a retryable 409: %v", codes)
+	require.NotEqual(t, -1, winner)
+
+	fipList := &fipv1beta2.FloatingIPList{}
+	require.NoError(t, inner.List(context.Background(), fipList, client.InNamespace(ns.GetName())))
+	require.Len(t, fipList.Items, 1)
+	assert.Equal(t, clusters[winner], fipList.Items[0].Labels["rancher.k8s.binbash.org/cluster-name"],
+		"the winning cluster's claim must survive")
+	assert.Equal(t, []string{services[winner]}, serviceNamesOnFIP(&fipList.Items[0]),
+		"the losing cluster's service must not be added")
+}
+
+// TestFIPRequestHandlerPinnedIPAdmissionDenialIsClientError pins the
+// admission-denial half: a validating-webhook rejection with no FloatingIP to
+// adopt (a quota or pool rejection) keeps the API server's 4xx code and message
+// instead of a raw 500 carrying API internals.
+func TestFIPRequestHandlerPinnedIPAdmissionDenialIsClientError(t *testing.T) {
+	const projectName = "proj-pinned-denied"
+	ns := createNamespaceAndProject(t, "test-pinned-denied-", projectName)
+	createFloatingIPPool(t, "pool-pinned-denied", "10.55.0.0/24", "10.55.0.1", "10.55.0.254")
+
+	inner := app.FipRestClient
+	app.FipRestClient = &createErrorClient{
+		Client: inner,
+		err: &k8serrors.StatusError{ErrStatus: metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    http.StatusBadRequest,
+			Message: `admission webhook "rancher-fip-manager-validator" denied the request: project quota exceeded for pool pool-pinned-denied`,
+		}},
+	}
+	defer func() { app.FipRestClient = inner }()
+
+	body, err := json.Marshal(&types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "pool-pinned-denied",
+		Cluster:          "cluster-denied",
+		ServiceName:      "svc-denied",
+		ServiceNamespace: "default",
+		IPAddress:        "10.55.0.10",
+	})
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, "the webhook's denial code must reach the client, body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "denied the request")
+	assert.Contains(t, w.Body.String(), "quota exceeded")
+
+	got := &fipv1beta2.FloatingIP{}
+	err = inner.Get(context.Background(), client.ObjectKey{
+		Namespace: ns.GetName(),
+		Name:      specificFIPName("pool-pinned-denied", "10.55.0.10"),
+	}, got)
+	assert.True(t, k8serrors.IsNotFound(err), "a denied create must not persist a FloatingIP, got %v", err)
+}
+
+// interceptCreateClient replaces Create with fn, so a test can persist a
+// concurrent winner's FloatingIP and then return the webhook denial the real
+// admission chain would produce for the loser.
+type interceptCreateClient struct {
+	client.Client
+	fn func(context.Context) error
+}
+
+func (c *interceptCreateClient) Create(ctx context.Context, _ client.Object, _ ...client.CreateOption) error {
+	return c.fn(ctx)
+}
+
+// persistConcurrentPinnedFIP writes the FloatingIP a winning request would
+// have persisted for (project, pool, ip) under its deterministic name, with
+// service svc-winner and optionally an allocated status address.
+func persistConcurrentPinnedFIP(t *testing.T, cl client.Client, namespace, project, pool, ipAddr, cluster, svc string, allocated bool) *fipv1beta2.FloatingIP {
+	t.Helper()
+	ctx := context.Background()
+	fip := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      specificFIPName(pool, ipAddr),
+			Namespace: namespace,
+			Labels: map[string]string{
+				"rancher.k8s.binbash.org/project-name":        project,
+				"rancher.k8s.binbash.org/cluster-name":        cluster,
+				"rancher.k8s.binbash.org/service-0-name":      svc,
+				"rancher.k8s.binbash.org/service-0-namespace": "default",
+			},
+		},
+		Spec: fipv1beta2.FloatingIPSpec{IPAddr: &ipAddr, FloatingIPPool: pool},
+	}
+	require.NoError(t, cl.Create(ctx, fip))
+	if allocated {
+		fip.Status.IPAddr = ipAddr
+		fip.Status.State = "Allocated"
+		require.NoError(t, cl.Status().Update(ctx, fip))
+	}
+	return fip
+}
+
+// webhookDuplicateIPDenial is the StatusError the API server returns when the
+// validating webhook's duplicate-IP reservation denies a concurrent create.
+func webhookDuplicateIPDenial(ipAddr string) error {
+	return &k8serrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusBadRequest,
+		Message: fmt.Sprintf(`admission webhook "rancher-fip-manager-validator" denied the request: requested IP %s is pending allocation in floatingippool`, ipAddr),
+	}}
+}
+
+// TestFIPRequestHandlerPinnedIPDeniedCreateAdoptsConcurrentFIP verifies the
+// create-failure re-list: the loser of a concurrent pinned-IP race is denied
+// by the webhook's reservation (admission runs before persistence, so it never
+// sees AlreadyExists) and must adopt the winner's FloatingIP instead of
+// failing, sharing the address as the same cluster.
+func TestFIPRequestHandlerPinnedIPDeniedCreateAdoptsConcurrentFIP(t *testing.T) {
+	const projectName = "proj-pinned-adopt"
+	ns := createNamespaceAndProject(t, "test-pinned-adopt-", projectName)
+	createFloatingIPPool(t, "pool-pinned-adopt", "10.56.0.0/24", "10.56.0.1", "10.56.0.254")
+
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 10 * time.Second
+	defer func() { allocationWaitTimeout = origTimeout }()
+
+	inner := app.FipRestClient
+	app.FipRestClient = &interceptCreateClient{
+		Client: inner,
+		fn: func(ctx context.Context) error {
+			persistConcurrentPinnedFIP(t, inner, ns.GetName(), projectName, "pool-pinned-adopt", "10.56.0.10", "cluster-adopt", "svc-winner", true)
+			return webhookDuplicateIPDenial("10.56.0.10")
+		},
+	}
+	defer func() { app.FipRestClient = inner }()
+
+	body, err := json.Marshal(&types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "pool-pinned-adopt",
+		Cluster:          "cluster-adopt",
+		ServiceName:      "svc-loser",
+		ServiceNamespace: "default",
+		IPAddress:        "10.56.0.10",
+	})
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+
+	require.Equal(t, http.StatusOK, w.Code, "the loser must adopt the winner's FloatingIP: %s", w.Body.String())
+	var resp types.FIPResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "10.56.0.10", resp.IPAddress)
+
+	fipList := &fipv1beta2.FloatingIPList{}
+	require.NoError(t, inner.List(context.Background(), fipList, client.InNamespace(ns.GetName())))
+	require.Len(t, fipList.Items, 1)
+	assert.ElementsMatch(t, []string{"svc-winner", "svc-loser"}, serviceNamesOnFIP(&fipList.Items[0]),
+		"the adopting request must add its service to the winner's FloatingIP")
+}
+
+// TestFIPRequestHandlerPinnedIPAdoptedFIPSurvivesAllocationTimeout pins the
+// destructive half of the adoption rule: a FIP adopted from a concurrent
+// request was not created here, so the allocation-timeout cleanup must keep it
+// (createdNew stays false).
+func TestFIPRequestHandlerPinnedIPAdoptedFIPSurvivesAllocationTimeout(t *testing.T) {
+	const projectName = "proj-pinned-adopt-timeout"
+	ns := createNamespaceAndProject(t, "test-pinned-adopt-timeout-", projectName)
+	createFloatingIPPool(t, "pool-pinned-adopt-timeout", "10.57.0.0/24", "10.57.0.1", "10.57.0.254")
+
+	origTimeout := allocationWaitTimeout
+	allocationWaitTimeout = 500 * time.Millisecond
+	defer func() { allocationWaitTimeout = origTimeout }()
+
+	inner := app.FipRestClient
+	app.FipRestClient = &interceptCreateClient{
+		Client: inner,
+		fn: func(ctx context.Context) error {
+			persistConcurrentPinnedFIP(t, inner, ns.GetName(), projectName, "pool-pinned-adopt-timeout", "10.57.0.10", "cluster-adopt-timeout", "svc-winner", false)
+			return webhookDuplicateIPDenial("10.57.0.10")
+		},
+	}
+	defer func() { app.FipRestClient = inner }()
+
+	body, err := json.Marshal(&types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "pool-pinned-adopt-timeout",
+		Cluster:          "cluster-adopt-timeout",
+		ServiceName:      "svc-loser",
+		ServiceNamespace: "default",
+		IPAddress:        "10.57.0.10",
+	})
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+
+	require.Equal(t, http.StatusGatewayTimeout, w.Code, "no allocation arrives: %s", w.Body.String())
+
+	got := &fipv1beta2.FloatingIP{}
+	require.NoError(t, inner.Get(context.Background(), client.ObjectKey{
+		Namespace: ns.GetName(),
+		Name:      specificFIPName("pool-pinned-adopt-timeout", "10.57.0.10"),
+	}, got), "an adopted FloatingIP must survive the allocation-timeout cleanup")
+	assert.ElementsMatch(t, []string{"svc-winner", "svc-loser"}, serviceNamesOnFIP(got))
+}
+
+// TestSpecificFIPNameCanonicalizesAddress verifies the name is a pure function
+// of the webhook's uniqueness domain (pool + canonical address), so textual
+// IPv6 variants collide on the API server instead of racing through.
+func TestSpecificFIPNameCanonicalizesAddress(t *testing.T) {
+	base := specificFIPName("pool-a", "2001:db8::1")
+	assert.Equal(t, base, specificFIPName("pool-a", "2001:0db8:0000:0000:0000:0000:0000:0001"),
+		"equivalent IPv6 forms must map to one name")
+	assert.Equal(t, base, specificFIPName("pool-a", "2001:DB8::1"))
+	assert.NotEqual(t, base, specificFIPName("pool-b", "2001:db8::1"), "pools have independent address spaces")
+	assert.NotEqual(t, base, specificFIPName("pool-a", "2001:db8::2"))
+	assert.Equal(t, specificFIPName("pool-a", "10.0.0.1"), specificFIPName("pool-a", "10.0.0.1"))
+	assert.NotEqual(t, specificFIPName("pool-a", "10.0.0.1"), specificFIPName("pool-a", "10.0.0.10"))
+
+	for _, name := range []string{
+		specificFIPName("pool-a", "10.0.0.1"),
+		specificFIPName("pool/a b", "not-an-ip"),
+	} {
+		assert.Empty(t, validation.IsDNS1123Subdomain(name), "name %q must be a valid object name", name)
+	}
 }

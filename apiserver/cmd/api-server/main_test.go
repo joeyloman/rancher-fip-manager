@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joeyloman/rancher-fip-api-server/internal/handlers"
 	"github.com/sirupsen/logrus"
 )
 
@@ -94,4 +95,125 @@ func TestServeHealthProbe_ReadyzGatedOnListener(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// shutdownGracePeriod is derived from the handlers package so the two cannot
+// drift: if a handler budget grows, the drain window grows with it. A shorter
+// grace (the former hard-coded 5s) made server.Shutdown hit its deadline and
+// log.Fatalf while an allocation handler was still mid-write.
+func TestShutdownGracePeriodCoversWorstCaseHandler(t *testing.T) {
+	if got, want := shutdownGracePeriod, handlers.MaxRequestDuration(); got <= want {
+		t.Fatalf("shutdownGracePeriod = %s, must exceed worst-case handler %s", got, want)
+	}
+	if shutdownGracePeriod <= 30*time.Second+10*time.Second {
+		t.Fatalf("shutdownGracePeriod = %s, must cover the 30s allocation wait plus 10s cleanup", shutdownGracePeriod)
+	}
+}
+
+// TestShutdownAPIWaitsForInFlightHandler pins the drain behaviour: a request
+// that started before the signal finishes and its response is delivered,
+// instead of the process exiting mid-write.
+func TestShutdownAPIWaitsForInFlightHandler(t *testing.T) {
+	started := make(chan struct{})
+	srv, ln := startTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		time.Sleep(300 * time.Millisecond)
+		w.Write([]byte("ok"))
+	}))
+
+	type result struct {
+		body string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		done <- result{body: string(b), err: err}
+	}()
+
+	<-started
+	begin := time.Now()
+	shutdownAPI(srv, discardLogger(), 2*time.Second)
+	if elapsed := time.Since(begin); elapsed < 200*time.Millisecond {
+		t.Fatalf("shutdownAPI returned after %s, before the in-flight handler finished", elapsed)
+	}
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("in-flight request failed during drain: %s", res.err)
+		}
+		if res.body != "ok" {
+			t.Fatalf("in-flight request body = %q, want %q", res.body, "ok")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight request never completed after shutdownAPI returned")
+	}
+}
+
+// TestShutdownAPIForceClosesStuckHandler covers the residual: a handler that
+// outlives the grace is force-closed, and shutdownAPI still returns instead of
+// blocking (or killing the process) forever.
+func TestShutdownAPIForceClosesStuckHandler(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	srv, ln := startTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+
+	done := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			done <- err
+			return
+		}
+		defer resp.Body.Close()
+		_, err = io.ReadAll(resp.Body)
+		done <- err
+	}()
+
+	<-started
+	begin := time.Now()
+	shutdownAPI(srv, discardLogger(), 100*time.Millisecond)
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("shutdownAPI blocked for %s with a stuck handler", elapsed)
+	}
+
+	select {
+	case <-done:
+		// Either a connection error or a truncated read is expected: the
+		// point is that the client is released, not hung.
+	case <-time.After(2 * time.Second):
+		t.Fatal("client stayed connected after the grace expired")
+	}
+}
+
+func startTestServer(t *testing.T, h http.Handler) (*http.Server, net.Listener) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %s", err)
+	}
+	srv := &http.Server{Handler: h}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			t.Logf("serve: %s", err)
+		}
+	}()
+	return srv, ln
+}
+
+func discardLogger() *logrus.Logger {
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+	return log
 }

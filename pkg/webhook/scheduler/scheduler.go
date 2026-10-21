@@ -59,7 +59,7 @@ func StartCertRenewalScheduler(cHandler certSource, sHandler server, certRenewal
 	go func() {
 		// One goroutine per scheduled interval: the tick handler reschedules
 		// and returns. The previous loop fell through without returning,
-		// leaking a goroutine per renewal (REPORT.md 2.4).
+		// leaking a goroutine per renewal.
 		for range ticker.C {
 			log.Infof("certRenewalPeriod is reached, renewing certificate and secret")
 			renewCertificate(cHandler, sHandler, certRenewalPeriod)
@@ -79,7 +79,7 @@ func StartCertRenewalScheduler(cHandler certSource, sHandler server, certRenewal
 // than the operator's configured renewal period. Without the bound an
 // oversized CERTRENEWALPERIOD drove the raw value ≤ 0 and the floor of 1
 // minute collapsed a perfectly healthy cert into a per-minute renewal
-// bounce (REPORT.md 2.4). cmd/webhook also clamps the period itself.
+// bounce. cmd/webhook also clamps the period itself.
 func renewalCheckIntervalMinutes(minutesLeft, certRenewalPeriod int64) int64 {
 	sTime := minutesLeft - certRenewalPeriod + 1
 
@@ -106,7 +106,7 @@ func renewalCheckIntervalMinutes(minutesLeft, certRenewalPeriod int64) int64 {
 // renewCertificate runs one renewal attempt. Success is in-place: the fresh
 // material is pushed into the running HTTPS server (net/http resolves the
 // certificate per handshake), so the admission endpoint keeps serving
-// throughout (REPORT.md 2.4: the old path unconditionally ran Stop →
+// throughout (the old path unconditionally ran Stop →
 // sleep(2s) → Run every tick — a ~2-12s write blackout per renewal even
 // when nothing had changed). The server is only restarted when it is not
 // serving at all, e.g. the listener never bound or died.

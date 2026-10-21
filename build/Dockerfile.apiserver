@@ -8,7 +8,7 @@ WORKDIR /deps/apiserver
 RUN go mod download
 ADD / /src
 WORKDIR /src/apiserver
-RUN go build -a -o rancher-fip-api-server cmd/api-server/main.go
+RUN go build -a -o rancher-fip-api-server ./cmd/api-server
 FROM docker.io/alpine:3.24
 RUN adduser -S -D -H -h /app rancher-fip-api-server
 USER rancher-fip-api-server

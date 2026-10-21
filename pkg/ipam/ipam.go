@@ -3,6 +3,7 @@ package ipam
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/netip"
 	"sort"
@@ -19,6 +20,48 @@ var ErrForeignClaim = errors.New("ip is allocated to a different owner")
 // owned by a different claimant.
 func IsForeignClaim(err error) bool {
 	return errors.Is(err, ErrForeignClaim)
+}
+
+// MaxSubnetRangeSize is the maximum number of addresses a pool range
+// [start,end] may span. buildSubnet materializes every address in the range
+// into the allocation map, so an unbounded range (e.g. a /8, or any sizeable
+// IPv6 prefix) would exhaust memory and stall the pool reconcile loop while
+// holding the IPAM mutex. 65536 addresses (a /16 worth) is far above any
+// realistic floating-IP pool.
+const MaxSubnetRangeSize = 65536
+
+// ValidateRangeSize checks that the address range [start,end] spans at most
+// MaxSubnetRangeSize addresses without materializing the range. Caller must
+// already have verified that start <= end. The pool admission webhook uses
+// this to reject oversized ranges with a clear message; buildSubnet enforces
+// the same bound as a backstop for writes that bypass the webhook.
+func ValidateRangeSize(start, end string) error {
+	startAddr, err := netip.ParseAddr(start)
+	if err != nil {
+		return fmt.Errorf("invalid start address %s: %w", start, err)
+	}
+	endAddr, err := netip.ParseAddr(end)
+	if err != nil {
+		return fmt.Errorf("invalid end address %s: %w", end, err)
+	}
+
+	// Both addresses are in the same family (they must sit in one subnet),
+	// so the 16-byte representation yields an exact difference for v4 and v6.
+	startBytes := startAddr.As16()
+	endBytes := endAddr.As16()
+	startInt := new(big.Int).SetBytes(startBytes[:])
+	endInt := new(big.Int).SetBytes(endBytes[:])
+	size := new(big.Int).Sub(endInt, startInt)
+	size.Add(size, big.NewInt(1)) // inclusive
+
+	// Sizes beyond int64 (large IPv6 ranges) are IsInt64() == false and
+	// therefore oversized by definition.
+	if !size.IsInt64() || size.Int64() > MaxSubnetRangeSize {
+		return fmt.Errorf("pool range %s-%s spans %s addresses, exceeding the maximum of %d",
+			start, end, size.String(), MaxSubnetRangeSize)
+	}
+
+	return nil
 }
 
 // UsageData contains usage information for a single subnet.
@@ -61,8 +104,9 @@ func New() *IPAllocator {
 }
 
 // NewSubnet adds a new subnet to the IPAM. It validates that the start and end
-// IPs are within the subnet and that the end IP is not the broadcast address.
-// It pre-populates a map of all available IPs within the given range.
+// IPs are within the subnet, that the end IP is not the broadcast address, and
+// that the range spans at most MaxSubnetRangeSize addresses. It pre-populates
+// a map of all available IPs within the given range.
 func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) error {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -183,6 +227,16 @@ func (a *IPAllocator) buildSubnet(subnet, start, end string) (IPSubnet, error) {
 		if s.end.Equal(s.broadcast) {
 			return s, fmt.Errorf("end address %s equals the broadcast address %s", s.end.String(), s.broadcast.String())
 		}
+	}
+
+	// Bound the range before materializing the allocation map: the loop
+	// below pre-populates one map entry per address in [start,end], so an
+	// oversized range (a /8, any sizeable IPv6 prefix) would exhaust memory
+	// while holding the IPAM mutex and stall every allocation/release.
+	// Kept after the checks above so their long-standing error messages keep
+	// precedence; this check is equally pre-materialization.
+	if err := ValidateRangeSize(start, end); err != nil {
+		return s, err
 	}
 
 	// pre-allocate all ips between the start and end address

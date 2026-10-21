@@ -1,12 +1,18 @@
 package helm
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +23,7 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/downloader"
 	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/helmpath"
 	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
@@ -71,10 +78,37 @@ type Client struct {
 	// too corrupt for Helm's own Get/Uninstall to read: an unreadable
 	// release must still be purgeable so provisioning can converge.
 	purgeReleaseRecords func(ctx context.Context, config *rest.Config, namespace, releaseName string) error
+	// purgeUndecodableRecords deletes only the storage records of a release
+	// that Helm cannot decode, keeping the readable ones. Helm silently
+	// skips undecodable rows on every History/Get/Uninstall read (logging
+	// "query: failed to decode release"), so they are dead weight that
+	// nothing else ever removes.
+	purgeUndecodableRecords func(ctx context.Context, config *rest.Config, namespace, releaseName string) error
 	// repoLock serialises access to the process-wide on-disk repository
-	// file and index cache: repo.File.WriteFile is not atomic and the
-	// reconcile workers install the same charts for many clusters at once.
+	// file: repo.File.WriteFile is not atomic and the reconcile workers
+	// add the same repositories for many clusters at once. Held only for
+	// local-disk work, never across the index download. updateRepoFile
+	// replaces the file atomically (sibling temp file + rename), so the
+	// unlocked chart-resolution readers always see a complete file —
+	// the lock serialises the writers' read-modify-write cycle only.
 	repoLock sync.Mutex
+	// repoIndexLocks serialises index downloads per repository name. Helm
+	// writes the downloaded index to <RepositoryCache>/<name>-index.yaml
+	// with a non-atomic os.WriteFile (helm v3.20.2, pkg/repo/chartrepo.go)
+	// and chart resolution reads that same file, so two workers refreshing
+	// the same repository concurrently could tear it. Keyed per name —
+	// NOT a global lock — because the download is a network call bounded
+	// only by the Helm getter timeout: one slow or blackholed chart-repo
+	// endpoint must not stall the other reconcile workers. The finished
+	// index is renamed into the cache atomically, so the unlocked readers
+	// never see a partial file; the lock keeps same-name downloads from
+	// reordering and from tearing the temp-to-final swap.
+	repoIndexLocks sync.Mutex
+	repoIndexLock  map[string]*sync.Mutex
+	// repoIndexDownloadTimeout bounds each chart-repository index download.
+	// A field rather than a bare const at the call site so tests can shrink
+	// it and pin the bound; defaulted to repoIndexDownloadTimeout.
+	repoIndexDownloadTimeout time.Duration
 }
 
 // NewClient creates a new Helm client.
@@ -83,6 +117,9 @@ func NewClient() *Client {
 	c.newActionConfig = c.defaultActionConfig
 	c.loadChart = c.defaultLoadChart
 	c.purgeReleaseRecords = defaultPurgeReleaseRecords
+	c.purgeUndecodableRecords = defaultPurgeUndecodableRecords
+	c.repoIndexLock = map[string]*sync.Mutex{}
+	c.repoIndexDownloadTimeout = repoIndexDownloadTimeout
 	return c
 }
 
@@ -153,6 +190,12 @@ func (c *Client) defaultLoadChart(actionConfig *action.Configuration, spec Chart
 const (
 	helmOperationTimeout = 10 * time.Minute
 	helmUninstallTimeout = 2 * time.Minute
+	// repoIndexDownloadTimeout bounds each chart-repository index download
+	// in AddOrUpdateChartRepo. Helm's getter default is 120s
+	// (getter.DefaultHTTPTimeout, pkg/getter/getter.go), which lets one
+	// blackholed chart-repo endpoint stall a reconcile worker for two
+	// minutes; the index download needs no such budget.
+	repoIndexDownloadTimeout = 30 * time.Second
 )
 
 // releaseAction is the operation InstallOrUpgrade derives from the *stored*
@@ -239,6 +282,16 @@ func (c *Client) InstallOrUpgrade(ctx context.Context, config *rest.Config, spec
 		return errors.Wrapf(err, "failed to parse values for release %q", spec.ReleaseName)
 	}
 
+	// Helm's storage driver silently skips records it cannot decode, and
+	// Uninstall cannot remove them either, so an undecodable record would
+	// sit in the release history forever (and a corrupt latest revision
+	// wedges Get, forcing the full purge-and-reinstall below). Drop them up
+	// front: an undecodable record is invisible to every Helm operation,
+	// so deleting it cannot lose state.
+	if err := c.purgeUndecodableRecords(ctx, config, spec.Namespace, spec.ReleaseName); err != nil {
+		return errors.Wrapf(err, "failed to sanitize storage records of release %q", spec.ReleaseName)
+	}
+
 	historyClient := action.NewHistory(actionConfig)
 	historyClient.Max = 1
 	if _, err := historyClient.Run(spec.ReleaseName); stderrors.Is(err, driver.ErrReleaseNotFound) {
@@ -251,12 +304,15 @@ func (c *Client) InstallOrUpgrade(ctx context.Context, config *rest.Config, spec
 	getClient := action.NewGet(actionConfig)
 	existingRelease, err := getClient.Run(spec.ReleaseName)
 	if err != nil {
-		// History saw the storage rows but the release itself cannot be
-		// read — the usual cause is a corrupt (undecodable) release
-		// secret. There is no status to plan from, and Helm's own purge
-		// cannot run either because Uninstall reads the same broken
-		// record. Drop the storage rows by label and reinstall: an
-		// unreadable release is indistinguishable from an absent one.
+		// The sanitizer above removes undecodable records before Helm reads
+		// them, so this is now the residual fallback for a record that
+		// became unreadable in the window between that scan and this Get
+		// (or a storage driver the scan does not cover). History saw the
+		// storage rows but the release itself cannot be read; there is no
+		// status to plan from, and Helm's own purge cannot run either
+		// because Uninstall reads the same broken record. Drop the storage
+		// rows by label and reinstall: an unreadable release is
+		// indistinguishable from an absent one.
 		log.Printf("Release %q is stored but unreadable (%s); purging its storage records and reinstalling.", spec.ReleaseName, err)
 		if perr := c.purgeReleaseRecords(ctx, config, spec.Namespace, spec.ReleaseName); perr != nil {
 			return errors.Wrapf(perr, "failed to purge unreadable release %q", spec.ReleaseName)
@@ -347,15 +403,112 @@ func (c *Client) repairRelease(ctx context.Context, actionConfig *action.Configu
 }
 
 func (c *Client) AddOrUpdateChartRepo(entry repo.Entry) error {
-	// The repository file and index cache are process-wide state shared by
-	// every reconcile worker.
-	c.repoLock.Lock()
-	defer c.repoLock.Unlock()
-
 	settings := cli.New()
 
 	repoFile := settings.RepositoryConfig
 
+	// Phase 1: mutate the process-wide repository file under the global
+	// lock. Only local-disk work happens here, so the critical section
+	// stays short.
+	c.repoLock.Lock()
+	if err := c.updateRepoFile(repoFile, entry); err != nil {
+		c.repoLock.Unlock()
+		return err
+	}
+	c.repoLock.Unlock()
+
+	// Phase 2: refresh the index. This is a network call, so it runs
+	// OUTSIDE the global repository lock, serialised per repository name
+	// instead: one slow or blackholed chart-repo endpoint must not block
+	// the other reconcile workers. The download itself is bounded by
+	// repoIndexDownloadTimeout — helm's getter default of 120s would let
+	// one blackholed endpoint eat two minutes of worker time per attempt.
+	cr, err := repo.NewChartRepository(&entry, getter.All(settings, getter.WithTimeout(c.repoIndexDownloadTimeout)))
+	if err != nil {
+		return err
+	}
+	// NewChartRepository hardcodes CachePath to helmpath.CachePath
+	// ("repository") and ignores settings.RepositoryCache
+	// (HELM_REPOSITORY_CACHE); every helm caller overrides it
+	// (pkg/downloader/manager.go), because chart resolution
+	// (ChartDownloader.ResolveChartVersion) reads the index from
+	// settings.RepositoryCache. Without the override the two paths only
+	// coincide while HELM_REPOSITORY_CACHE is unset.
+	//
+	// DownloadIndexFile writes the index with a plain non-atomic
+	// os.WriteFile (helm v3.20.2 pkg/repo/chartrepo.go:156) and chart
+	// resolution reads that same file without any locking (the per-name
+	// index lock below serialises writers only), so the download lands in
+	// a temporary directory inside the cache and the finished index file
+	// is renamed into its final location. The rename is atomic within the
+	// cache directory's filesystem, so a concurrent chart resolution
+	// always reads either the previous complete index or the new one,
+	// never a truncated one.
+	cacheDir := settings.RepositoryCache
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return err
+	}
+
+	indexLock := c.indexLockFor(entry.Name)
+	indexLock.Lock()
+	defer indexLock.Unlock()
+
+	// A SIGKILL between MkdirTemp and the deferred RemoveAll leaves a
+	// `.index-download-<name>-*` dir behind forever; sweep stale ones for
+	// THIS repo before creating a new one. Safe: the temp prefix carries
+	// the repo name and same-name downloads are serialised by the index
+	// lock held above, so no live same-name download dir can exist here —
+	// a different repo's dir is never matched. ReadDir + prefix instead
+	// of filepath.Glob: repo names come from operator config and glob
+	// metacharacters in a name would be patterns, not literals.
+	tempPrefix := ".index-download-" + strings.NewReplacer("*", "_").Replace(entry.Name) + "-"
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), tempPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(cacheDir, e.Name())); err != nil {
+			return errors.Wrapf(err, "failed to remove stale index download dir %q", e.Name())
+		}
+	}
+	tmpCache, err := os.MkdirTemp(cacheDir, tempPrefix)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpCache)
+	cr.CachePath = tmpCache
+
+	indexFile, err := cr.DownloadIndexFile()
+	if err != nil {
+		return errors.Wrapf(err, "looks like %q is not a valid chart repository or cannot be reached", entry.URL)
+	}
+	if err := os.Rename(indexFile, filepath.Join(cacheDir, helmpath.CacheIndexFile(entry.Name))); err != nil {
+		return errors.Wrapf(err, "failed to move the downloaded index for %q into the repository cache", entry.URL)
+	}
+	log.Printf("Successfully got an update from the %q chart repository", entry.Name)
+
+	return nil
+}
+
+// indexLockFor returns the download lock for one repository name.
+func (c *Client) indexLockFor(name string) *sync.Mutex {
+	c.repoIndexLocks.Lock()
+	defer c.repoIndexLocks.Unlock()
+
+	l, ok := c.repoIndexLock[name]
+	if !ok {
+		l = &sync.Mutex{}
+		c.repoIndexLock[name] = l
+	}
+	return l
+}
+
+// updateRepoFile adds the repository entry to the on-disk repository file if
+// it is not present yet. Callers must hold c.repoLock.
+func (c *Client) updateRepoFile(repoFile string, entry repo.Entry) error {
 	// Ensure the directory for the repository file exists.
 	if err := os.MkdirAll(filepath.Dir(repoFile), 0755); err != nil {
 		return err
@@ -374,24 +527,39 @@ func (c *Client) AddOrUpdateChartRepo(entry repo.Entry) error {
 	// If the repo doesn't exist, add it.
 	if !r.Has(entry.Name) {
 		r.Add(&entry)
-		if err := r.WriteFile(repoFile, 0644); err != nil {
+		// repo.File.WriteFile writes with a plain os.WriteFile (helm
+		// v3.20.2 pkg/repo/repo.go:124), but chart resolution reads this
+		// file on every InstallOrUpgrade (ChartDownloader.ResolveChartVersion
+		// → loadRepoConfig) without any locking — the repoLock below
+		// serialises writers only. Write to a sibling temp file and rename:
+		// a rename within the same directory is atomic, so a concurrent
+		// reader always sees either the previous complete file or the new
+		// one, never a truncated yaml.
+		tmp, err := os.CreateTemp(filepath.Dir(repoFile), filepath.Base(repoFile)+".tmp-")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName) // no-op once the rename succeeded
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		if err := r.WriteFile(tmpName, 0644); err != nil {
+			return err
+		}
+		// os.CreateTemp creates the temp file 0600 and os.WriteFile
+		// cannot change an existing file's mode, so restore the mode
+		// helm's own WriteFile (and the previous file) used.
+		if err := os.Chmod(tmpName, 0644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmpName, repoFile); err != nil {
 			return err
 		}
 		log.Printf("Repository %s has been added.", entry.Name)
 	} else {
 		log.Printf("Repository %s already exists.", entry.Name)
 	}
-
-	// Update the repo
-	cr, err := repo.NewChartRepository(&entry, getter.All(settings))
-	if err != nil {
-		return err
-	}
-	if _, err := cr.DownloadIndexFile(); err != nil {
-		return errors.Wrapf(err, "looks like %q is not a valid chart repository or cannot be reached", entry.URL)
-	}
-	log.Printf("Successfully got an update from the %q chart repository", entry.Name)
-
 	return nil
 }
 
@@ -487,6 +655,65 @@ func (c *restClientGetter) ToRawKubeConfigLoader() clientcmd.ClientConfig {
 		overrides.AuthInfo.ClientKeyData = c.restConfig.KeyData
 	}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
+}
+
+// decodeReleaseRecord mirrors the secret driver's unexported decodeRelease
+// (base64, optional gzip, JSON) so a record rejected here is exactly a record
+// Helm's own reads would skip.
+var magicGzip = []byte{0x1f, 0x8b, 0x08}
+
+func decodeReleaseRecord(data string) error {
+	b, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return err
+	}
+	// Releases stored before compression was introduced skip decompression
+	// when the gzip magic header is absent.
+	if len(b) > 3 && bytes.Equal(b[0:3], magicGzip) {
+		zr, err := gzip.NewReader(bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		if b, err = io.ReadAll(zr); err != nil {
+			return err
+		}
+	}
+	var rel release.Release
+	return json.Unmarshal(b, &rel)
+}
+
+// defaultPurgeUndecodableRecords deletes every storage record of releaseName
+// that Helm's own decoder rejects, keeping the readable ones. Decoding here
+// is exactly what the secret driver does on every History/Get/Uninstall, so
+// a record rejected here can never be read by any Helm operation and deleting
+// it only stops the recurring "query: failed to decode release" noise and
+// frees its revision slot.
+func defaultPurgeUndecodableRecords(ctx context.Context, config *rest.Config, namespace, releaseName string) error {
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return errors.Wrapf(err, "failed to build kube client to sanitize release %q", releaseName)
+	}
+	return purgeUndecodableRecordsWithClient(ctx, client, namespace, releaseName)
+}
+
+func purgeUndecodableRecordsWithClient(ctx context.Context, client kubernetes.Interface, namespace, releaseName string) error {
+	records, err := client.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("name=%s,owner=helm", releaseName),
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to list storage records of release %q", releaseName)
+	}
+	for i := range records.Items {
+		if err := decodeReleaseRecord(string(records.Items[i].Data["release"])); err == nil {
+			continue
+		}
+		log.Printf("Release %q has an undecodable storage record %s; deleting it.", releaseName, records.Items[i].Name)
+		if err := client.CoreV1().Secrets(namespace).Delete(ctx, records.Items[i].Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "failed to delete undecodable storage record %s of release %q", records.Items[i].Name, releaseName)
+		}
+	}
+	return nil
 }
 
 // defaultPurgeReleaseRecords deletes all Helm release-storage secrets for

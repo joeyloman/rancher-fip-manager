@@ -9,6 +9,7 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -108,6 +109,15 @@ func main() {
 		},
 	}
 
+	// runStart carries the cancel func of the running controller once it is
+	// up; runDone closes when run() finished its drain (workqueue shutdown
+	// + graceful HTTP shutdown). OnStoppedLeading uses them to stop the
+	// controller cleanly instead of killing it mid-teardown. client-go
+	// releases the lease (ReleaseOnCancel) before OnStoppedLeading runs, so
+	// the drain does not delay failover.
+	runStart := make(chan context.CancelFunc, 1)
+	runDone := make(chan struct{})
+
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
@@ -116,11 +126,19 @@ func main() {
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				run(ctx, kubeClient, fipClient)
+				// client-go cancels this context itself when the lease is
+				// lost or the parent context is done (Run's deferred cancel
+				// runs before OnStoppedLeading); the cancel handed over via
+				// runStart is belt-and-braces so the drain works regardless
+				// of client-go's internal ordering.
+				runCtx, cancel := context.WithCancel(ctx)
+				runStart <- cancel
+				defer close(runDone)
+				run(runCtx, kubeClient, fipClient)
 			},
 			OnStoppedLeading: func() {
 				logrus.Infof("leader lost: %s", id)
-				os.Exit(0)
+				drainAndExit(runStart, runDone)
 			},
 			OnNewLeader: func(identity string) {
 				if identity == id {
@@ -131,6 +149,41 @@ func main() {
 			},
 		},
 	})
+}
+
+// gracefulDrainTimeout bounds how long OnStoppedLeading waits for the
+// controller drain. It must stay below the pod terminationGracePeriod (30s
+// kubelet default), or the SIGTERM path ends in SIGKILL anyway.
+const gracefulDrainTimeout = 20 * time.Second
+
+// drainAndExit cancels the running controller's context and waits a bounded
+// grace period for its drain (workqueue shutdown + graceful HTTP shutdown)
+// to finish, then exits. If leadership was never acquired, there is nothing
+// to drain and it exits immediately.
+func drainAndExit(runStart <-chan context.CancelFunc, runDone <-chan struct{}) {
+	drainRun(runStart, runDone, gracefulDrainTimeout)
+	os.Exit(0)
+}
+
+// drainRun cancels the controller via the cancel func received on runStart
+// and waits up to grace for runDone. It reports whether the drain completed
+// (also true when leadership was never acquired, i.e. nothing to drain).
+func drainRun(runStart <-chan context.CancelFunc, runDone <-chan struct{}, grace time.Duration) bool {
+	select {
+	case cancel := <-runStart:
+		cancel()
+		select {
+		case <-runDone:
+			logrus.Info("graceful drain complete")
+			return true
+		case <-time.After(grace):
+			logrus.Errorf("graceful drain timed out after %s, exiting anyway", grace)
+			return false
+		}
+	default:
+		// Never started leading; nothing to drain.
+		return true
+	}
 }
 
 // serveHealthProbe binds the liveness/readiness endpoints independently of
@@ -180,21 +233,75 @@ func run(ctx context.Context, kubeClient kubernetes.Interface, fipClient clients
 		floatingIPProjectQuotaInformer.Lister(),
 		fipInformer.Lister(),
 	)
-	go httpServer.Start(ctx)
+
+	// Start the HTTP service
+	httpDone := make(chan struct{})
+	go func() {
+		defer close(httpDone)
+		httpServer.Start(ctx)
+	}()
 
 	// Start informers
-	go fipInformerFactory.Start(ctx.Done())
+	informersDone := make(chan struct{})
+	go func() {
+		defer close(informersDone)
+		fipInformerFactory.Start(ctx.Done())
+	}()
 
-	// Start controllers
-	go fipPoolController.Run(ctx, 1)
-	<-fipPoolController.IsInitialSyncDone()
+	// Start controllers. Each Run returns only after its workqueue was
+	// shut down and its workers exited, so the controller group below
+	// joins the full teardown.
+	var controllersWG sync.WaitGroup
+	startController := func(run func()) {
+		controllersWG.Add(1)
+		go func() {
+			defer controllersWG.Done()
+			run()
+		}()
+	}
 
-	go floatingIPProjectQuotaController.Run(ctx, 1)
-	<-floatingIPProjectQuotaController.IsInitialSyncDone()
+	// waitForInitialSync returns false when the context was cancelled
+	// while the caches were still warming. The ctx branch matters for a
+	// lease loss during the startup window: initSyncDone is only closed
+	// after the initial-sync loop, so an unconditional wait would park
+	// run() past the drain grace.
+	waitForInitialSync := func(done <-chan struct{}) bool {
+		select {
+		case <-done:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	// shutdownAfterEarlyExit joins the components started so far when
+	// startup was interrupted by a context cancellation.
+	shutdownAfterEarlyExit := func() {
+		logrus.Info("Shutting down controller")
+		controllersWG.Wait()
+		<-httpDone
+		<-informersDone
+		logrus.Info("Controller shut down")
+	}
 
-	go fipController.Run(ctx, 2)
-	<-fipController.IsInitialSyncDone()
+	startController(func() { fipPoolController.Run(ctx, 1) })
+	if !waitForInitialSync(fipPoolController.IsInitialSyncDone()) {
+		shutdownAfterEarlyExit()
+		return
+	}
+
+	startController(func() { floatingIPProjectQuotaController.Run(ctx, 1) })
+	if !waitForInitialSync(floatingIPProjectQuotaController.IsInitialSyncDone()) {
+		shutdownAfterEarlyExit()
+		return
+	}
+
+	startController(func() { fipController.Run(ctx, 2) })
+	if !waitForInitialSync(fipController.IsInitialSyncDone()) {
+		shutdownAfterEarlyExit()
+		return
+	}
 
 	<-ctx.Done()
 	logrus.Info("Shutting down controller")
+	shutdownAfterEarlyExit()
 }

@@ -41,6 +41,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       dnsPolicy: ClusterFirst
+      # Must stay above shutdownGracePeriod in apiserver/cmd/api-server/main.go
+      # (45s: the 30s allocation wait plus 10s cleanup plus 5s margin), or the
+      # kubelet SIGKILLs an in-flight allocation request mid-write.
+      terminationGracePeriodSeconds: 50
       {{- with .Values.apiserver.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

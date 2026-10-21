@@ -96,13 +96,18 @@ webhook:
   
   securityContext: {}
  
+  # The webhook runs with failurePolicy=Fail: an OOMKilled pod denies every
+  # FloatingIP/FloatingIPPool write cluster-wide until it recovers. Live peak
+  # RSS is ~15Mi, so 32Mi left the Go heap no headroom for a
+  # cluster-wide FloatingIP list under admission bursts; 256Mi matches the
+  # manager, and the 32Mi request reflects observed usage instead of 8Mi.
   resources:
     limits:
       cpu: 500m
-      memory: 32Mi
+      memory: 256Mi
     requests:
       cpu: 100m
-      memory: 8Mi
+      memory: 32Mi
   
   autoscaling:
     enabled: false

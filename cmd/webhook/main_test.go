@@ -56,7 +56,7 @@ func TestParseAppEnv(t *testing.T) {
 	}
 }
 
-// TestParseAppEnvCertRenewalPeriod pins REPORT.md 2.4: CERTRENEWALPERIOD is
+// TestParseAppEnvCertRenewalPeriod pins CERTRENEWALPERIOD as
 // minutes with a sane range. Previously only 0 and parse errors fell back
 // to the default, so an oversized value (e.g. 1000000 ≈ 694 days on a
 // ~1-year cert) drove the renewal tick to its 1-minute floor and bounced

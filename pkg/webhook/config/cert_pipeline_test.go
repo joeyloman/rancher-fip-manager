@@ -108,8 +108,8 @@ func shortenCSRWait(t *testing.T) {
 	})
 }
 
-// TestRunBrickedSecretForcesRenewalAndPreservesSecret pins REPORT.md 2.1:
-// an empty tls.crt (slow CSR signer leftover) must be treated as
+// TestRunBrickedSecretForcesRenewalAndPreservesSecret pins the must-renew
+// contract: an empty tls.crt (slow CSR signer leftover) must be treated as
 // must-renew, the renewal must go through a CSR (not hand back the empty
 // cert), and a failing signer must never destroy the existing secret.
 func TestRunBrickedSecretForcesRenewalAndPreservesSecret(t *testing.T) {
@@ -132,7 +132,7 @@ func TestRunBrickedSecretForcesRenewalAndPreservesSecret(t *testing.T) {
 	assert.Len(t, csrs.Items, 1, "empty certificate material must trigger a renewal attempt via CSR")
 }
 
-// TestRunRegeneratesSecretViaSigner pins the first-boot path of 2.1/2.3:
+// TestRunRegeneratesSecretViaSigner pins the first-boot path:
 // the secret is only created once the signer actually returns a parseable
 // certificate; the on-disk material then serves that certificate.
 func TestRunRegeneratesSecretViaSigner(t *testing.T) {
@@ -165,8 +165,9 @@ func TestRunRegeneratesSecretViaSigner(t *testing.T) {
 	assert.WithinDuration(t, notAfter, expireDate, time.Minute)
 }
 
-// TestRunTransientSecretErrorDoesNotRegenerate pins REPORT.md 2.2: a
-// transient Secrets Get error must surface as an error to be retried, and
+// TestRunTransientSecretErrorDoesNotRegenerate pins the transient-error
+// contract: a transient Secrets Get error must surface as an error to be
+// retried, and
 // must never be conflated with "absent" (which would regenerate material
 // and, pre-fix, crash-loop the pod via the scheduler panic).
 func TestRunTransientSecretErrorDoesNotRegenerate(t *testing.T) {
@@ -189,7 +190,7 @@ func TestRunTransientSecretErrorDoesNotRegenerate(t *testing.T) {
 	assert.Empty(t, csrs.Items, "transient API error must not start a regeneration")
 }
 
-// TestRunGenerateErrorDoesNotCreateSecret pins REPORT.md 2.3: when
+// TestRunGenerateErrorDoesNotCreateSecret pins the generate-error path: when
 // generateTLSKeyAndCert fails the old code fell through to createSecret
 // with a zero-value tls.Certificate and panicked on Certificate[0]. Run
 // must return the error and write no secret at all.

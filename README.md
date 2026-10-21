@@ -34,7 +34,7 @@ If approved, the IP details are returned to the rancher-fip-lb-controller, which
 
 ## The rancher-fip-manager-webhook
 
-The validating admission webhook is part of this repository (`cmd/webhook`, `pkg/webhook/`). It validates `FloatingIP` and `FloatingIPPool` objects before they are admitted: it checks that requests are correctly configured and that they stay within the `FloatingIPProjectQuota` limits of the project the request is made for.
+The validating admission webhook is part of this repository (`cmd/webhook`, `pkg/webhook/`). It validates `FloatingIP` and `FloatingIPPool` objects before they are admitted: it checks that requests are correctly configured and that they stay within the `FloatingIPProjectQuota` limits of the project the request is made for. A `FloatingIPPool` range (`spec.ipConfig.pool.start`–`end`) may span at most 65536 addresses (`ipam.MaxSubnetRangeSize`); larger ranges are denied at admission.
 
 The webhook manages its own serving certificate: on startup it generates a TLS key pair via a Kubernetes CertificateSigningRequest (requesting a bounded one-year lifetime), stores it in a Secret and (re)registers its `ValidatingWebhookConfiguration` with an explicit `failurePolicy: Fail` and `timeoutSeconds: 10`. A scheduler renews the certificate before it expires (controlled with the `CERTRENEWALPERIOD` environment variable, in minutes, clamped to a sane 1 hour – 90 day range): renewal goes through a fresh CSR and updates the Secret in place, and the new pair is hot-swapped into the running HTTPS server — the admission endpoint stays up for the whole renewal. A readiness probe on `/readyz` reports NotReady while no servable certificate exists, and liveness probes are configured on all four deployments.
 
@@ -139,7 +139,7 @@ Available values are documented in `deployments/charts/rancher-fip-manager/value
     ```
 
 2.  **Create an IP Pool**:
-    Define a pool of IPs.
+    Define a pool of IPs. The `start`–`end` range may span at most 65536 addresses.
     ```yaml
     # config/samples/pool.yaml
     apiVersion: rancher.k8s.binbash.org/v1beta2

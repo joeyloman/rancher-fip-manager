@@ -87,10 +87,11 @@ func TestIpam(t *testing.T) {
 			want:   fmt.Errorf("end address 172.16.255.255 equals the broadcast address 172.16.255.255"),
 		},
 		{
+			// Large but within MaxSubnetRangeSize.
 			name:   "default/network-class-a-ok",
 			subnet: "10.0.0.0/8",
 			start:  "10.0.0.10",
-			end:    "10.255.255.254",
+			end:    "10.0.255.254",
 			want:   nil,
 		},
 		{
@@ -115,6 +116,8 @@ func TestIpam(t *testing.T) {
 			want:   fmt.Errorf("end address 10.10.227.10 is smaller then the start address 10.255.255.253"),
 		},
 		{
+			// The broadcast check precedes the range bound, so the original
+			// /8 case still reports the broadcast error unchanged.
 			name:   "default/network-class-a-broadcast-error",
 			subnet: "10.0.0.0/8",
 			start:  "10.0.0.10",
@@ -761,5 +764,92 @@ func TestReleaseAllByOwner(t *testing.T) {
 	}
 	if got == abandoned2 {
 		t.Errorf("re-allocation returned %q out of pool order", got)
+	}
+}
+
+// TestRangeSizeBound pins the MaxSubnetRangeSize bound: buildSubnet used to materialize every
+// address in [start,end] with no bound, so a large pool range (a /8, any
+// sizeable IPv6 prefix) exhausted memory while holding the IPAM mutex. The
+// range is now bounded at MaxSubnetRangeSize addresses, checked before the
+// allocation map is built, and surfaced through the pool admission webhook.
+func TestRangeSizeBound(t *testing.T) {
+	ti := New()
+
+	testSubnets := []struct {
+		name   string
+		subnet string
+		start  string
+		end    string
+		want   error
+	}{
+		{
+			// Exactly MaxSubnetRangeSize addresses (inclusive range) fits.
+			name:   "range-at-maximum-size-ok",
+			subnet: "10.0.0.0/8",
+			start:  "10.0.0.0",
+			end:    "10.0.255.255",
+			want:   nil,
+		},
+		{
+			// One address beyond the bound must be rejected before
+			// materialization.
+			name:   "range-over-maximum-size-error",
+			subnet: "10.0.0.0/8",
+			start:  "10.0.0.0",
+			end:    "10.1.0.0",
+			want:   fmt.Errorf("pool range 10.0.0.0-10.1.0.0 spans 65537 addresses, exceeding the maximum of %d", MaxSubnetRangeSize),
+		},
+		{
+			// An IPv6 range far beyond int64 must be rejected, not loop.
+			name:   "ipv6-range-over-maximum-size-error",
+			subnet: "2001:db8::/32",
+			start:  "2001:db8::1",
+			end:    "2001:db8:ffff:ffff::1",
+			want:   fmt.Errorf("pool range 2001:db8::1-2001:db8:ffff:ffff::1 spans 79228162495817593519834398721 addresses, exceeding the maximum of %d", MaxSubnetRangeSize),
+		},
+		{
+			// Same-/64 endpoints whose span (2^64-1) overflows int64: the
+			// big.Int difference must not wrap past the bound.
+			name:   "ipv6-same-slash64-over-maximum-size-error",
+			subnet: "2001:db8::/64",
+			start:  "2001:db8::1",
+			end:    "2001:db8::ffff:ffff:ffff:ffff",
+			want:   fmt.Errorf("pool range 2001:db8::1-2001:db8::ffff:ffff:ffff:ffff spans 18446744073709551615 addresses, exceeding the maximum of %d", MaxSubnetRangeSize),
+		},
+	}
+
+	for i := 0; i < len(testSubnets); i++ {
+		got := ti.NewSubnet(
+			testSubnets[i].name,
+			testSubnets[i].subnet,
+			testSubnets[i].start,
+			testSubnets[i].end,
+		)
+		if got == nil && testSubnets[i].want != nil {
+			t.Errorf("%s: got nil, wanted %q", testSubnets[i].name, testSubnets[i].want)
+		} else if got != nil && testSubnets[i].want == nil {
+			t.Errorf("%s: got %q, wanted nil", testSubnets[i].name, got)
+		} else if got != nil && got.Error() != testSubnets[i].want.Error() {
+			t.Errorf("%s: got %q, wanted %q", testSubnets[i].name, got, testSubnets[i].want)
+		}
+	}
+
+	// The rejected subnets must not have been registered: a later allocation
+	// attempt reports the subnet as absent instead of handing out addresses
+	// from an unbuilt range.
+	if _, err := ti.GetIP("range-over-maximum-size-error", ""); err == nil {
+		t.Errorf("oversized subnet was registered despite build error")
+	}
+
+	// ValidateRangeSize is the exported bound used by the webhook; it must
+	// accept the at-limit range and parse errors must surface.
+	if err := ValidateRangeSize("10.0.0.0", "10.0.255.255"); err != nil {
+		t.Errorf("at-limit range rejected: %v", err)
+	}
+	if err := ValidateRangeSize("not-an-ip", "10.0.0.1"); err == nil {
+		t.Errorf("invalid start address accepted")
+	}
+	if err := ValidateRangeSize("10.0.0.1", "not-an-ip"); err == nil {
+		t.Errorf("invalid end address accepted")
 	}
 }

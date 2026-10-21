@@ -14,6 +14,7 @@ import (
 	"time"
 
 	rfmv2 "github.com/joeyloman/rancher-fip-manager/pkg/apis/rancher.k8s.binbash.org/v1beta2"
+	"github.com/joeyloman/rancher-fip-manager/pkg/ipam"
 	log "github.com/sirupsen/logrus"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,7 +39,7 @@ type Handler struct {
 // touching the listener itself. net/http loads the certificate per
 // handshake via GetCertificate, so a renewal is an in-memory pointer swap:
 // the admission endpoint never goes down while the CSR round-trip runs
-// (REPORT.md 2.4: renewal used to Stop the server, sleep 2s and restart it).
+// (renewal used to Stop the server, sleep 2s and restart it).
 func (h *Handler) SetCertificate(pair *tls.Certificate) {
 	h.servingCert.Store(pair)
 }
@@ -47,7 +48,7 @@ func (h *Handler) SetCertificate(pair *tls.Certificate) {
 // succeed: either renewed material was pushed in memory, or the on-disk
 // pair from the last config.Run is loadable. Drives /readyz so the
 // Service endpoint is only advertised while admission calls can actually be
-// served, instead of failing closed against a dead handshake (5.1).
+// served, instead of failing closed against a dead handshake.
 func (h *Handler) servingMaterialReady() bool {
 	if h.servingCert.Load() != nil {
 		return true
@@ -99,6 +100,338 @@ func Register(ctx context.Context) *Handler {
 		clientset: clientset,
 		dynamic:   dynamicClient,
 	}
+}
+
+// poolAdmissionLocks serializes the duplicate-IP decision per
+// FloatingIPPool: two concurrent CREATEs of the same
+// spec.ipAddr must not interleave their duplicate checks. The lock covers
+// the check only — never the response write.
+var poolAdmissionLocks sync.Map // pool name -> *sync.Mutex
+
+// quotaAdmissionLocks serializes the quota decision per project/pool:
+// N concurrent creates for one project must not all read
+// the same usage and all fit under the quota. All quotaReservations
+// access happens while the matching lock is held.
+var quotaAdmissionLocks sync.Map // "project/pool" -> *sync.Mutex
+
+// quotaReservations closes the concurrent-create window on the quota
+// side: the live FloatingIP list only counts CRs after they persist, but
+// an admitted CREATE occupies a quota slot from the moment the response
+// is written. Each allowed admission appends an expiry; liveQuotaUsage
+// pairs persisted not-yet-allocated CRs off against reservations, so the
+// TTL only bounds admissions whose CR never persisted (allowed response
+// lost to an apiserver failure) — the normal path is counted exactly
+// once. Per-process: a second webhook replica's in-flight creates are
+// covered by the live pending count once they persist.
+var quotaReservations sync.Map // "project/pool" -> *[]time.Time (expiries)
+
+const (
+	ipReservationTTL = 5 * time.Second
+	// Bounds the live FloatingIP list while the per-pool mutex is held:
+	// an unbounded list call would head-of-line-block every other
+	// admission for the pool.
+	ipClaimListTimeout = 3 * time.Second
+	// How long an allowed admission counts toward quota usage if its CR
+	// never becomes visible in the live list. The normal path is paired
+	// off against the persisted pending CR (see liveQuotaUsage), so this
+	// only bounds the false count of an admission whose create failed
+	// after the webhook allowed it; it must comfortably cover apiserver
+	// persistence latency.
+	quotaReservationTTL = 5 * time.Second
+	// Matches the label the manager's quota controller keys projects on
+	// (pkg/controller/floatingipprojectquota/controller.go).
+	projectNameLabel = "rancher.k8s.binbash.org/project-name"
+)
+
+// ipReservations closes the residual concurrent-CREATE window: the per-pool
+// mutex is released before the admitted CR is persisted, so two
+// near-simultaneous CREATEs of the same spec.ipAddr could both pass a
+// list-only check. A reservation taken at admission time (before the
+// response is written) makes the second CREATE deterministic; the TTL
+// bounds the false block when an admitted request is later denied by the
+// quota check or the create fails, since there is no hook to clear it.
+var ipReservations sync.Map // "pool/canonicalIP" -> time.Time (expiry)
+
+func lockAdmission(m *sync.Map, key string) func() {
+	if key == "" {
+		return func() {}
+	}
+	v, _ := m.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+
+	return mu.Unlock
+}
+
+func lockPoolForAdmission(pool string) func() {
+	return lockAdmission(&poolAdmissionLocks, pool)
+}
+
+func lockQuotaForAdmission(key string) func() {
+	return lockAdmission(&quotaAdmissionLocks, key)
+}
+
+// activeQuotaReservations returns the number of unexpired admissions
+// counted against the key, pruning expired entries. Callers must hold the
+// per-key quota lock.
+func activeQuotaReservations(key string) int {
+	v, ok := quotaReservations.Load(key)
+	if !ok {
+		return 0
+	}
+	expiries := v.(*[]time.Time)
+	now := time.Now()
+	active := make([]time.Time, 0, len(*expiries))
+	count := 0
+	for _, expiry := range *expiries {
+		if now.Before(expiry) {
+			active = append(active, expiry)
+			count++
+		}
+	}
+	*expiries = active
+
+	return count
+}
+
+// takeQuotaReservation records an allowed admission as a pending quota
+// consumer for quotaReservationTTL. Callers must hold the per-key quota
+// lock.
+func takeQuotaReservation(key string) {
+	v, _ := quotaReservations.LoadOrStore(key, &[]time.Time{})
+	expiries := v.(*[]time.Time)
+	*expiries = append(*expiries, time.Now().Add(quotaReservationTTL))
+}
+
+// checkIPNotInUse returns a denial when the requested IP is already claimed,
+// nil when the admission may proceed. Three layers, all under the per-pool
+// lock:
+//  1. pool.status.Allocated — the manager controller writes it
+//     asynchronously after the FloatingIP CR persists, so on its own it
+//     lags concurrent CREATEs by a full reconcile.
+//  2. A bounded live FloatingIP list — a CR claiming the same IP is visible
+//     immediately after the apiserver persists it. Terminating CRs still
+//     count as claims: reconcileDelete releases the IPAM lease only just
+//     before removing the finalizer. CRs in Error state without
+//     status.ipAddr are skipped: a failed allocation never made an IPAM
+//     claim, so the CR must not block the retry path for that address.
+//  3. A short-TTL in-process reservation taken on allow, so a second
+//     near-simultaneous CREATE is denied even before either CR persists.
+//
+// Any residual race (multi-replica webhook, reservation expiry) is
+// backstopped by the controller, which fails closed on the actual grant.
+func checkIPNotInUse(ctx context.Context, dynamic dynamic.Interface, ar *admissionv1.AdmissionReview, fip *rfmv2.FloatingIP, allocatedIP string, fipPool *rfmv2.FloatingIPPool, isUpdate bool, oldFIP *rfmv2.FloatingIP) *admissionv1.AdmissionResponse {
+	unlock := lockPoolForAdmission(fip.Spec.FloatingIPPool)
+	defer unlock()
+
+	if _, ok := fipPool.Status.Allocated[allocatedIP]; ok {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("requested IP %s is already allocated", allocatedIP),
+			},
+		}
+	}
+
+	// Canonical form: peers may textually differ (IPv6 zero compression,
+	// IPv4 leading zeros are already rejected by net.ParseIP) while naming
+	// the same address the IPAM would collide on.
+	requestedIP := net.ParseIP(allocatedIP)
+	reservationKey := fip.Spec.FloatingIPPool + "/" + allocatedIP
+	if requestedIP != nil {
+		reservationKey = fip.Spec.FloatingIPPool + "/" + requestedIP.String()
+	}
+
+	// The object under update already owns this exact address (e.g. the
+	// controller's spec rewrite right after a pinned-IP create, while
+	// status.ipAddr is still empty and the outer oldFIP.Status.IPAddr skip
+	// does not fire): it is not claiming anything new, so neither probe
+	// the reservation nor take one. Failing this write open is safe — the
+	// address is the object's own.
+	if isUpdate && oldFIP != nil && oldFIP.Spec.IPAddr != nil {
+		oldIP := net.ParseIP(*oldFIP.Spec.IPAddr)
+		if requestedIP == nil {
+			if *oldFIP.Spec.IPAddr == allocatedIP {
+				return nil
+			}
+		} else if oldIP != nil && oldIP.Equal(requestedIP) {
+			return nil
+		}
+	}
+
+	if expiry, ok := ipReservations.Load(reservationKey); ok {
+		if time.Now().Before(expiry.(time.Time)) {
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("requested IP %s is pending allocation in floatingippool %s", allocatedIP, fip.Spec.FloatingIPPool),
+				},
+			}
+		}
+		// Expired entries are never overwritten while the holder is being
+		// denied; sweep them here so the map does not grow unboundedly.
+		ipReservations.Delete(reservationKey)
+	}
+
+	fipListGVR := schema.GroupVersionResource{
+		Group:    "rancher.k8s.binbash.org",
+		Version:  "v1beta2",
+		Resource: "floatingips",
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, ipClaimListTimeout)
+	defer cancel()
+
+	fips, err := dynamic.Resource(fipListGVR).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{})
+	if err != nil {
+		log.Errorf("failed to list floatingips while validating IP %s: %s", allocatedIP, err)
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("failed to verify that requested IP %s is free in floatingippool %s", allocatedIP, fip.Spec.FloatingIPPool),
+			},
+		}
+	}
+
+	for _, item := range fips.Items {
+		var existing rfmv2.FloatingIP
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, &existing); err != nil {
+			continue
+		}
+		if isUpdate && oldFIP != nil && existing.Name == oldFIP.Name && existing.Namespace == oldFIP.Namespace {
+			// The object under update itself.
+			continue
+		}
+		if existing.Spec.IPAddr == nil || existing.Spec.FloatingIPPool != fip.Spec.FloatingIPPool {
+			continue
+		}
+		existingIP := net.ParseIP(*existing.Spec.IPAddr)
+		if requestedIP == nil || existingIP == nil {
+			// Unparseable forms cannot be compared canonically; fall back
+			// to exact string match so nothing is silently allowed.
+			if *existing.Spec.IPAddr != allocatedIP {
+				continue
+			}
+		} else if !existingIP.Equal(requestedIP) {
+			continue
+		}
+		if existing.DeletionTimestamp != nil {
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("requested IP %s is still held by terminating floatingip %s/%s", allocatedIP, existing.Namespace, existing.Name),
+				},
+			}
+		}
+		if existing.Status.State == "Error" && existing.Status.IPAddr == "" {
+			// Failed allocation: the grant path fails before any IPAM
+			// claim is made (pkg/controller/floatingip/controller.go
+			// updateFipStatusWithError), so this CR holds nothing and
+			// must not block the retry path.
+			continue
+		}
+
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("requested IP %s is already claimed by floatingip %s/%s", allocatedIP, existing.Namespace, existing.Name),
+			},
+		}
+	}
+
+	// All checks passed: reserve the address until the CR is expected to
+	// have persisted.
+	ipReservations.Store(reservationKey, time.Now().Add(ipReservationTTL))
+
+	return nil
+}
+
+// liveQuotaUsage computes a project/pool's quota usage from live cluster
+// state instead of the asynchronously updated quota.status.
+// A CR occupies a slot when it carries the project label and targets the
+// pool, and either holds a status.ipAddr (allocated — including
+// terminating CRs, whose release happens in reconcileDelete just before
+// finalizer removal, and Error-state CRs that still hold their IP) or is
+// persisted and still waiting for the manager controller to grant one
+// (pending — a failed allocation, Error state without status.ipAddr,
+// holds nothing and must not block retries). This mirrors — and under
+// cache lag improves on — the manager's Used computation
+// (pkg/controller/floatingipprojectquota/controller.go).
+//
+// Reservations close the pre-persist window: an admitted CREATE occupies
+// a slot from the moment the webhook responds, before the CR is visible
+// in the list. Reservations are paired off against the occupying CRs
+// (allocated or pending) that appeared within the reservation TTL — on
+// one replica every such CR still has its live reservation — so an
+// in-flight create is counted exactly once: never twice once its CR
+// persists and is granted, never zero between the response and the
+// persist. Aged occupying CRs (manager backlog) never had a live
+// reservation and do not mask one. Reservations whose CR never became
+// visible (response lost after allowing) count alone until they expire.
+// The object under update is excluded: same-pool updates never reach the
+// quota check unless the CR holds no slot (errored, never granted), and
+// a pool-change update's current slot sits under the old pool.
+func liveQuotaUsage(ctx context.Context, dynamic dynamic.Interface, projectID string, poolName string, fip *rfmv2.FloatingIP) (int, error) {
+	fipListGVR := schema.GroupVersionResource{
+		Group:    "rancher.k8s.binbash.org",
+		Version:  "v1beta2",
+		Resource: "floatingips",
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, ipClaimListTimeout)
+	defer cancel()
+
+	fips, err := dynamic.Resource(fipListGVR).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+
+	recentCutoff := time.Now().Add(-quotaReservationTTL)
+	allocated, pending, recent := 0, 0, 0
+	for _, item := range fips.Items {
+		var existing rfmv2.FloatingIP
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, &existing); err != nil {
+			continue
+		}
+		if existing.Name == fip.Name && existing.Namespace == fip.Namespace {
+			continue
+		}
+		if existing.Spec.FloatingIPPool != poolName || existing.Labels[projectNameLabel] != projectID {
+			continue
+		}
+		occupies := false
+		if existing.Status.IPAddr != "" {
+			allocated++
+			occupies = true
+		} else if existing.Status.State != "Error" {
+			// Persisted and still waiting for the manager controller to
+			// grant an IP: it is about to hold a slot, so it counts now.
+			// (A genuinely stuck pending CR requires a wedged controller,
+			// which fails every allocation anyway.)
+			pending++
+			occupies = true
+		}
+		// A reservation can only have turned into a visible CR that
+		// appeared within the reservation's lifetime; an aged occupying
+		// CR (manager backlog) never had a live reservation to consume
+		// and must not mask one.
+		if occupies && existing.CreationTimestamp.Time.After(recentCutoff) {
+			recent++
+		}
+	}
+
+	reservations := activeQuotaReservations(projectID + "/" + poolName)
+	unpaired := reservations - recent
+	if unpaired < 0 {
+		unpaired = 0
+	}
+
+	return allocated + pending + unpaired, nil
 }
 
 func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admissionv1.AdmissionReview, fip *rfmv2.FloatingIP, oldFIP *rfmv2.FloatingIP, h *Handler) *admissionv1.AdmissionResponse {
@@ -162,6 +495,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		}
 
 		// Check if the IP is within the subnet
+		if fipPool.Spec.IPConfig == nil {
+			log.Errorf("floatingippool %s has no ipConfig", fip.Spec.FloatingIPPool)
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("floatingippool %s has no ipConfig", fip.Spec.FloatingIPPool),
+				},
+			}
+		}
 		_, subnet, err := net.ParseCIDR(fipPool.Spec.IPConfig.Subnet)
 		if err != nil {
 			log.Errorf("failed to parse subnet %s: %s", fipPool.Spec.IPConfig.Subnet, err)
@@ -252,14 +595,8 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		allocatedIP := *fip.Spec.IPAddr
 		if isUpdate && oldFIP != nil && oldFIP.Status.IPAddr == allocatedIP {
 			// The IP hasn't changed, skip the allocated check
-		} else if _, ok := fipPool.Status.Allocated[allocatedIP]; ok {
-			return &admissionv1.AdmissionResponse{
-				UID:     ar.Request.UID,
-				Allowed: false,
-				Result: &metav1.Status{
-					Message: fmt.Sprintf("requested IP %s is already allocated", *fip.Spec.IPAddr),
-				},
-			}
+		} else if resp := checkIPNotInUse(ctx, dynamic, ar, fip, allocatedIP, &fipPool, isUpdate, oldFIP); resp != nil {
+			return resp
 		}
 	} else {
 		// if no ip is requested, check if there are available ips in the pool
@@ -274,23 +611,39 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 		}
 	}
 
-	// Skip quota check if the IP address hasn't changed during an update
-	// For auto-assignment (IPAddr is nil), we still need to check quota
+	// Skip the quota check when the admission cannot change the project's
+	// occupancy for the pool: a same-pool update keeps the CR's existing
+	// slot (one CR holds one slot regardless of which IP it carries), and
+	// the IP-unchanged update is its special case. The slot was
+	// quota-checked when it was acquired; re-checking here would
+	// self-deny the controller's spec rewrite of a just-created pinned IP
+	// against its own create's reservation at a full quota. An errored CR
+	// with empty status.ipAddr holds NO slot (the grant path failed
+	// before any claim), so re-reconciling it can occupy one and must be
+	// quota-checked.
 	shouldCheckQuota := true
-	if isUpdate && oldFIP != nil && fip.Spec.IPAddr != nil {
-		allocatedIP := *fip.Spec.IPAddr
-		if oldFIP.Status.IPAddr == allocatedIP {
+	if isUpdate && oldFIP != nil {
+		erroredWithoutSlot := oldFIP.Status.IPAddr == "" && oldFIP.Status.State == "Error"
+		if fip.Spec.IPAddr != nil && oldFIP.Status.IPAddr == *fip.Spec.IPAddr {
+			shouldCheckQuota = false
+		} else if oldFIP.Spec.FloatingIPPool == fip.Spec.FloatingIPPool && !erroredWithoutSlot {
 			shouldCheckQuota = false
 		}
 	}
 
 	if shouldCheckQuota {
 		// 3. Project Quota Enforcement
+		//
+		// The decision is serialized per project/pool and computed from
+		// the live FloatingIP list, not from quota.status:
+		// the manager controller updates Used asynchronously, so the
+		// former fixed 2s sleep burned admission budget on every
+		// quota-checked request while N concurrent creates still all read
+		// the same stale count and all fit under the quota.
+		projectID := fip.ObjectMeta.Labels[projectNameLabel]
 
-		// This sleep prevents Quota usage race conditions when creating multiple FloatingIPs in a short period of time
-		time.Sleep(2 * time.Second)
-
-		projectID := fip.ObjectMeta.Labels["rancher.k8s.binbash.org/project-name"]
+		unlockQuota := lockQuotaForAdmission(projectID + "/" + fip.Spec.FloatingIPPool)
+		defer unlockQuota()
 
 		plbcGVR := schema.GroupVersionResource{
 			Group:    "rancher.k8s.binbash.org",
@@ -335,10 +688,18 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 			}
 		}
 
-		// Check the current usage for that pool
-		usage := 0
-		if fipInfo, ok := plbc.Status.FloatingIPs[fip.Spec.FloatingIPPool]; ok {
-			usage = fipInfo.Used
+		// Check the current usage for that pool from live state; the
+		// asynchronously written quota.status Used is not consulted.
+		usage, err := liveQuotaUsage(ctx, dynamic, projectID, fip.Spec.FloatingIPPool, fip)
+		if err != nil {
+			log.Errorf("failed to compute live quota usage for project %s: %s", projectID, err)
+			return &admissionv1.AdmissionResponse{
+				UID:     ar.Request.UID,
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: fmt.Sprintf("failed to verify quota usage for floatingippool %s in project %s", fip.Spec.FloatingIPPool, projectID),
+				},
+			}
 		}
 
 		if usage >= quota {
@@ -350,6 +711,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 				},
 			}
 		}
+
+		// Reserve a quota slot for this admission unless occupancy cannot
+		// change: a same-pool update keeps the CR's existing slot, and
+		// that slot was quota-checked when it was acquired (create or
+		// pool change). Covers the window before the CR persists, so a
+		// burst of creates sees each other instead of all reading the
+		// same count.
+		if !isUpdate || oldFIP == nil || oldFIP.Spec.FloatingIPPool != fip.Spec.FloatingIPPool {
+			takeQuotaReservation(projectID + "/" + fip.Spec.FloatingIPPool)
+		}
 	}
 
 	return &admissionv1.AdmissionResponse{
@@ -359,6 +730,16 @@ func validateFloatingIP(ctx context.Context, dynamic dynamic.Interface, ar *admi
 }
 
 func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview, fipPool *rfmv2.FloatingIPPool) *admissionv1.AdmissionResponse {
+	if fipPool.Spec.IPConfig == nil {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: "ipConfig is required in floatingippool spec",
+			},
+		}
+	}
+
 	// Check if the subnet is valid
 	_, subnet, err := net.ParseCIDR(fipPool.Spec.IPConfig.Subnet)
 	if err != nil {
@@ -438,6 +819,21 @@ func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview
 		}
 	}
 
+	// Bound the pool range before it reaches the IPAM: buildSubnet
+	// materializes every address in [start,end], so an oversized range must
+	// be denied here with a clear message instead of leaving a pool whose
+	// reconcile fails (or OOMs) forever. Runs after the ordering check, per
+	// ValidateRangeSize's contract.
+	if err := ipam.ValidateRangeSize(fipPool.Spec.IPConfig.Pool.Start, fipPool.Spec.IPConfig.Pool.End); err != nil {
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: err.Error(),
+			},
+		}
+	}
+
 	// Check if exclude IPs are valid, within the subnet and between the start and end IP
 	for _, excludedIPStr := range fipPool.Spec.IPConfig.Pool.Exclude {
 		excludedIP := net.ParseIP(excludedIPStr)
@@ -491,12 +887,38 @@ func validateFloatingIPPool(ctx context.Context, ar *admissionv1.AdmissionReview
 	}
 }
 
+// writeMalformedAdmissionReview answers a request whose body decoded to an
+// AdmissionReview without a `request` field: a structured
+// denial instead of a nil-pointer panic on ar.Request.Object.Raw.
+func writeMalformedAdmissionReview(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(&admissionv1.AdmissionReview{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: admissionv1.SchemeGroupVersion.String(),
+			Kind:       "AdmissionReview",
+		},
+		Response: &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Code:    http.StatusBadRequest,
+				Message: "admission review does not contain a request",
+			},
+		},
+	})
+}
+
 func (h *Handler) validateFloatingIPAdmission(w http.ResponseWriter, r *http.Request) {
 	ar := &admissionv1.AdmissionReview{}
 	if err := json.NewDecoder(r.Body).Decode(&ar); err != nil {
 		log.Errorf("cannot decode AdmissionReview to json: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "cannot decode AdmissionReview to json: %s", err)
+		return
+	}
+	if ar.Request == nil {
+		log.Errorf("admission review does not contain a request")
+		writeMalformedAdmissionReview(w)
 		return
 	}
 
@@ -535,6 +957,11 @@ func (h *Handler) validateFloatingIPPoolAdmission(w http.ResponseWriter, r *http
 		log.Errorf("cannot decode AdmissionReview to json: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "cannot decode AdmissionReview to json: %s", err)
+		return
+	}
+	if ar.Request == nil {
+		log.Errorf("admission review does not contain a request")
+		writeMalformedAdmissionReview(w)
 		return
 	}
 
@@ -628,7 +1055,7 @@ func (h *Handler) Stop() error {
 		return nil
 	}
 
-	// REPORT.md 2.5: Shutdown(h.ctx) alone ended only on SIGTERM, so a
+	// Shutdown(h.ctx) alone ended only on SIGTERM, so a
 	// wedged handler could block a renewal restart indefinitely. Deriving a
 	// timeout context bounds Stop at shutdownTimeout regardless.
 	ctx, cancel := context.WithTimeout(h.ctx, shutdownTimeout)

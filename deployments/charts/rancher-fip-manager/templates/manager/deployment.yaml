@@ -41,6 +41,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       dnsPolicy: ClusterFirst
+      # Must stay above the 20s gracefulDrainTimeout in cmd/manager/main.go,
+      # or the SIGTERM drain path ends in SIGKILL.
+      terminationGracePeriodSeconds: 30
       {{- with .Values.manager.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -67,8 +70,8 @@ spec:
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
           # Port literal: the binary's --http-service-port defaults to 8080
-          # and the args block above only renders when manager.env is set
-          # (REPORT.md 5.2), so this is the only port the server can have.
+          # and the args block above only renders when manager.env is set,
+          # so this is the only port the server can have.
           ports:
             - name: http
               containerPort: 8080

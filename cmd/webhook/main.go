@@ -19,7 +19,7 @@ var progname string = "rancher-fip-manager-webhook"
 
 var certRenewalPeriod int64
 
-// Sane bounds for CERTRENEWALPERIOD, in minutes (REPORT.md 2.4: the value
+// Sane bounds for CERTRENEWALPERIOD, in minutes: the value
 // was only checked against 0, so any positive int64 was accepted; raising
 // it past the cert lifetime collapsed the renewal tick to a per-minute
 // bounce of the admission endpoint).
@@ -128,7 +128,7 @@ func main() {
 	} else {
 		// Serve the secret material straight from memory: the first
 		// renewal later on is then a pointer swap with zero listener
-		// downtime (REPORT.md 2.4).
+		// downtime.
 		serviceHandler.SetCertificate(pair)
 	}
 	admissionHandler.Init()

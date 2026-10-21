@@ -31,7 +31,7 @@ var (
 	// csrPollInterval is the poll period while waiting for the CSR to sign.
 	csrPollInterval = 500 * time.Millisecond
 	// csrExpirationSeconds requests a bounded one-year lifetime on the CSR
-	// (REPORT.md 2.4: lifetime was entirely the signer's decision). The
+	// (the lifetime was previously entirely the signer's decision). The
 	// signer may clamp the request, and the parsed NotAfter of the material
 	// it actually returns remains the source of truth (certNotAfter).
 	csrExpirationSeconds int32 = 365 * 24 * 60 * 60

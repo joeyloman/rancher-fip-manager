@@ -32,6 +32,10 @@ import (
 // ClusterProvisioningReconciler reconciles a managementv3.Cluster object.
 type ClusterProvisioningReconciler struct {
 	client.Client
+	// APIReader reads directly from the API server, bypassing the informer
+	// cache. Used for credential material (config secret, CA bundle) that
+	// must not be reconciled from a stale snapshot.
+	APIReader client.Reader
 	// Scheme is the scheme for the controller.
 	Scheme *runtime.Scheme
 	// HelmClient is the Helm client for installing and upgrading charts.
@@ -377,29 +381,21 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 	vmNamespace, _, _ := unstructured.NestedString(harvesterConfig.Object, "vmNamespace")
 	log.Infof("the harvester vmNamespace is: %s", vmNamespace)
 
-	// Get the configured networks for the downstream cluster from the HarvesterConfig object
-	networkInfoRaw, _, _ := unstructured.NestedString(harvesterConfig.Object, "networkInfo")
-	log.Infof("the harvester networkInfo is: %s", networkInfoRaw)
-
-	type networkInfoData struct {
-		Interfaces []struct {
-			NetworkName string `json:"networkName"`
-		} `json:"interfaces"`
-	}
-
-	var networkInfo networkInfoData
-	if err := json.Unmarshal([]byte(networkInfoRaw), &networkInfo); err != nil {
-		log.WithError(err).Error("unable to unmarshal networkInfo")
+	// Get the configured network for the downstream cluster from the HarvesterConfig object
+	networkName, err := harvesterNetworkName(harvesterConfig)
+	if err != nil {
+		log.WithError(err).Error("unable to determine harvester network")
 		return ctrl.Result{}, err
 	}
-
-	if len(networkInfo.Interfaces) == 0 || networkInfo.Interfaces[0].NetworkName == "" {
-		err := fmt.Errorf("networkName not found in networkInfo")
-		log.Error(err)
-		return ctrl.Result{}, err
+	if networkName == "" {
+		// The HarvesterConfig has no network configured yet. Rancher owns
+		// that field and no event on the Cluster will signal the fix, so
+		// re-check on the provisioning interval instead of failing.
+		log.Infof("HarvesterConfig %s has no network configured yet, requeuing", harvesterConfig.GetName())
+		return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
 	}
+	log.Infof("the harvester networkName is: %s", networkName)
 
-	networkName := networkInfo.Interfaces[0].NetworkName
 	networkNameParts := strings.Split(networkName, "/")
 	if len(networkNameParts) != 2 {
 		err := fmt.Errorf("invalid networkName format: %s", networkName)
@@ -552,7 +548,7 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	if result, err := HandleConfigSecrets(
-		ctx, r.Client,
+		ctx, r.APIReader, r.Client,
 		downstreamClient,
 		r.Config.RancherFipLBControllerNamespace,
 		&project,
@@ -562,12 +558,44 @@ func (r *ClusterProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.
 		cluster.Name,
 		loadBalancerType,
 		r.Config.CaCrt,
+		r.AppNamespace,
 	); err != nil {
 		return result, err
 	}
 
 	// Keep the cluster on the convergence loop.
 	return ctrl.Result{RequeueAfter: provisioningReconcileInterval}, nil
+}
+
+// harvesterNetworkName resolves the Harvester network (namespace/name) the
+// guest cluster's VMs are attached to.
+//
+// HarvesterConfig carries the network in two encodings: the legacy
+// networkName field, and the networkInfo JSON blob introduced with multi-NIC
+// support. An empty networkInfo is not an error — the node driver treats it
+// as the legacy format and uses networkName — so the same precedence is
+// applied here. An empty return value means the config has no network set at
+// all; the caller requeues instead of failing because Rancher owns the field
+// and no event on the Cluster object will signal the fix.
+func harvesterNetworkName(harvesterConfig *unstructured.Unstructured) (string, error) {
+	networkInfoRaw, _, _ := unstructured.NestedString(harvesterConfig.Object, "networkInfo")
+	if networkInfoRaw != "" {
+		var networkInfo struct {
+			Interfaces []struct {
+				NetworkName string `json:"networkName"`
+			} `json:"interfaces"`
+		}
+		if err := json.Unmarshal([]byte(networkInfoRaw), &networkInfo); err != nil {
+			return "", fmt.Errorf("unable to unmarshal networkInfo of HarvesterConfig %s: %w", harvesterConfig.GetName(), err)
+		}
+		if len(networkInfo.Interfaces) == 0 || networkInfo.Interfaces[0].NetworkName == "" {
+			return "", fmt.Errorf("networkName not found in networkInfo of HarvesterConfig %s", harvesterConfig.GetName())
+		}
+		return networkInfo.Interfaces[0].NetworkName, nil
+	}
+
+	networkName, _, _ := unstructured.NestedString(harvesterConfig.Object, "networkName")
+	return networkName, nil
 }
 
 func (r *ClusterProvisioningReconciler) releaseFloatingIPs(ctx context.Context, log *logrus.Entry, clusterName string) error {

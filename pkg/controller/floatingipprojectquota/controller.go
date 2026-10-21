@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -29,6 +30,14 @@ const quotaFinalizerName = "rancher.k8s.binbash.org/floatingipprojectquota-clean
 
 const projectNameLabel = "rancher.k8s.binbash.org/project-name"
 
+// Cascade requeue pacing: exponential from baseDelay, capped, so a stalled
+// FloatingIP deletion converges on a bounded poll instead of hammering at a
+// fixed 2 s forever.
+const (
+	cascadeRetryBaseDelay = 2 * time.Second
+	cascadeRetryMaxDelay  = 30 * time.Second
+)
+
 // Controller is the controller implementation for FloatingIPProjectQuota resources.
 // It keeps the FloatingIPProjectQuota status in sync with its attached FloatingIPs and cascades
 // FloatingIPProjectQuota deletion: a FloatingIPProjectQuota being deleted first deletes all FloatingIPs labeled
@@ -44,6 +53,15 @@ type Controller struct {
 	fipPoolSynced                cache.InformerSynced
 	workqueue                    workqueue.RateLimitingInterface
 	initSyncDone                 chan struct{}
+
+	// cascadeRetries tracks, per quota key, how many cascade passes have
+	// already run while FloatingIPs are still attached. Deleted once the
+	// cascade completes so a future deletion starts at the base delay again.
+	cascadeRetries sync.Map
+
+	// cascadeEnqueueAfter requeues a cascade pass after a backoff delay.
+	// Bound to workqueue.AddAfter in New; a seam for tests.
+	cascadeEnqueueAfter func(key string, delay time.Duration)
 }
 
 // New creates a new Controller for managing FloatingIPProjectQuota resources.
@@ -65,6 +83,9 @@ func New(
 		fipPoolSynced:                fipPoolInformer.Informer().HasSynced,
 		workqueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "FloatingIPProjectQuotas"),
 		initSyncDone:                 make(chan struct{}),
+	}
+	controller.cascadeEnqueueAfter = func(key string, delay time.Duration) {
+		controller.workqueue.AddAfter(key, delay)
 	}
 
 	logrus.Info("Setting up event handlers for FloatingIPProjectQuota controller")
@@ -112,14 +133,26 @@ func (c *Controller) Run(ctx context.Context, workers int) {
 
 	logrus.Info("Waiting for informer caches to sync for FloatingIPProjectQuota controller")
 	if ok := cache.WaitForCacheSync(ctx.Done(), c.floatingIPProjectQuotaSynced, c.fipSynced, c.fipPoolSynced); !ok {
+		// A cancelled context means shutdown raced startup (e.g. leader
+		// loss during the rollout window): return instead of Fatal so the
+		// process exits through the leader-loss drain with the lease
+		// released, instead of os.Exit(1) while still holding the lease.
+		if ctx.Err() != nil {
+			logrus.Errorf("FloatingIPProjectQuota controller startup aborted: %v", ctx.Err())
+			return
+		}
 		logrus.Fatal("failed to wait for caches to sync")
 	}
 
 	logrus.Info("Starting initial sync for FloatingIPProjectQuota controller")
 	queueLen := c.workqueue.Len()
 	logrus.Infof("FloatingIPProjectQuota controller initial sync: processing %d items", queueLen)
-	for i := 0; i < queueLen; i++ {
+	for range queueLen {
 		if !c.processNextWorkItem(ctx) {
+			if ctx.Err() != nil {
+				logrus.Errorf("FloatingIPProjectQuota controller initial sync aborted: %v", ctx.Err())
+				return
+			}
 			logrus.Fatal("worker shutdown during initial sync")
 		}
 	}
@@ -127,13 +160,26 @@ func (c *Controller) Run(ctx context.Context, workers int) {
 	close(c.initSyncDone)
 
 	logrus.Info("Starting workers for FloatingIPProjectQuota controller")
-	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+	// Tracked workers: Run only returns after the workqueue was shut down
+	// and every worker goroutine exited - the leader-loss drain in
+	// cmd/manager relies on that for an ordered teardown. In-flight items
+	// are not killed mid-sequence by the exit itself, but their remaining
+	// API writes fail fast on the cancelled context and are re-delivered
+	// after restart (idempotent per-object updates).
+	var workersWG sync.WaitGroup
+	for range workers {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		}()
 	}
 
 	logrus.Info("Started workers for FloatingIPProjectQuota controller")
 	<-ctx.Done()
 	logrus.Info("Shutting down workers for FloatingIPProjectQuota controller")
+	c.workqueue.ShutDown()
+	workersWG.Wait()
 }
 
 func (c *Controller) runWorker(ctx context.Context) {
@@ -183,6 +229,11 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	floatingIPProjectQuota, err := c.floatingIPProjectQuotaLister.Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			// The quota is gone from the cache, so handleFloatingIPProjectQuotaDelete
+			// will never run its reset path for this key; drop any leftover cascade
+			// backoff state or a recreated quota with the same name would resume at
+			// the stale (capped) delay.
+			c.cascadeRetries.Delete(key)
 			runtime.HandleError(fmt.Errorf("floatingipprojectquota '%s' in work queue no longer exists", key))
 			return nil
 		}
@@ -302,9 +353,18 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 
 		// FloatingIPs are gone from the API but the informer cache may still
 		// list them; requeue until the list is empty and their finalizers ran.
-		c.workqueue.AddAfter(key, 2*time.Second)
+		// Passes back off exponentially (2 s doubling, capped at 30 s) so a
+		// stalled FloatingIP deletion converges on a bounded retry rate
+		// instead of an unbounded fixed 2 s poll.
+		attempt := 1
+		if prev, ok := c.cascadeRetries.Load(key); ok {
+			attempt = prev.(int) + 1
+		}
+		c.cascadeRetries.Store(key, attempt)
+		c.cascadeEnqueueAfter(key, cascadeRetryDelay(attempt))
 		return nil
 	}
+	c.cascadeRetries.Delete(key)
 
 	quota, err := c.clientset.RancherV1beta2().FloatingIPProjectQuotas().Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
@@ -333,6 +393,20 @@ func (c *Controller) handleFloatingIPProjectQuotaDelete(ctx context.Context, key
 		return fmt.Errorf("failed to remove finalizer from FloatingIPProjectQuota %s: %w", name, err)
 	}
 	return nil
+}
+
+// cascadeRetryDelay returns the requeue delay for the attempt-th (1-based)
+// cascade pass of a Terminating FloatingIPProjectQuota: 2 s, 4 s, 8 s, …
+// capped at cascadeRetryMaxDelay.
+func cascadeRetryDelay(attempt int) time.Duration {
+	delay := cascadeRetryBaseDelay
+	for i := 1; i < attempt && delay < cascadeRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > cascadeRetryMaxDelay {
+		delay = cascadeRetryMaxDelay
+	}
+	return delay
 }
 
 func (c *Controller) handleFloatingIPProjectQuotaCreate(obj interface{}) {

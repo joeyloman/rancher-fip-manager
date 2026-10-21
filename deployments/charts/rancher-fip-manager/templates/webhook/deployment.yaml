@@ -63,7 +63,7 @@ spec:
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
           # Port literal, not values.webhook.webhookListenPort: the binary
-          # hardcodes :8443 (REPORT.md 5.5), so values-driven ports would
+          # hardcodes :8443, so values-driven ports would
           # silently mis-target the probes.
           ports:
             - name: https
@@ -83,7 +83,7 @@ spec:
           # /readyz is material-gated: the Service only advertises the
           # endpoint while TLS handshakes can actually succeed, so renewals
           # and recovery windows shed admission calls instead of failing
-          # closed against a dead handshake (REPORT.md 5.1).
+          # closed against a dead handshake.
           readinessProbe:
             httpGet:
               path: /readyz
