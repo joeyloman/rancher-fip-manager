@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+    # Release tags need per-commit images: build-release retags the
+    # <sha8> image to the release tag, and a chart-only release commit
+    # never matches the path filter below. Path filters are not
+    # evaluated for tag pushes, so tags build regardless of paths.
+    tags:
+      - 'v*'
     paths:
       - 'cmd/**'
       - 'pkg/**'
