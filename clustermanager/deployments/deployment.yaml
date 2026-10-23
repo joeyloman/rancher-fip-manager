@@ -141,20 +141,20 @@ data:
   RancherFipApiServerURL: https://rancher-fip-api.example.com/v1
   RancherFipLBControllerChartName: rancher-fip-lb-controller
   RancherFipLBControllerChartRef: oci://registry.example.com/projectname/rancher-fip-lb-controller
-  RancherFipLBControllerChartVersion: 0.2.0
+  RancherFipLBControllerChartVersion: 0.5.0
   RancherFipLBControllerNamespace: rancher-fip-manager
   RancherFipLBControllerValues: |
     image:
       repository: ghcr.io/joeyloman/rancher-fip-lb-controller
-      tag: v0.2.0
+      tag: v0.5.0
   PureLBControllerChartName: purelb
-  PureLBControllerChartRef: https://gitlab.com/api/v4/projects/20400619/packages/helm/stable
-  PureLBControllerChartVersion: 0.13.0
+  PureLBControllerChartRef: https://purelb.github.io/purelb/charts
+  PureLBControllerChartVersion: 0.14.1
   PureLBControllerNamespace: rancher-fip-manager
   PureLBControllerValues: |
     image:
-      repository: registry.gitlab.com/purelb/purelb
-      tag: v0.13.0
+      repository: ghcr.io/purelb/purelb
+      tag: v0.14.1
     lbnodeagent:
       sendgarp: true
       nodeSelector:
@@ -172,13 +172,13 @@ data:
       "operator": "Exists" } ]
   MetalLBControllerChartName: metallb
   MetalLBControllerChartRef: https://metallb.github.io/metallb
-  MetalLBControllerChartVersion: 0.15.2
+  MetalLBControllerChartVersion: 0.15.3
   MetalLBControllerNamespace: rancher-fip-manager
   MetalLBControllerValues: |
     controller:
       image:
         repository: quay.io/metallb/controller
-        tag: v0.15.2
+        tag: v0.15.3
       nodeSelector:
         node-role.kubernetes.io/control-plane: 'true'
       tolerations: [ { "effect": "NoSchedule", "key":
@@ -200,7 +200,7 @@ data:
       frr:
         image:
           repository: quay.io/frrouting/frr
-          tag: 9.1.0
+          tag: 10.4.1
 ---
 apiVersion: apps/v1
 kind: Deployment
