@@ -324,6 +324,18 @@ func checkSpecificIPClaimable(fip *fipv1beta2.FloatingIP, req types.FIPRequest) 
 	if fip.Status.Assigned != nil {
 		// Check if FloatingIPGroup is set in Status.Assigned
 		if fip.Status.Assigned.FloatingIPGroup == "" {
+			// A repeated request from the Service that already holds the
+			// address is an idempotent re-claim, not a conflict. The
+			// controller records the allocation in an annotation only after
+			// the request returns, so a crash or timeout in between leaves an
+			// identical retry with no local record. The
+			// cluster label must match too: a same-named Service in another
+			// cluster does not own this address.
+			if req.FloatingIPGroup == "" &&
+				fip.Labels["rancher.k8s.binbash.org/cluster-name"] == req.Cluster &&
+				serviceAlreadyExists(fip.Labels, req.ServiceName, req.ServiceNamespace) {
+				return nil
+			}
 			// IP is already assigned, which is an error condition
 			return newErrHTTP(http.StatusConflict, "IP address is already assigned")
 		}
@@ -337,6 +349,47 @@ func checkSpecificIPClaimable(fip *fipv1beta2.FloatingIP, req types.FIPRequest) 
 		}
 	}
 	return nil
+}
+
+// findServiceFIP returns the project's FloatingIP that already claims the
+// requesting Service. A repeated request must reuse that object: the
+// controller writes the allocated address into an annotation only after the
+// request returns, so a retry after a crash, a timeout or a dropped response
+// arrives without any local record of the allocation. Matching on the service
+// labels makes the request idempotent by
+// (project, cluster, pool, namespace, name, group).
+func findServiceFIP(ctx context.Context, app *types.App, project managementv3.Project, req types.FIPRequest) (*fipv1beta2.FloatingIP, bool, error) {
+	fipList := &fipv1beta2.FloatingIPList{}
+	if err := app.FipRestClient.List(ctx, fipList, client.InNamespace(project.Namespace)); err != nil {
+		return nil, false, err
+	}
+	for i := range fipList.Items {
+		fip := &fipList.Items[i]
+		if fip.DeletionTimestamp != nil {
+			// Being released: the retry must allocate a fresh object.
+			continue
+		}
+		if fip.Labels["rancher.k8s.binbash.org/project-name"] != req.Project ||
+			fip.Labels["rancher.k8s.binbash.org/cluster-name"] != req.Cluster {
+			continue
+		}
+		if fip.Spec.FloatingIPPool != req.FloatingIPPool {
+			continue
+		}
+		if !serviceAlreadyExists(fip.Labels, req.ServiceName, req.ServiceNamespace) {
+			continue
+		}
+		if fip.Labels["rancher.k8s.binbash.org/floatingip-group"] != req.FloatingIPGroup {
+			continue
+		}
+		// A pinned request that asks for a different address is a static-IP
+		// change, not a retry; let the normal claim path handle it.
+		if req.IPAddress != "" && (fip.Spec.IPAddr == nil || *fip.Spec.IPAddr != req.IPAddress) {
+			continue
+		}
+		return fip, true, nil
+	}
+	return nil, false, nil
 }
 
 // findPinnedFIP looks up the project's FloatingIP for a pinned address. The
@@ -535,8 +588,24 @@ func FIPRequestHandler(app *types.App) http.HandlerFunc {
 		// by this request may be cleaned up when the allocation watch fails.
 		createdNew := false
 
+		// A repeated request for a Service that already holds an allocation
+		// must return that allocation. The controller records the address in
+		// an annotation only after the request returns, so a crash or timeout
+		// in between produces an identical request with no local record;
+		// without this lookup the manager would allocate a second address.
+		serviceFIP, serviceHasFIP, err := findServiceFIP(r.Context(), app, project, fipRequest)
+		if err != nil {
+			app.Log.Errorf("failed to list floatingips: %s", err.Error())
+			errors.WriteJSONError(w, http.StatusInternalServerError, "failed to list existing floating IPs")
+			return
+		}
+
 		var floatingIP *fipv1beta2.FloatingIP
-		if fipRequest.IPAddress != "" {
+		if serviceHasFIP {
+			floatingIP = serviceFIP
+			app.Log.Infof("Reusing FloatingIP %s/%s already allocated to service %s/%s",
+				floatingIP.Namespace, floatingIP.Name, fipRequest.ServiceNamespace, fipRequest.ServiceName)
+		} else if fipRequest.IPAddress != "" {
 			// IP address is given in the request: look up, claim or create it.
 			// The helper owns the create-collision handling so two requests
 			// for one address cannot persist two FloatingIPs.

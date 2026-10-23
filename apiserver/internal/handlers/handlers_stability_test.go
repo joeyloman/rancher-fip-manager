@@ -1041,3 +1041,154 @@ func TestSpecificFIPNameCanonicalizesAddress(t *testing.T) {
 		assert.Empty(t, validation.IsDNS1123Subdomain(name), "name %q must be a valid object name", name)
 	}
 }
+
+// TestFIPRequestHandlerReusesServiceAllocation: a repeated
+// request for a Service that already holds an allocation returns that
+// FloatingIP instead of allocating a second address. The controller writes its
+// annotation only after the request returns, so a crash, timeout or dropped
+// response leaves an identical retry with no local record of the allocation.
+func TestFIPRequestHandlerReusesServiceAllocation(t *testing.T) {
+	const projectName = "proj-service-reuse"
+	ns := createNamespaceAndProject(t, "test-svc-reuse-", projectName)
+	createFloatingIPPool(t, "pool-svc-reuse", "10.32.0.0/24", "10.32.0.1", "10.32.0.254")
+
+	ctx := context.Background()
+	ipAddr := "10.32.0.7"
+	existing := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fip-svc-reuse",
+			Namespace: ns.GetName(),
+			Labels: map[string]string{
+				"rancher.k8s.binbash.org/project-name":        projectName,
+				"rancher.k8s.binbash.org/cluster-name":        "cluster-reuse",
+				"rancher.k8s.binbash.org/service-0-name":      "svc-reuse",
+				"rancher.k8s.binbash.org/service-0-namespace": "default",
+			},
+		},
+		Spec: fipv1beta2.FloatingIPSpec{IPAddr: &ipAddr, FloatingIPPool: "pool-svc-reuse"},
+	}
+	require.NoError(t, app.FipRestClient.Create(ctx, existing))
+	existing.Status.IPAddr = ipAddr
+	existing.Status.State = "Allocated"
+	require.NoError(t, app.FipRestClient.Status().Update(ctx, existing))
+
+	fipRequest := &types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "pool-svc-reuse",
+		ServiceName:      "svc-reuse",
+		ServiceNamespace: "default",
+		Cluster:          "cluster-reuse",
+	}
+	body, err := json.Marshal(fipRequest)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var fipResponse types.FIPResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fipResponse))
+	assert.Equal(t, ipAddr, fipResponse.IPAddress)
+
+	var list fipv1beta2.FloatingIPList
+	require.NoError(t, app.FipRestClient.List(ctx, &list, client.InNamespace(ns.GetName())))
+	assert.Len(t, list.Items, 1, "a repeated request must not allocate a second FloatingIP")
+}
+
+// TestCheckSpecificIPClaimableAllowsSameServiceReclaim: the
+// manager must accept a pinned-address request when the assigned FloatingIP
+// already carries the requesting Service's labels. The controller persists the
+// allocation only after the request returns, so a retry after a crash in
+// between otherwise loops on 409 forever.
+func TestCheckSpecificIPClaimableAllowsSameServiceReclaim(t *testing.T) {
+	ipAddr := "10.35.0.7"
+	fip := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+			"rancher.k8s.binbash.org/project-name":        "p-reclaim",
+			"rancher.k8s.binbash.org/cluster-name":        "cluster-reclaim",
+			"rancher.k8s.binbash.org/service-0-name":      "svc-reclaim",
+			"rancher.k8s.binbash.org/service-0-namespace": "default",
+		}},
+		Spec: fipv1beta2.FloatingIPSpec{IPAddr: &ipAddr, FloatingIPPool: "pool-reclaim"},
+		Status: fipv1beta2.FloatingIPStatus{
+			Assigned: &fipv1beta2.AssignedInfo{ClusterName: "cluster-reclaim"},
+		},
+	}
+
+	req := types.FIPRequest{
+		Project:          "p-reclaim",
+		Cluster:          "cluster-reclaim",
+		FloatingIPPool:   "pool-reclaim",
+		ServiceName:      "svc-reclaim",
+		ServiceNamespace: "default",
+		IPAddress:        ipAddr,
+	}
+	require.NoError(t, checkSpecificIPClaimable(fip, req), "the Service that owns the address must be able to re-claim it")
+
+	req.ServiceName = "another-svc"
+	err := checkSpecificIPClaimable(fip, req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "IP address is already assigned")
+
+	// A same-named Service in another cluster does not own the address.
+	req.ServiceName = "svc-reclaim"
+	req.Cluster = "other-cluster"
+	err = checkSpecificIPClaimable(fip, req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "IP address is already assigned")
+}
+
+// TestFIPRequestHandlerReclaimsAssignedStaticIP is the end-to-end H3 case: a
+// Service retries its pinned address after the allocation was made but before
+// the controller persisted it. The FIP is already assigned, yet the request
+// must return that allocation instead of a 409 that the controller retries
+// forever.
+func TestFIPRequestHandlerReclaimsAssignedStaticIP(t *testing.T) {
+	const projectName = "proj-static-reclaim"
+	ns := createNamespaceAndProject(t, "test-static-reclaim-", projectName)
+	createFloatingIPPool(t, "pool-static-reclaim", "10.36.0.0/24", "10.36.0.1", "10.36.0.254")
+
+	ctx := context.Background()
+	ipAddr := "10.36.0.7"
+	existing := &fipv1beta2.FloatingIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fip-static-reclaim",
+			Namespace: ns.GetName(),
+			Labels: map[string]string{
+				"rancher.k8s.binbash.org/project-name":        projectName,
+				"rancher.k8s.binbash.org/cluster-name":        "cluster-static-reclaim",
+				"rancher.k8s.binbash.org/service-0-name":      "svc-static-reclaim",
+				"rancher.k8s.binbash.org/service-0-namespace": "default",
+			},
+		},
+		Spec: fipv1beta2.FloatingIPSpec{IPAddr: &ipAddr, FloatingIPPool: "pool-static-reclaim"},
+	}
+	require.NoError(t, app.FipRestClient.Create(ctx, existing))
+	existing.Status.IPAddr = ipAddr
+	existing.Status.State = "Allocated"
+	existing.Status.Assigned = &fipv1beta2.AssignedInfo{ClusterName: "cluster-static-reclaim"}
+	require.NoError(t, app.FipRestClient.Status().Update(ctx, existing))
+
+	fipRequest := &types.FIPRequest{
+		Project:          projectName,
+		FloatingIPPool:   "pool-static-reclaim",
+		ServiceName:      "svc-static-reclaim",
+		ServiceNamespace: "default",
+		Cluster:          "cluster-static-reclaim",
+		IPAddress:        ipAddr,
+	}
+	body, err := json.Marshal(fipRequest)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	FIPRequestHandler(app)(w, httptest.NewRequest(http.MethodPost, "/v1/fip/request", bytes.NewReader(body)))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var fipResponse types.FIPResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fipResponse))
+	assert.Equal(t, ipAddr, fipResponse.IPAddress)
+
+	var list fipv1beta2.FloatingIPList
+	require.NoError(t, app.FipRestClient.List(ctx, &list, client.InNamespace(ns.GetName())))
+	assert.Len(t, list.Items, 1, "a re-claim must not allocate a second FloatingIP")
+}
