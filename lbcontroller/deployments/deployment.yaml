@@ -162,7 +162,7 @@ spec:
       serviceAccountName: rancher-fip-lb-controller
       containers:
       - name: rancher-fip-lb-controller
-        image: ghcr.io/joeyloman/rancher-fip-lb-controller:v0.5.8
+        image: ghcr.io/joeyloman/rancher-fip-lb-controller:v0.6.0
         imagePullPolicy: IfNotPresent
         args:
           - --leader-elect=true

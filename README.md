@@ -76,7 +76,7 @@ Install the latest chart version:
 ```sh
 helm upgrade --install rancher-fip-manager \
   oci://ghcr.io/joeyloman/charts/rancher-fip-manager \
-  --version 0.5.8 \
+  --version 0.6.0 \
   -n rancher-fip-manager --create-namespace
 ```
 
@@ -85,7 +85,7 @@ With common overrides (disable the apiserver ingress placeholder and use NodePor
 ```sh
 helm upgrade --install rancher-fip-manager \
   oci://ghcr.io/joeyloman/charts/rancher-fip-manager \
-  --version 0.5.8 \
+  --version 0.6.0 \
   -n rancher-fip-manager --create-namespace \
   --set apiserver.ingress.enabled=false \
   --set clustermanager.RancherFipApiServerURL=https://<apiserver-host>:<port>/v1
