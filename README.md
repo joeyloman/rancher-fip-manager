@@ -45,6 +45,19 @@ make webhook
 make docker-build-webhook WEBHOOK_IMG=your-registry/rancher-fip-manager-webhook:latest
 ```
 
+## The rancher-fip-lb-controller
+
+The load balancer controller is part of this repository (`lbcontroller/`, a separate Go module for the `github.com/joeyloman/rancher-fip-lb-controller` package). It runs in downstream clusters, watches `LoadBalancer` Services, requests or releases floating IPs through the `rancher-fip-api-server`, and programs MetalLB (`IPAddressPool`, `L2Advertisement`) or PureLB (`ServiceGroup`, `LBNodeAgent`) accordingly. Its own chart lives at `deployments/charts/rancher-fip-lb-controller`; the cluster manager installs that chart into downstream clusters.
+
+It is built and published as a separate container image:
+
+```sh
+make lbcontroller
+make docker-build-lbcontroller LB_CONTROLLER_IMG=your-registry/rancher-fip-lb-controller:latest
+```
+
+Configuration, annotations, and project detection are documented in `lbcontroller/README.md`.
+
 ## Getting Started
 
 ### Prerequisites

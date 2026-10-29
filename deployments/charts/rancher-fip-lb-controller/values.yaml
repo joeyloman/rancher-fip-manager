@@ -1,0 +1,73 @@
+# Default values for rancher-fip-lb-controller
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/joeyloman/rancher-fip-lb-controller
+  pullPolicy: IfNotPresent
+  # This chart selects the UI Service by the leader label that the controller
+  # sets on its own Pod. The image and the chart must be released together:
+  # pairing these templates with an older image leaves the Service without
+  # endpoints. Bump the chart version and this tag in the release commit.
+  tag: "v0.5.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+service:
+  enabled: true
+  # Port exposed by the UI Service and listened on by the controller
+  # (--http-server-port and the container port follow this value).
+  webServicePort: 8080
+
+podDisruptionBudget:
+  enabled: true
+  # maxUnavailable keeps node drains possible with a single replica while
+  # still bounding voluntary disruption when the chart is scaled out.
+  maxUnavailable: 1

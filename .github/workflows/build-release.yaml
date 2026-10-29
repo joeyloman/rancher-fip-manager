@@ -10,6 +10,7 @@ env:
   WEBHOOK_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-manager-webhook
   APISERVER_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-api-server
   CLUSTERMANAGER_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-cluster-manager
+  LB_CONTROLLER_IMAGE_NAME: ${{ github.repository_owner }}/rancher-fip-lb-controller
 
 jobs:
   build-release:
@@ -95,3 +96,24 @@ jobs:
           docker pull $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
           docker tag $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$GITHUB_REF_NAME
           docker push $REGISTRY/$CLUSTERMANAGER_IMAGE_NAME:$GITHUB_REF_NAME
+
+  build-lbcontroller-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag a lb-controller container build to the release version and push image to GHCR
+        id: build-lbcontroller-image
+        run: |
+          docker pull $REGISTRY/$LB_CONTROLLER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
+          docker tag $REGISTRY/$LB_CONTROLLER_IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$LB_CONTROLLER_IMAGE_NAME:$GITHUB_REF_NAME
+          docker push $REGISTRY/$LB_CONTROLLER_IMAGE_NAME:$GITHUB_REF_NAME

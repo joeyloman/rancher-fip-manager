@@ -1,0 +1,24 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rancher-fip-lb-controller.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "rancher-fip-lb-controller.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "rancher-fip-lb-controller.selectorLabels" . | nindent 4 }}
+    # Only the leader replica serves the management UI; it labels its own pod
+    # after winning the election.
+    rancher-fip-lb-controller/leader: "true"
+  ports:
+    - name: http
+      port: {{ .Values.service.webServicePort | default 8080 }}
+      protocol: TCP
+      # Resolve by name so the Service follows the container port declared in
+      # the Deployment instead of duplicating a number.
+      targetPort: http
+  sessionAffinity: None
+  type: ClusterIP
+{{- end }}

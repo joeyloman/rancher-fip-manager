@@ -1,0 +1,16 @@
+FROM docker.io/golang:1.26-alpine3.24 AS builder
+RUN mkdir /src /deps
+RUN apk update && apk add git build-base binutils-gold
+WORKDIR /deps
+ADD lbcontroller/go.mod lbcontroller/go.sum /deps/lbcontroller/
+WORKDIR /deps/lbcontroller
+RUN go mod download
+ADD / /src
+WORKDIR /src/lbcontroller
+RUN go build -a -o rancher-fip-lb-controller cmd/lb-controller/main.go
+FROM docker.io/alpine:3.24
+RUN adduser -S -D -H -h /app rancher-fip-lb-controller
+USER rancher-fip-lb-controller
+COPY --from=builder /src/lbcontroller/rancher-fip-lb-controller /app/
+WORKDIR /app
+ENTRYPOINT ["./rancher-fip-lb-controller"]

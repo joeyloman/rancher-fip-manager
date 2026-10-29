@@ -1,0 +1,208 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rancher-fip-lb-controller
+  namespace: rancher-fip-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rancher-fip-lb-controller
+rules:
+# Secrets and ConfigMaps are read only in --app-namespace (rancher-fip-manager);
+# that access is granted by the namespaced Role below, not here.
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - delete
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - get
+  - list
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+- apiGroups:
+  - metallb.io
+  resources:
+  - ipaddresspools
+  - l2advertisements
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - purelb.io
+  resources:
+  - servicegroups
+  - lbnodeagents
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rancher-fip-lb-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rancher-fip-lb-controller
+subjects:
+- kind: ServiceAccount
+  name: rancher-fip-lb-controller
+  namespace: rancher-fip-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rancher-fip-lb-controller
+  namespace: rancher-fip-manager
+  labels:
+    app: rancher-fip-lb-controller
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rancher-fip-lb-controller
+  namespace: rancher-fip-manager
+  labels:
+    app: rancher-fip-lb-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rancher-fip-lb-controller
+subjects:
+- kind: ServiceAccount
+  name: rancher-fip-lb-controller
+  namespace: rancher-fip-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rancher-fip-lb-controller
+  namespace: rancher-fip-manager
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rancher-fip-lb-controller
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: rancher-fip-lb-controller
+    spec:
+      serviceAccountName: rancher-fip-lb-controller
+      containers:
+      - name: rancher-fip-lb-controller
+        image: ghcr.io/joeyloman/rancher-fip-lb-controller:v0.5.0
+        imagePullPolicy: IfNotPresent
+        args:
+          - --leader-elect=true
+          - --lease-lock-name=rancher-fip-lb-controller-lock
+          - --lease-lock-namespace=rancher-fip-manager
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccountName: rancher-fip-lb-controller
+      terminationGracePeriodSeconds: 30

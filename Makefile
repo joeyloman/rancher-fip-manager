@@ -4,6 +4,7 @@ IMG ?= github.com/joeyloman/rancher-fip-manager:latest
 WEBHOOK_IMG ?= github.com/joeyloman/rancher-fip-manager-webhook:latest
 APISERVER_IMG ?= github.com/joeyloman/rancher-fip-api-server:latest
 CLUSTERMANAGER_IMG ?= github.com/joeyloman/rancher-fip-cluster-manager:latest
+LB_CONTROLLER_IMG ?= github.com/joeyloman/rancher-fip-lb-controller:latest
 # Produce CRDs that work back to Kubernetes 1.11 (no pruning).
 CRD_OPTIONS ?= "crd:trivialVersions=true,preserveUnknownFields=false"
 
@@ -33,6 +34,10 @@ test-apiserver:
 test-clustermanager:
 	cd clustermanager && go test -race -v ./cmd/... ./internal/... ./pkg/...
 
+## Run the lb-controller tests
+test-lbcontroller:
+	cd lbcontroller && go test -race -v ./cmd/... ./internal/... ./pkg/...
+
 # =================================================================================================
 # Build
 # =================================================================================================
@@ -48,6 +53,10 @@ webhook: generate
 ## Build the cluster-manager binary
 clustermanager:
 	cd clustermanager && go build -o ../bin/rancher-fip-cluster-manager ./cmd/cluster-manager
+
+## Build the lb-controller binary
+lbcontroller:
+	cd lbcontroller && go build -o ../bin/rancher-fip-lb-controller ./cmd/lb-controller
 
 ## Build the api-server binary
 apiserver:
@@ -69,6 +78,10 @@ docker-build-apiserver:
 docker-build-clustermanager:
 	docker build -f build/Dockerfile.clustermanager -t ${CLUSTERMANAGER_IMG} .
 
+## Build the lb-controller docker image
+docker-build-lbcontroller:
+	docker build -f build/Dockerfile.lbcontroller -t ${LB_CONTROLLER_IMG} .
+
 ## Push the docker image
 docker-push:
 	docker push ${IMG}
@@ -84,6 +97,10 @@ docker-push-apiserver:
 ## Push the cluster-manager docker image
 docker-push-clustermanager:
 	docker push ${CLUSTERMANAGER_IMG}
+
+## Push the lb-controller docker image
+docker-push-lbcontroller:
+	docker push ${LB_CONTROLLER_IMG}
 
 # =================================================================================================
 # Code Generation
@@ -110,4 +127,4 @@ undeploy:
 	kubectl delete -f config/deployment/deployment.yaml
 	kubectl delete -f config/crd/
 
-.PHONY: all run test test-apiserver test-clustermanager manager webhook apiserver clustermanager docker-build docker-build-webhook docker-build-apiserver docker-build-clustermanager docker-push docker-push-webhook docker-push-apiserver docker-push-clustermanager generate install deploy undeploy
+.PHONY: all run test test-apiserver test-clustermanager test-lbcontroller manager webhook apiserver clustermanager lbcontroller docker-build docker-build-webhook docker-build-apiserver docker-build-clustermanager docker-build-lbcontroller docker-push docker-push-webhook docker-push-apiserver docker-push-clustermanager docker-push-lbcontroller generate install deploy undeploy
