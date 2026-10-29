@@ -11,7 +11,7 @@ image:
   # sets on its own Pod. The image and the chart must be released together:
   # pairing these templates with an older image leaves the Service without
   # endpoints. Bump the chart version and this tag in the release commit.
-  tag: "v0.5.0"
+  tag: "v0.5.8"
 
 imagePullSecrets: []
 nameOverride: ""
