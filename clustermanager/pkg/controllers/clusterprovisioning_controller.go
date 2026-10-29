@@ -61,6 +61,14 @@ const (
 	// clusterProviderLabel is the Rancher provider label. Harvester
 	// management clusters are never provisioned here.
 	clusterProviderLabel = "provider.cattle.io"
+	// fipClusterNameLabel marks the cluster a FloatingIP is claimed by.
+	fipClusterNameLabel = "rancher.k8s.binbash.org/cluster-name"
+	// fipGroupLabel marks the FloatingIPPool group a claim was made from.
+	fipGroupLabel = "rancher.k8s.binbash.org/floatingip-group"
+	// fipServiceLabelPrefix indexes the services a claim is used by:
+	// rancher.k8s.binbash.org/service-<N>-name / -namespace. A FloatingIP
+	// can be shared by several services, so the indices are unbounded.
+	fipServiceLabelPrefix = "rancher.k8s.binbash.org/service-"
 	// defaultMaxConcurrentReconciles is the worker count used when the
 	// reconciler is constructed without MaxConcurrentReconciles. A single
 	// worker lets one blackholed downstream cluster (or one Helm wait)
@@ -610,24 +618,43 @@ func (r *ClusterProvisioningReconciler) releaseFloatingIPs(ctx context.Context, 
 
 	for _, fip := range fipList.Items {
 		// compare the clustername with the floatingip object rancher.k8s.binbash.org/cluster-name label
-		if fip.Labels["rancher.k8s.binbash.org/cluster-name"] == clusterName {
-			fipToUpdate := fip.DeepCopy()
-
-			delete(fipToUpdate.Labels, "rancher.k8s.binbash.org/cluster-name")
-			delete(fipToUpdate.Labels, "rancher.k8s.binbash.org/service-name")
-			delete(fipToUpdate.Labels, "rancher.k8s.binbash.org/service-namespace")
-
-			// the status assigned and conditions will be updated by the rancher-fip-manager controller
-
-			if err := r.Update(ctx, fipToUpdate); err != nil {
-				log.Errorf("failed to update floatingip: %s", err.Error())
-				return err
-			}
-			log.Infof("Released FloatingIP %s for deleted cluster %s", fip.Name, clusterName)
+		if fip.Labels[fipClusterNameLabel] != clusterName {
+			continue
 		}
+
+		fipToUpdate := fip.DeepCopy()
+		releaseClaimLabels(fipToUpdate.Labels)
+
+		// the status assigned and conditions will be updated by the rancher-fip-manager controller
+
+		if err := r.Update(ctx, fipToUpdate); err != nil {
+			log.Errorf("failed to update floatingip: %s", err.Error())
+			return err
+		}
+		log.Infof("Released FloatingIP %s for deleted cluster %s", fip.Name, clusterName)
 	}
 
 	return nil
+}
+
+// releaseClaimLabels strips every claim the cluster owned from the FloatingIP
+// labels: the cluster and pool-group markers plus all indexed service
+// name/namespace pairs. Several services can share a FloatingIP, so the
+// service labels are matched by prefix instead of by fixed index — the old
+// code deleted non-existent "service-name"/"service-namespace" keys and left
+// "service-0-*"/"service-1-*" consumed by a cluster that no longer exists.
+func releaseClaimLabels(labels map[string]string) {
+	delete(labels, fipClusterNameLabel)
+	delete(labels, fipGroupLabel)
+
+	for key := range labels {
+		if !strings.HasPrefix(key, fipServiceLabelPrefix) {
+			continue
+		}
+		if strings.HasSuffix(key, "-name") || strings.HasSuffix(key, "-namespace") {
+			delete(labels, key)
+		}
+	}
 }
 
 func (r *ClusterProvisioningReconciler) createChartSpec(name, ref, version, namespace, values string) helm.ChartSpec {
